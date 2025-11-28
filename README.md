@@ -1,6 +1,6 @@
 [![Cargo Build & Test](https://github.com/rderelle/kamino/actions/workflows/ci.yml/badge.svg)](https://github.com/rderelle/kamino/actions/workflows/ci.yml)
 [![Clippy check](https://github.com/rderelle/kamino/actions/workflows/clippy.yml/badge.svg)](https://github.com/rderelle/kamino/actions/workflows/clippy.yml)
-[![codecov](https://codecov.io/gh/rderelle/kamino/branch/main/graph/badge.svg?token=YOUR_TOKEN_HERE)](https://codecov.io/gh/rderelle/kamino)
+[![codecov](https://codecov.io/github/rderelle/kamino/graph/badge.svg?token=6B8WIGZL2F)](https://codecov.io/github/rderelle/kamino)
 
 <br>
 <h1 align="center">kamino</h1>
