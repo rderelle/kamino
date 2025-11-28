@@ -1,6 +1,7 @@
 [![Cargo Build & Test](https://github.com/rderelle/kamino/actions/workflows/ci.yml/badge.svg)](https://github.com/rderelle/kamino/actions/workflows/ci.yml)
 [![Clippy check](https://github.com/rderelle/kamino/actions/workflows/clippy.yml/badge.svg)](https://github.com/rderelle/kamino/actions/workflows/clippy.yml)
 [![codecov](https://codecov.io/github/rderelle/kamino/graph/badge.svg?token=6B8WIGZL2F)](https://codecov.io/github/rderelle/kamino)
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/kamino/README.html)
 
 <br>
 <h1 align="center">kamino</h1>
@@ -35,13 +36,21 @@ kamino performs the following successive steps:
 
 ## installation
 
+### bioconda
+
 ```bash
-git clone https://github.com/rderelle/kamino.git
-cd kamino
+conda install bioconda::kamino
+```
+
+### build from source
+
+```bash
+git clone https://github.com/rderelle/kamingo.git
+cd kamingo
 cargo build --release
 ```
 
-This produces the executable at target/release/kamino
+This produces the executable at target/release/kamingo
 
 ---
 
