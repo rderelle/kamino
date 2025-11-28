@@ -62,10 +62,19 @@ fn golden_3diff() {
         );
     }
 
-    // Compare the three expected output files with the program output
+    // Compare the 3 expected output files with the program output
     compare_files(
         &expected_dir.join("kamino_alignment.fas"),
         &work_dir.join("kamino_alignment.fas"),
     );
     compare_files(
-        &expec
+        &expected_dir.join("kamino_missing.tsv"),
+        &work_dir.join("kamino_missing.tsv"),
+    );
+    compare_files(
+        &expected_dir.join("kamino_partitions.tsv"),
+        &work_dir.join("kamino_partitions.tsv"),
+    );
+
+    println!("Golden test passed (Rust integration test).");
+}
