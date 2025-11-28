@@ -30,4 +30,4 @@ jobs:
         run: cargo test --all --release
 
       - name: Run golden dataset test
-        run: ./tests/run_3diff.sh
+        run: bash tests/run_3diff.sh
