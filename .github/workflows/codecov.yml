@@ -1,28 +1,33 @@
 name: Run tests and upload coverage
 
-on: 
-  push
+on:
+  push:
+    branches: [ main ]
+  pull_request:
 
 jobs:
   test:
     name: Run tests and collect coverage
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
 
-      - name: Run tests
-        run: npx jest --coverage
+      - name: Run tests with coverage
+        run: cargo tarpaulin --out Xml
 
       - name: Upload results to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          files: cobertura.xml
+          fail_ci_if_error: true
