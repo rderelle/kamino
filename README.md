@@ -96,7 +96,7 @@ And using the 400 *Mycobacterium* dataset to understand how parameters can impac
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given set of parameters and input proteomes.</p>
 
 - **Where do the constant positions come from?**
-<p>They are taken from the left flank of the end k-mer in each variant group, next to the middle positions. Because these positions are recoded under Dayhoff6, some may become polymorphic once converted back to amino acids. Using the default c=3, constant positions represent 60 to 75% of the alignment in the analyses mentioned above.</p>
+<p>They are taken from the left flank of the end k-mer in each variant group, next to the middle positions. Because these positions are recoded under Dayhoff6, some may become polymorphic once converted back to amino acids. Using the default c=3, constant positions represent 60 to 75% of the alignment in the analyses mentioned above.</p> 
 
 - **How to get more phylogenetic positions?**
     * increase the k-mer size (-k), but can substantially raise memory usage
