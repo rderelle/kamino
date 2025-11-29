@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+
+use kamino::{run_with_args, Args};
 
 #[test]
 fn golden_3diff() {
@@ -23,37 +24,34 @@ fn golden_3diff() {
     // Create work directory
     fs::create_dir_all(work_dir).expect("Failed to create work dir");
 
-    // Path to the compiled kamino binary (provided by Cargo for tests)
-    let kamino_exe = env!("CARGO_BIN_EXE_kamino");
-
-    // Use an absolute path for input, but run from work_dir
+    // Use an absolute path for input, but write outputs in work_dir
     let input_abs = input_dir
         .canonicalize()
         .expect("Failed to canonicalize input dir");
+    let output_prefix = work_dir.join("kamino");
 
-    let status = Command::new(kamino_exe)
-        .current_dir(work_dir)
-        .arg("-i")
-        .arg(input_abs.to_str().expect("Input path not valid UTF-8"))
-        .status()
-        .expect("Failed to run kamino");
+    let args = Args {
+        input: input_abs,
+        k: None,
+        min_freq: 0.85,
+        depth: 4,
+        output: output_prefix,
+        constant: None,
+        length_middle: None,
+        threads: None,
+        version: (),
+    };
 
-    assert!(
-        status.success(),
-        "kamino exited with non-zero status: {:?}",
-        status.code()
-    );
+    run_with_args(args).expect("Failed to run kamino pipeline");
 
     // Helper to compare two files like `diff`
     fn compare_files(expected: &Path, got: &Path) {
-        let expected_content =
-            fs::read_to_string(expected).unwrap_or_else(|e| {
-                panic!("Failed to read expected file {:?}: {}", expected, e);
-            });
-        let got_content =
-            fs::read_to_string(got).unwrap_or_else(|e| {
-                panic!("Failed to read output file {:?}: {}", got, e);
-            });
+        let expected_content = fs::read_to_string(expected).unwrap_or_else(|e| {
+            panic!("Failed to read expected file {:?}: {}", expected, e);
+        });
+        let got_content = fs::read_to_string(got).unwrap_or_else(|e| {
+            panic!("Failed to read output file {:?}: {}", got, e);
+        });
 
         assert_eq!(
             expected_content, got_content,
