@@ -71,22 +71,6 @@ impl Graph {
         }
         sid
     }
-
-    /// Iterate successors for a node by visiting set bits in its adjacency mask.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn for_each_succ<F: FnMut(u64, u32)>(&self, u: u64, mut f: F) {
-        if let Some(mask) = self.adj.get(u) {
-            let mut m = mask;
-            while m != 0 {
-                let b = m.trailing_zeros();
-                m &= m - 1;
-                let sym = b;
-                let v = ((u << RECODE_BITS_PER_SYMBOL) | sym as u64) & self.k1_mask;
-                f(v, sym);
-            }
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -135,10 +119,6 @@ impl AdjTable {
         I: IntoIterator<Item = (u64, u32)>,
     {
         let mut entries: Vec<(u64, u32)> = iter.into_iter().collect();
-        if entries.is_empty() {
-            return Self::new();
-        }
-
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         let mut nodes: Vec<u64> = Vec::with_capacity(entries.len());
@@ -220,7 +200,6 @@ pub struct NodeColorSlice<'a> {
 pub struct NodeColorOnes<'a> {
     species: &'a [u32],
     index: usize,
-    n_species: usize,
 }
 
 impl NodeColorTable {
@@ -232,11 +211,6 @@ impl NodeColorTable {
             species: Vec::new(),
             n_species: 0,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.nodes.len()
     }
 
     pub fn nodes(&self) -> &[u64] {
@@ -255,16 +229,6 @@ impl NodeColorTable {
         I: IntoIterator<Item = (u64, SpeciesSet)>,
     {
         let mut entries: Vec<(u64, SpeciesSet)> = iter.into_iter().collect();
-        if entries.is_empty() {
-            return Self {
-                nodes: Vec::new(),
-                offsets: Vec::new(),
-                lens: Vec::new(),
-                species: Vec::new(),
-                n_species,
-            };
-        }
-
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         let mut nodes: Vec<u64> = Vec::with_capacity(entries.len());
@@ -374,7 +338,6 @@ impl<'a> NodeColorSlice<'a> {
         NodeColorOnes {
             species: self.species,
             index: 0,
-            n_species: self.n_species,
         }
     }
 
@@ -398,10 +361,6 @@ impl<'a> Iterator for NodeColorOnes<'a> {
             return None;
         }
         let sid = self.species[self.index] as usize;
-        if sid >= self.n_species {
-            self.index = self.species.len();
-            return None;
-        }
         self.index += 1;
         Some(sid)
     }
