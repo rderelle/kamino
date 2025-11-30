@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::graph::{AdjTable, Graph, NodeColorTable, SpeciesSet};
-use crate::recode::recode_byte;
+use crate::recode::{recode_byte, RecodeScheme, RECODE_ALPHABET_SIZE, RECODE_BITS_PER_SYMBOL};
 
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -112,9 +112,10 @@ pub fn build_graph_from_dir(
         species_ids.push(sid);
     }
 
-    let sym_bits = main.sym_bits;
+    let sym_bits = RECODE_BITS_PER_SYMBOL;
     let k_mask = main.k_mask;
     let k1_mask = main.k1_mask;
+    let recode_scheme = main.recode_scheme;
     let sym_mask: u64 = if sym_bits >= 64 {
         u64::MAX
     } else {
@@ -132,6 +133,7 @@ pub fn build_graph_from_dir(
         k1_mask: u64,
         sym_mask: u64,
         mut on_edge: impl FnMut(u64, u32, u64),
+        scheme: RecodeScheme,
     ) -> Result<()> {
         while let Some(rec) = reader.next() {
             let rec = rec?;
@@ -141,7 +143,7 @@ pub fn build_graph_from_dir(
             let mut have: usize = 0;
 
             for &b in seq {
-                let a = recode_byte(b);
+                let a = recode_byte(b, scheme);
                 if a == 255 {
                     roll = 0;
                     have = 0;
@@ -185,10 +187,10 @@ pub fn build_graph_from_dir(
                     out_mask: u32, // OR of outgoing symbol bits
                     indeg: u8,     // saturated at 2: 0,1,2 (2 = ">=2")
                 }
-                
+
                 // with_capacity is enough for bacteria but not for eukaryotes
                 let mut node_deg: HashMap<u64, NodeDeg> = HashMap::with_capacity(1_000_000);
-                
+
                 // First pass: fill node_deg with per-node out_mask and indegree (saturated).
                 stream_kmers(
                     reader,
@@ -212,6 +214,7 @@ pub fn build_graph_from_dir(
                             }
                         }
                     },
+                    recode_scheme,
                 )?;
 
                 let mut kept = 0usize;
@@ -250,9 +253,7 @@ pub fn build_graph_from_dir(
 
                         if od == 1 && id == 1 {
                             let bit = 1u32 << sym;
-                            adj.entry(*u)
-                                .and_modify(|m| *m |= bit)
-                                .or_insert(bit);
+                            adj.entry(*u).and_modify(|m| *m |= bit).or_insert(bit);
 
                             update_node(*u);
                             update_node(v);
@@ -275,7 +276,7 @@ pub fn build_graph_from_dir(
             })
     })?; // propagate any I/O / parsing errors
 
-    main.adj = AdjTable::from_iter(adj, main.alphabet_size);
+    main.adj = AdjTable::from_iter(adj);
     main.samples = NodeColorTable::from_iter(samples, main.n_species);
 
     Ok(())
@@ -294,12 +295,12 @@ pub fn print_graph_size(g: &Graph) {
 #[allow(dead_code)]
 pub fn assert_adj_masks_within_alphabet(g: &Graph) {
     // Ensures we never set adjacency bits >= alphabet size.
-    let max_bit = g.alphabet_size as u32;
+    let max_bit = RECODE_ALPHABET_SIZE as u32;
     for (_, mask) in g.adj.iter() {
         if mask >> max_bit != 0 {
             panic!(
                 "Adjacency has bits set >= alphabet_size ({}).",
-                g.alphabet_size
+                RECODE_ALPHABET_SIZE
             );
         }
     }

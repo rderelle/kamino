@@ -1,4 +1,5 @@
 use crate::graph::Graph;
+use crate::recode::RECODE_BITS_PER_SYMBOL;
 use ahash::RandomState;
 use bitvec::prelude::*;
 use hashbrown::{HashMap, HashSet};
@@ -195,7 +196,6 @@ fn collect_paths_iterative_species_from_last_bifurcation(
     while let Some(mut fr) = stack.pop() {
         // Reached an end and path long enough: Emit path, materializing the species only now.
         if !fr.emitted && end_kmers.contains(&fr.node) && path.len() > min_path_edges {
-            
             // Intersect with species content of end k-mer (currently disabled)
             //let mut species = fr.ref_species.clone();
             //let end_species = get_species(fr.node);
@@ -224,7 +224,7 @@ fn collect_paths_iterative_species_from_last_bifurcation(
             stack.push(fr);
 
             // Compute successor directly from current node
-            let next = ((cur << g.sym_bits) | (b as u64)) & mask_k1;
+            let next = ((cur << RECODE_BITS_PER_SYMBOL) | (b as u64)) & mask_k1;
 
             // Guard cycles cheaply
             if on_path.contains(&next) {
@@ -245,7 +245,7 @@ fn collect_paths_iterative_species_from_last_bifurcation(
             if next_solved > max_depth {
                 continue;
             }
-  
+
             let mut next_ref_species = parent.ref_species.clone();
 
             // Update species reference: intersect when we are leaving a real bifurcation (not start node)
