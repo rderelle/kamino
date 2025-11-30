@@ -39,6 +39,7 @@ fn golden_3diff() {
         constant: None,
         length_middle: None,
         threads: None,
+        recode: kamino::RecodeScheme::Dayhoff6,
         version: (),
     };
 
