@@ -3,6 +3,7 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
 use crate::graph::{Graph, NodeColorSlice};
+use crate::recode::{RECODE_ALPHABET_SIZE, RECODE_BITS_PER_SYMBOL};
 
 pub fn find_bubble_endpoints(
     main: &Graph,
@@ -15,13 +16,9 @@ pub fn find_bubble_endpoints(
     let mut sources: Vec<u64> = main.adj.nodes().to_vec();
     sources.sort_unstable();
 
-    let sym_mask = if main.sym_bits == 0 {
-        0
-    } else {
-        (1u64 << main.sym_bits) - 1
-    };
+    let sym_mask = (1u64 << RECODE_BITS_PER_SYMBOL) - 1;
     let shift_symbols = main.k.saturating_sub(2);
-    let shift_bits = main.sym_bits.saturating_mul(shift_symbols as u32);
+    let shift_bits = RECODE_BITS_PER_SYMBOL.saturating_mul(shift_symbols as u32);
 
     // Shared helpers
     #[inline]
@@ -74,8 +71,8 @@ pub fn find_bubble_endpoints(
                 || {
                     (
                         vec![0u32; n_species],
-                        Vec::with_capacity(main.alphabet_size),
-                        Vec::with_capacity(main.alphabet_size),
+                        Vec::with_capacity(RECODE_ALPHABET_SIZE),
+                        Vec::with_capacity(RECODE_ALPHABET_SIZE),
                         1u32,
                     )
                 },
@@ -94,7 +91,7 @@ pub fn find_bubble_endpoints(
                     while m != 0 {
                         let b = m.trailing_zeros() as u64;
                         m &= m - 1;
-                        let v = ((u << main.sym_bits) | b) & main.k1_mask;
+                        let v = ((u << RECODE_BITS_PER_SYMBOL) | b) & main.k1_mask;
                         succs.push(v);
                     }
 
@@ -146,8 +143,8 @@ pub fn find_bubble_endpoints(
                 || {
                     (
                         vec![0u32; n_species],
-                        Vec::with_capacity(main.alphabet_size),
-                        Vec::with_capacity(main.alphabet_size),
+                        Vec::with_capacity(RECODE_ALPHABET_SIZE),
+                        Vec::with_capacity(RECODE_ALPHABET_SIZE),
                         1u32,
                     )
                 },
@@ -157,13 +154,13 @@ pub fn find_bubble_endpoints(
                     scratch.clear();
 
                     let tail = (v & sym_mask) as u32;
-                    let base = v >> main.sym_bits;
+                    let base = v >> RECODE_BITS_PER_SYMBOL;
                     let shift_bits_u128 = shift_bits as u128;
                     if shift_bits_u128 >= 128 {
                         return None;
                     }
 
-                    for head in 0..(main.alphabet_size as u32) {
+                    for head in 0..(RECODE_ALPHABET_SIZE as u32) {
                         let candidate = (((head as u128) << shift_bits_u128) | base as u128)
                             & (main.k1_mask as u128);
                         let u = candidate as u64;

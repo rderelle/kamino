@@ -1,22 +1,23 @@
 // Node-colored, node-based de Bruijn graph with variable alphabet.
 //
-// Nodes are (k-1)-mers packed with sym_bits bits per symbol.
+// Nodes are (k-1)-mers packed with 3 bits per symbol (6-letter alphabet).
 // Adjacency: node -> bitmask of outgoing symbols; mask is u32 (supports up to 32 symbols).
 // Colors are stored as compact sorted species lists per node.
 
 use bitvec::prelude::*;
 use smallvec::SmallVec;
 
+use crate::recode::{RecodeScheme, RECODE_BITS_PER_SYMBOL};
+
 pub type AdjMask = u32;
 pub type SpeciesSet = SmallVec<[u16; 4]>;
 
 pub struct Graph {
     pub k: usize,
-    pub sym_bits: u32,        // 3 (Dayhoff6)
-    pub alphabet_size: usize, // 6
-    pub k_mask: u64,          // ((1 << (sym_bits*k)) - 1) or u64::MAX if overflow
-    pub k1_mask: u64,         // ((1 << (sym_bits*(k-1))) - 1)
-    pub adj: AdjTable,        // node -> bitmask (compact storage)
+    pub recode_scheme: RecodeScheme,
+    pub k_mask: u64,   // ((1 << (sym_bits*k)) - 1) or u64::MAX if overflow
+    pub k1_mask: u64,  // ((1 << (sym_bits*(k-1))) - 1)
+    pub adj: AdjTable, // node -> bitmask (compact storage)
     pub samples: NodeColorTable,
     pub n_species: usize, // number of species registered
     pub species_names: Vec<String>, // species names in exact sid order
@@ -26,9 +27,9 @@ pub struct Graph {
 
 impl Graph {
     #[inline]
-    fn compute_masks(k: usize, sym_bits: u32) -> (u64, u64) {
-        let kb = sym_bits.saturating_mul(k as u32);
-        let k1b = sym_bits.saturating_mul((k - 1) as u32);
+    fn compute_masks(k: usize) -> (u64, u64) {
+        let kb = RECODE_BITS_PER_SYMBOL.saturating_mul(k as u32);
+        let k1b = RECODE_BITS_PER_SYMBOL.saturating_mul((k - 1) as u32);
         let k_mask = if kb >= 64 { u64::MAX } else { (1u64 << kb) - 1 };
         let k1_mask = if k1b >= 64 {
             u64::MAX
@@ -38,12 +39,11 @@ impl Graph {
         (k_mask, k1_mask)
     }
 
-    pub fn new(k: usize, sym_bits: u32, alphabet_size: usize) -> Self {
-        let (k_mask, k1_mask) = Self::compute_masks(k, sym_bits);
+    pub fn new(k: usize, recode_scheme: RecodeScheme) -> Self {
+        let (k_mask, k1_mask) = Self::compute_masks(k);
         Self {
             k,
-            sym_bits,
-            alphabet_size,
+            recode_scheme,
             k_mask,
             k1_mask,
             adj: AdjTable::new(),
@@ -82,7 +82,7 @@ impl Graph {
                 let b = m.trailing_zeros();
                 m &= m - 1;
                 let sym = b;
-                let v = ((u << self.sym_bits) | sym as u64) & self.k1_mask;
+                let v = ((u << RECODE_BITS_PER_SYMBOL) | sym as u64) & self.k1_mask;
                 f(v, sym);
             }
         }
@@ -98,15 +98,13 @@ pub struct AdjTable {
 #[derive(Clone)]
 enum MaskStorage {
     U8(Vec<u8>),
-    U16(Vec<u16>),
-    U32(Vec<u32>),
 }
 
 impl AdjTable {
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
-            masks: MaskStorage::U32(Vec::new()),
+            masks: MaskStorage::U8(Vec::new()),
         }
     }
 
@@ -132,7 +130,7 @@ impl AdjTable {
         }
     }
 
-    pub fn from_iter<I>(iter: I, alphabet_size: usize) -> Self
+    pub fn from_iter<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (u64, u32)>,
     {
@@ -162,16 +160,13 @@ impl AdjTable {
             masks_acc.push(cur_mask);
         }
 
-        let masks = MaskStorage::from_masks(alphabet_size, masks_acc);
+        let masks = MaskStorage::from_masks(masks_acc);
         Self { nodes, masks }
     }
 
     fn mask_at(&self, idx: usize) -> AdjMask {
-        match &self.masks {
-            MaskStorage::U8(v) => v[idx] as AdjMask,
-            MaskStorage::U16(v) => v[idx] as AdjMask,
-            MaskStorage::U32(v) => v[idx],
-        }
+        let MaskStorage::U8(v) = &self.masks;
+        v[idx] as AdjMask
     }
 }
 
@@ -182,16 +177,9 @@ impl Default for AdjTable {
 }
 
 impl MaskStorage {
-    fn from_masks(alphabet_size: usize, masks: Vec<u32>) -> Self {
-        if alphabet_size <= 8 {
-            let compact: Vec<u8> = masks.iter().map(|m| *m as u8).collect();
-            MaskStorage::U8(compact)
-        } else if alphabet_size <= 16 {
-            let compact: Vec<u16> = masks.iter().map(|m| *m as u16).collect();
-            MaskStorage::U16(compact)
-        } else {
-            MaskStorage::U32(masks)
-        }
+    fn from_masks(masks: Vec<u32>) -> Self {
+        let compact: Vec<u8> = masks.iter().map(|m| *m as u8).collect();
+        MaskStorage::U8(compact)
     }
 }
 

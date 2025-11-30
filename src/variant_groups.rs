@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::graph::Graph;
 use crate::io::{collect_fasta_files, open_fasta, species_name_from_path};
-use crate::recode::recode_byte;
+use crate::recode::{recode_byte, RecodeScheme, RECODE_BITS_PER_SYMBOL};
 use crate::traverse::{PathRec, VariantGroups};
 
 /// Alignment output pieces produced for all variant groups.
@@ -278,16 +278,16 @@ pub(crate) fn build_group_block(
     // Filter middle positions on missing ratio (polymorphism is checked at the group level)
     let mut keep_middle_cols: Vec<usize> = Vec::with_capacity(middle_len);
     let mut has_polymorphic_middle = false;
-    
+
     for col in middle_start..middle_end {
         if col >= tail_const_start && col < tail_const_end {
             // Skip positions reserved for the trailing constant context.
             continue;
         }
-    
+
         let mut counts = [0usize; 256];
         let mut missing = 0usize;
-    
+
         for row in block.iter().take(n) {
             let b = row[col];
             if b == b'-' || b == b'X' {
@@ -295,13 +295,13 @@ pub(crate) fn build_group_block(
             }
             counts[b as usize] += 1;
         }
-    
+
         let missing_ratio = (missing as f64) / (n as f64);
         if missing_ratio > missing_cutoff {
             // Too much missing: drop this column.
             continue;
         }
-    
+
         // Check if this column is polymorphic among non-missing AAs.
         let mut unique_non_gap = 0usize;
         for (aa, &cnt) in counts.iter().enumerate() {
@@ -316,25 +316,25 @@ pub(crate) fn build_group_block(
                 }
             }
         }
-    
+
         // Keep all columns that pass the missing filter, even if monomorphic.
         keep_middle_cols.push(col);
     }
-    
+
     // If nothing survives the missing filter, drop the block.
     if keep_middle_cols.is_empty() {
         return GroupOutcome::DroppedMiddle;
     }
-    
+
     // If no middle column is polymorphic, drop the block.
     if !has_polymorphic_middle {
         return GroupOutcome::DroppedMiddle;
     }
-    
+
     if keep_middle_cols.len() > max_middle_len {
         return GroupOutcome::DroppedLength;
     }
-    
+
     let block_len_filtered = keep_middle_cols.len() + keep_tail_cols.len();
     debug_assert!(block_len_filtered > 0);
 
@@ -373,7 +373,8 @@ pub fn build_variant_group_alignment(
 
     let k1 = k - 1;
     let head_keep = head_max;
-    let sym_bits = g.sym_bits;
+    let sym_bits = RECODE_BITS_PER_SYMBOL;
+    let recode_scheme: RecodeScheme = g.recode_scheme;
 
     // Set scan_k (=21 or less if short k-mer size)
     let min_vg_len: usize = 2 * (k - 1) + 1;
@@ -517,7 +518,7 @@ pub fn build_variant_group_alignment(
 
                         for &b in seq {
                             let aa = b.to_ascii_uppercase();
-                            let code = recode_byte(aa);
+                            let code = recode_byte(aa, recode_scheme);
 
                             if code == 255 {
                                 // Unknown symbol: reset window.

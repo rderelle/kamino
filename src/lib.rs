@@ -9,7 +9,7 @@ mod traverse;
 //mod util;
 mod variant_groups;
 
-use recode::{DAYHOFF6_ALPHABET_SIZE, DAYHOFF6_BITS_PER_SYMBOL};
+pub use recode::RecodeScheme;
 
 /// Build a node-based, colored de Bruijn graph from amino-acid proteomes and analyze bubbles.
 #[derive(Parser, Debug)]
@@ -19,12 +19,17 @@ pub struct Args {
     #[arg(short, long)]
     pub input: std::path::PathBuf,
 
-    /// K-mer length on the Dayhoff6 alphabet [k=14]
+    /// K-mer length [k=14]
     #[arg(short, long)]
     pub k: Option<usize>,
 
-    /// Minimal sample frequency  [m=0.85]
-    #[arg(short = 'm', long = "min-freq", default_value_t = 0.85, hide_default_value = true)]
+    /// Minimal sample frequency [m=0.85]
+    #[arg(
+        short = 'm',
+        long = "min-freq",
+        default_value_t = 0.85,
+        hide_default_value = true
+    )]
     pub min_freq: f32,
 
     /// Maximum traversal depth from each start node [d=4]
@@ -47,16 +52,16 @@ pub struct Args {
     #[arg(short = 't', long)]
     pub threads: Option<usize>,
 
+    /// Recoding scheme [r=dayhoff6]
+    #[arg(short = 'r', long = "recode", value_enum, default_value_t = RecodeScheme::Dayhoff6, hide_default_value = true)]
+    pub recode: RecodeScheme,
+
     /// Display version information.
     #[arg(short = 'v', long = "version", action = ArgAction::Version)]
     pub version: (),
 }
 
 pub fn run_with_args(args: Args) -> anyhow::Result<()> {
-    // Fixed Dayhoff6 recoding scheme
-    let sym_bits = DAYHOFF6_BITS_PER_SYMBOL;
-    let alphabet_size = DAYHOFF6_ALPHABET_SIZE;
-
     // k defaults and limits for Dayhoff6
     let default_k = 14usize;
     let max_k = 21usize;
@@ -74,7 +79,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         (2..=max_k).contains(&k),
         "k={} is invalid for {}: allowed range is 2..={} (default {})",
         k,
-        "Dayhoff6",
+        args.recode,
         max_k,
         default_k
     );
@@ -102,19 +107,20 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
 
     eprintln!("kamino v{}", env!("CARGO_PKG_VERSION"));
     eprintln!(
-        "parameters: k={} constant={} min_freq={} depth={} length_middle={} threads={} input={} output={}",
+        "parameters: k={} constant={} min_freq={} depth={} length_middle={} threads={} recode={} input={} output={}",
         k,
         constant,
         min_freq,
         args.depth,
         length_middle,
         num_threads,
+        args.recode,
         args.input.display(),
         args.output.display()
     );
 
     // Build global graph
-    let mut g = graph::Graph::new(k, sym_bits, alphabet_size);
+    let mut g = graph::Graph::new(k, args.recode);
     io::build_graph_from_dir(&args.input, k, &mut g, num_threads)?;
 
     // Basic stats
