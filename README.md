@@ -11,8 +11,6 @@
 
 <br><br>
 
-From the Spanish word for *path*.  
-
 Builds an amino-acid alignment in a reference-free, alignment-free manner from a set of proteomes.  
 Not ‘better’ than traditional marker-based pipelines, but simpler and faster to run.  
   
@@ -24,7 +22,7 @@ Typical usages range from between-strains to within-phylum phylogenetic analyses
 ## under the hood
 kamino performs the following successive steps:
 - lists proteome files from the input directory (-i)
-- recodes proteins with the Dayhoff6 recoding scheme
+- recodes proteins with a 6-letters recoding scheme (-r)
 - simplifies proteomes by discarding within-proteome branching k-mers 
 - builds a global assembly graph and identifies variant groups as described <a href="https://academic.oup.com/mbe/article/42/4/msaf077/8103706">here</a> (-d)
 - converts variant group paths back to amino acids using a sliding window
@@ -74,7 +72,7 @@ All analyses were performed on a MacBook M4 pro using 4 threads (other parameter
 |-----------------------------|----------------------|---------------|-------------|---------------------|
 | 50 *Mycobacterium*          | within-genera        | 0.2           | 3           | 15.618              |
 | 400 *Mycobacterium*         | within-genera        | 1.4           | 11          | 12.291              |
-| 50 Polysporales (fungi)     | within-order         | 0.8           | 11          | 18.318              |
+| 50 Polyporales (fungi)     | within-order         | 0.8           | 11          | 18.318              |
 | 290 *A. fumigatus* (fungi)  | within-species       | 2.7           | 14          | 64.602              |
 | 46 *Drosophila*             | within-genera        | 1             | 10          | 190.175             |
 | 55 Mammalia                 | within-class         | 1.9           | 12          | 277.334             |  
@@ -105,7 +103,7 @@ And using the 400 *Mycobacterium* dataset to understand how parameters can impac
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given set of parameters and input proteomes.</p>
 
 - **Where do the constant positions come from?**
-<p>They are taken from the left flank of the end k-mer in each variant group, next to the middle positions. Because these positions are recoded under Dayhoff6, some may become polymorphic once converted back to amino acids. Using the default c=3, constant positions represent 60 to 75% of the alignment in the analyses mentioned above.</p> 
+<p>They are taken from the left flank of the end k-mer in each variant group, next to the middle positions. Because these positions are recoded, some may become polymorphic once converted back to amino acids. Using the default c=3, constant positions represent 60 to 75% of the alignment in the analyses mentioned above.</p> 
 
 - **How to get more phylogenetic positions?**
     * increase the k-mer size (-k), but can substantially raise memory usage
