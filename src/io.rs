@@ -182,16 +182,10 @@ pub fn build_graph_from_dir(
                 let rdr = open_fasta(path)?;
                 let reader = FastaReader::new(rdr);
 
-                #[derive(Default)]
-                struct NodeDeg {
-                    out_mask: u32, // OR of outgoing symbol bits
-                    indeg: u8,     // saturated at 2: 0,1,2 (2 = ">=2")
-                }
-
                 // with_capacity is enough for bacteria but not for eukaryotes
-                let mut node_deg: HashMap<u64, NodeDeg> = HashMap::with_capacity(1_000_000);
+                let mut out_masks: HashMap<u64, u32> = HashMap::with_capacity(1_000_000);
 
-                // First pass: fill node_deg with per-node out_mask and indegree (saturated).
+                // First pass: fill out_masks with per-node outgoing bitmasks.
                 stream_kmers(
                     reader,
                     k,
@@ -199,20 +193,10 @@ pub fn build_graph_from_dir(
                     k_mask,
                     k1_mask,
                     sym_mask,
-                    |u, sym, v| {
+                    |u, sym, _v| {
                         let bit = 1u32 << sym;
-
-                        // Update out_mask for prefix node u
-                        let entry_u = node_deg.entry(u).or_default();
-                        if (entry_u.out_mask & bit) == 0 {
-                            entry_u.out_mask |= bit;
-
-                            // Only when this (u, sym) is new do we increment indegree for v
-                            let entry_v = node_deg.entry(v).or_default();
-                            if entry_v.indeg < 2 {
-                                entry_v.indeg += 1; // 0 -> 1 -> 2 (2 == ">=2")
-                            }
-                        }
+                        let entry_u = out_masks.entry(u).or_insert(0);
+                        *entry_u |= bit;
                     },
                     recode_scheme,
                 )?;
@@ -234,35 +218,28 @@ pub fn build_graph_from_dir(
                     }
                 };
 
-                // Second pass: filter edges based on od == 1 && indeg(v) == 1
-                for (u, info) in node_deg.iter() {
-                    let mask = info.out_mask;
+                // Second pass: keep kmers with out-degree == 1
+                for (u, &mask) in out_masks.iter() {
                     if mask == 0 {
                         continue;
                     }
 
                     let od = mask.count_ones();
-
-                    let mut bits = mask;
-                    while bits != 0 {
-                        let sym = bits.trailing_zeros();
-                        bits &= bits - 1; // clear lowest set bit
-
-                        let v = (((*u) << sym_bits) | (sym as u64)) & k1_mask;
-                        let id = node_deg.get(&v).map(|nd| nd.indeg).unwrap_or(0);
-
-                        if od == 1 && id == 1 {
-                            let bit = 1u32 << sym;
-                            adj.entry(*u).and_modify(|m| *m |= bit).or_insert(bit);
-
-                            update_node(*u);
-                            update_node(v);
-
-                            kept += 1;
-                        } else {
-                            dropped += 1;
-                        }
+                    if od != 1 {
+                        dropped += od as usize;
+                        continue;
                     }
+
+                    let sym = mask.trailing_zeros();
+                    let bit = 1u32 << sym;
+                    let v = (((*u) << sym_bits) | (sym as u64)) & k1_mask;
+
+                    adj.entry(*u).and_modify(|m| *m |= bit).or_insert(bit);
+
+                    update_node(*u);
+                    update_node(v);
+
+                    kept += 1;
                 }
 
                 eprintln!(
