@@ -137,8 +137,8 @@ struct Frame {
 
 /// Iterative DFS that:
 /// - Starts at start (a bifurcation), walks until an end_kmers node or depth limit.
-/// - Initializes the species reference set from the start edge and progressively intersects it
-///   with the species of each bifurcation visited.
+/// - Initializes the species reference set from the start node and progressively refines it
+///   using intersections involving the previous and current node at bifurcations.
 /// - On reaching an end, records the accumulated species set with the path.
 fn collect_paths_iterative_species_from_last_bifurcation(
     g: &Graph,
@@ -177,6 +177,7 @@ fn collect_paths_iterative_species_from_last_bifurcation(
         bits
     };
 
+    // Start species = species at start node
     let start_species = get_species(start);
 
     let start_frame = Frame {
@@ -196,11 +197,6 @@ fn collect_paths_iterative_species_from_last_bifurcation(
     while let Some(mut fr) = stack.pop() {
         // Reached an end and path long enough: Emit path, materializing the species only now.
         if !fr.emitted && end_kmers.contains(&fr.node) && path.len() > min_path_edges {
-            // Intersect with species content of end k-mer (currently disabled)
-            //let mut species = fr.ref_species.clone();
-            //let end_species = get_species(fr.node);
-            //species &= end_species.as_bitslice();
-
             let species = fr.ref_species.clone();
 
             // In the node-based graph, the path is already explicit
@@ -232,7 +228,6 @@ fn collect_paths_iterative_species_from_last_bifurcation(
             }
 
             // Depth control: increment when *leaving* an internal bifurcation (not the start)
-            // Get the frame we just pushed (top of stack) to read its solved count and species
             let parent = stack.last().unwrap();
             let cur_outdeg = parent.total_outdeg;
             let add = if parent.node != start && cur_outdeg > 1 {
@@ -246,12 +241,35 @@ fn collect_paths_iterative_species_from_last_bifurcation(
                 continue;
             }
 
+            // ---------- NEW SPECIES LOGIC ----------
             let mut next_ref_species = parent.ref_species.clone();
 
-            // Update species reference: intersect when we are leaving a real bifurcation (not start node)
-            if parent.node != start && parent.total_outdeg > 1 {
-                next_ref_species &= get_species(parent.node).as_bitslice();
+            if parent.node == start {
+                // First step: species = S(start) ∩ S(next)
+                let next_species = get_species(next);
+                if next_ref_species.len() < next_species.len() {
+                    next_ref_species.resize(next_species.len(), false);
+                }
+                next_ref_species &= next_species.as_bitslice();
+            } else if parent.total_outdeg > 1 {
+                // At a real bifurcation:
+                //   species_new = current_ref ∩ S(parent) ∩ S(next)
+                let parent_species = get_species(parent.node);
+                if next_ref_species.len() < parent_species.len() {
+                    next_ref_species.resize(parent_species.len(), false);
+                }
+                next_ref_species &= parent_species.as_bitslice();
+
+                let next_species = get_species(next);
+                if next_ref_species.len() < next_species.len() {
+                    next_ref_species.resize(next_species.len(), false);
+                }
+                next_ref_species &= next_species.as_bitslice();
+            } else {
+                // Non-branching internal node:
+                // keep current ref_species as-is for now.
             }
+            // ---------- END NEW SPECIES LOGIC ----------
 
             // Prepare child frame
             let child_mask = g.adj.get(next).unwrap_or(0);
@@ -364,8 +382,8 @@ fn post_select_variant_groups(mut groups: VariantGroups) -> VariantGroups {
         // a.1 = score_a, b.1 = score_b
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0 .0 .0.cmp(&b.0 .0 .0)) // then by start node (a.0.0.0 is key.0)
-            .then_with(|| a.0 .0 .1.cmp(&b.0 .0 .1)) // then by end node (a.0.0.1 is key.1)
+            .then_with(|| a.0 .0 .0.cmp(&b.0 .0 .0)) // then by start node
+            .then_with(|| a.0 .0 .1.cmp(&b.0 .0 .1)) // then by end node
     });
 
     let mut used_starts: HashSet<u64, RandomState> = HashSet::with_hasher(RandomState::new());
