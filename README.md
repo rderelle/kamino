@@ -23,7 +23,7 @@ Typical usages range from between-strains to within-phylum phylogenetic analyses
 kamino performs the following successive steps:
 - lists proteome files from the input directory (-i)
 - recodes proteins with a 6-letters recoding scheme (-r)
-- simplifies proteomes by discarding within-proteome branching k-mers 
+- simplifies proteomes by discarding out-branching k-mers 
 - builds a global assembly graph and identifies variant groups as described <a href="https://academic.oup.com/mbe/article/42/4/msaf077/8103706">here</a> (-d)
 - converts variant group paths back to amino acids using a sliding window
 - filters variant groups by missing data and middle-length thresholds (-m and -l)
@@ -66,7 +66,7 @@ kamino -i <input_dir> -t 4
 
 ## examples
 
-All analyses were performed on a MacBook M4 pro using 4 threads (other parameters set to default):  
+All analyses were performed using v0.1 on a MacBook M4 pro using 4 threads (other parameters set to default):  
 
 | dataset                     | taxonomic diversity  | runtime (min) | memory (GB) | alignment size (aa) |
 |-----------------------------|----------------------|---------------|-------------|---------------------|
