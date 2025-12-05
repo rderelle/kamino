@@ -20,7 +20,10 @@ pub fn find_bubble_endpoints(
     let shift_symbols = main.k.saturating_sub(2);
     let shift_bits = RECODE_BITS_PER_SYMBOL.saturating_mul(shift_symbols as u32);
 
-    // Shared helpers
+    // ----------------------------
+    // Small helpers
+    // ----------------------------
+
     #[inline]
     fn bump_epoch(epoch: &mut u32, marks: &mut [u32]) {
         *epoch = epoch.wrapping_add(1);
@@ -30,24 +33,70 @@ pub fn find_bubble_endpoints(
         }
     }
 
+    /// |colors_u ∩ colors_v| where each is a sorted set of species IDs
     #[inline]
-    fn union_count_until(
+    fn intersection_count(colors_u: NodeColorSlice, colors_v: NodeColorSlice) -> usize {
+        let mut it_u = colors_u.iter_ones();
+        let mut it_v = colors_v.iter_ones();
+
+        let mut a = it_u.next();
+        let mut b = it_v.next();
+        let mut count = 0usize;
+
+        while let (Some(x), Some(y)) = (a, b) {
+            if x == y {
+                count += 1;
+                a = it_u.next();
+                b = it_v.next();
+            } else if x < y {
+                a = it_u.next();
+            } else {
+                b = it_v.next();
+            }
+        }
+
+        count
+    }
+
+    /// Union of intersections:
+    /// covered species in ⋃ (colors_u ∩ colors_v_i), written into `marks`.
+    #[inline]
+    fn union_intersection_until(
         marks: &mut [u32],
         epoch: u32,
-        colors: NodeColorSlice,
+        colors_u: NodeColorSlice,
+        colors_v: NodeColorSlice,
         need: usize,
         mut covered: usize,
     ) -> usize {
-        for sid in colors.iter_ones() {
-            let s = sid;
-            if unsafe { *marks.get_unchecked(s) } != epoch {
-                unsafe { *marks.get_unchecked_mut(s) = epoch };
-                covered += 1;
-                if covered >= need {
-                    break;
+        // two-pointer intersection on the fly; mark species in `marks`
+        let mut it_u = colors_u.iter_ones();
+        let mut it_v = colors_v.iter_ones();
+
+        let mut a = it_u.next();
+        let mut b = it_v.next();
+
+        while let (Some(x), Some(y)) = (a, b) {
+            if x == y {
+                let s = x; // species ID (usize)
+                unsafe {
+                    if *marks.get_unchecked(s) != epoch {
+                        *marks.get_unchecked_mut(s) = epoch;
+                        covered += 1;
+                        if covered >= need {
+                            break;
+                        }
+                    }
                 }
+                a = it_u.next();
+                b = it_v.next();
+            } else if x < y {
+                a = it_u.next();
+            } else {
+                b = it_v.next();
             }
         }
+
         covered
     }
 
@@ -61,8 +110,9 @@ pub fn find_bubble_endpoints(
     // Run the parallel parts inside this pool
     pool.install(|| {
         // ============================================================
-        // START nodes (outdeg ≥ 2) — match END logic:
-        // union of species across outgoing paths
+        // START nodes (outdeg ≥ 2)
+        // Use union of intersections:
+        //   S(u) = ⋃_v (colors(u) ∩ colors(v))
         // ============================================================
 
         let start_vec: Vec<u64> = sources
@@ -84,9 +134,16 @@ pub fn find_bubble_endpoints(
                         return None;
                     }
 
+                    // colours of the start node itself
+                    let colors_u = match main.samples.get(u) {
+                        Some(bs) => bs,
+                        None => return None,
+                    };
+
                     succs.clear();
                     scratch.clear();
 
+                    // collect successors of u
                     let mut m = mask;
                     while m != 0 {
                         let b = m.trailing_zeros() as u64;
@@ -95,9 +152,14 @@ pub fn find_bubble_endpoints(
                         succs.push(v);
                     }
 
+                    // quick upper-bound check using intersection sizes
                     let mut sum = 0usize;
                     for &v in succs.iter() {
-                        let cnt = main.samples.get(v).map(|bs| bs.count_ones()).unwrap_or(0);
+                        let cnt = if let Some(colors_v) = main.samples.get(v) {
+                            intersection_count(colors_u, colors_v)
+                        } else {
+                            0
+                        };
                         sum += cnt;
                         scratch.push((v, cnt));
                     }
@@ -106,14 +168,23 @@ pub fn find_bubble_endpoints(
                         return None;
                     }
 
+                    // sort successors by intersection size, then by node id
                     scratch.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
                     bump_epoch(epoch, marks.as_mut_slice());
                     let mut covered = 0usize;
+
+                    // S(u) = ⋃_v (colors(u) ∩ colors(v))
                     for (v, _c) in scratch.iter().copied() {
-                        if let Some(bs) = main.samples.get(v) {
-                            covered =
-                                union_count_until(marks.as_mut_slice(), *epoch, bs, need, covered);
+                        if let Some(colors_v) = main.samples.get(v) {
+                            covered = union_intersection_until(
+                                marks.as_mut_slice(),
+                                *epoch,
+                                colors_u,
+                                colors_v,
+                                need,
+                                covered,
+                            );
                             if covered >= need {
                                 return Some(u);
                             }
@@ -129,8 +200,9 @@ pub fn find_bubble_endpoints(
         let start_kmers: HashSet<u64> = start_vec.into_iter().collect();
 
         // =========================================
-        // END nodes (indeg ≥ 2) — unchanged logic:
-        // union of species across incoming paths
+        // END nodes (indeg ≥ 2)
+        // Symmetric logic using predecessors:
+        //   S(v) = ⋃_u (colors(v) ∩ colors(u))
         // =========================================
 
         let mut vs: Vec<u64> = main.samples.nodes().to_vec();
@@ -153,6 +225,11 @@ pub fn find_bubble_endpoints(
                     preds.clear();
                     scratch.clear();
 
+                    let colors_v = match main.samples.get(v) {
+                        Some(bs) => bs,
+                        None => return None,
+                    };
+
                     let tail = (v & sym_mask) as u32;
                     let base = v >> RECODE_BITS_PER_SYMBOL;
                     let shift_bits_u128 = shift_bits as u128;
@@ -160,6 +237,7 @@ pub fn find_bubble_endpoints(
                         return None;
                     }
 
+                    // enumerate predecessors of v
                     for head in 0..(RECODE_ALPHABET_SIZE as u32) {
                         let candidate = (((head as u128) << shift_bits_u128) | base as u128)
                             & (main.k1_mask as u128);
@@ -178,29 +256,45 @@ pub fn find_bubble_endpoints(
                         return None;
                     }
 
+                    // quick upper-bound check using intersection sizes
                     let mut sum = 0usize;
                     for &u in preds.iter() {
-                        let cnt = main.samples.get(u).map(|bs| bs.count_ones()).unwrap_or(0);
+                        let cnt = if let Some(colors_u) = main.samples.get(u) {
+                            intersection_count(colors_u, colors_v)
+                        } else {
+                            0
+                        };
                         sum += cnt;
                         scratch.push((u, cnt));
                     }
+
                     if sum < need {
                         return None;
                     }
 
+                    // sort predecessors by intersection size, then by node id
                     scratch.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
                     bump_epoch(epoch, marks.as_mut_slice());
                     let mut covered = 0usize;
+
+                    // S(v) = ⋃_u (colors(v) ∩ colors(u))
                     for (u, _c) in scratch.iter().copied() {
-                        if let Some(bs) = main.samples.get(u) {
-                            covered =
-                                union_count_until(marks.as_mut_slice(), *epoch, bs, need, covered);
+                        if let Some(colors_u) = main.samples.get(u) {
+                            covered = union_intersection_until(
+                                marks.as_mut_slice(),
+                                *epoch,
+                                colors_v,
+                                colors_u,
+                                need,
+                                covered,
+                            );
                             if covered >= need {
                                 return Some(v);
                             }
                         }
                     }
+
                     None
                 },
             )
