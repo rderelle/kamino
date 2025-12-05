@@ -19,7 +19,7 @@ pub struct Args {
     #[arg(short, long)]
     pub input: std::path::PathBuf,
 
-    /// K-mer length [k=14]
+    /// K-mer length [k=13]
     #[arg(short, long)]
     pub k: Option<usize>,
 
@@ -52,8 +52,8 @@ pub struct Args {
     #[arg(short = 't', long)]
     pub threads: Option<usize>,
 
-    /// Recoding scheme [r=dayhoff6]
-    #[arg(short = 'r', long = "recode", value_enum, default_value_t = RecodeScheme::Dayhoff6, hide_default_value = true)]
+    /// Recoding scheme [r=sr6]
+    #[arg(short = 'r', long = "recode", value_enum, default_value_t = RecodeScheme::SR6, hide_default_value = true)]
     pub recode: RecodeScheme,
 
     /// Display version information.
@@ -62,8 +62,8 @@ pub struct Args {
 }
 
 pub fn run_with_args(args: Args) -> anyhow::Result<()> {
-    // k defaults and limits for Dayhoff6
-    let default_k = 14usize;
+    // k defaults and limits for SR6
+    let default_k = 13usize;
     let max_k = 21usize;
     let default_constant = 3usize;
 
