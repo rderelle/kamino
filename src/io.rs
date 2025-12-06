@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::graph::{AdjTable, Graph, NodeColorTable, SpeciesSet};
-use crate::recode::{recode_byte, RecodeScheme, RECODE_ALPHABET_SIZE, RECODE_BITS_PER_SYMBOL};
+use crate::recode::{recode_byte, RecodeScheme, RECODE_BITS_PER_SYMBOL};
 
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -243,10 +243,9 @@ pub fn build_graph_from_dir(
                     let mut entry = samples.entry(node).or_default();
                     let species_set = entry.value_mut();
                     
-                    // Binary search for insertion point
-                    match species_set.binary_search(&sid) {
-                        Err(pos) => species_set.insert(pos, sid),
-                        Ok(_) => {} // Already present
+                    // Binary search for insertion point - only insert if not present
+                    if let Err(pos) = species_set.binary_search(&sid) {
+                        species_set.insert(pos, sid);
                     }
                 }
 
