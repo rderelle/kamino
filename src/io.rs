@@ -17,16 +17,10 @@ use rayon::ThreadPoolBuilder;
 // File I/O helpers
 // ------------------------------
 
-/// Return FASTA/proteome files from input_dir, sorted alphabetically by filename.
-/// Supported extensions (case-insensitive): .fa, .fas, .fasta, .faa, .fna and their .gz variants.
-/// Sorting is lexicographic on the final file name (case-sensitive to be fully deterministic).
 pub fn collect_fasta_files(input_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     fn is_supported_ext(p: &Path) -> bool {
-        // Accept: .fa, .fasta, .fas, .faa (any case)
-        // Also: .fa.gz, .fasta.gz, .fas.gz, .faa.gz
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext.eq_ignore_ascii_case("gz") {
-            // Inspect the "inner" extension from the file_stem
             if let Some(stem) = p.file_stem() {
                 let stem_path = Path::new(stem);
                 let inner = stem_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -51,7 +45,6 @@ pub fn collect_fasta_files(input_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         .filter(|p| is_supported_ext(p))
         .collect();
 
-    // Deterministic order: lexicographic by file name (no ties expected)
     files.sort_unstable_by(|a, b| a.file_name().unwrap().cmp(b.file_name().unwrap()));
 
     Ok(files)
@@ -91,21 +84,21 @@ pub(crate) fn open_fasta(path: &Path) -> Result<Box<dyn Read>> {
 }
 
 // ------------------------------
-// Build graph
+// Graph builder
 // ------------------------------
 
 pub fn build_graph_from_dir(
     dir: &Path,
     k: usize,
     main: &mut Graph,
-    num_threads: usize, // user-defined number of Rayon threads
+    num_threads: usize,
 ) -> Result<()> {
     let files = collect_fasta_files(dir)?;
     eprintln!("proteome files: {}", files.len());
 
     main.init_species_len(files.len());
 
-    // Pre-register species sequentially to keep IDs deterministic.
+    // Pre-register species sequentially for deterministic IDs
     let mut species_ids: Vec<u16> = Vec::with_capacity(files.len());
     for path in &files {
         let sid = main.register_species(species_name_from_path(path)) as u16;
@@ -122,7 +115,7 @@ pub fn build_graph_from_dir(
         (1u64 << sym_bits) - 1
     };
 
-    // Small helper to iterate kmers from a FASTA reader body without allocation.
+    // Single-pass kmer streaming
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn stream_kmers<R: Read>(
@@ -164,7 +157,6 @@ pub fn build_graph_from_dir(
         Ok(())
     }
 
-    // Build a local Rayon pool with the requested number of threads.
     let pool = ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build()
@@ -173,7 +165,6 @@ pub fn build_graph_from_dir(
     let adj: DashMap<u64, u32> = DashMap::new();
     let samples: DashMap<u64, SpeciesSet> = DashMap::new();
 
-    // Parallel over proteome files inside this pool and batch updates to shared structures.
     pool.install(|| -> Result<()> {
         files
             .par_iter()
@@ -182,10 +173,10 @@ pub fn build_graph_from_dir(
                 let rdr = open_fasta(path)?;
                 let reader = FastaReader::new(rdr);
 
-                // Thread-local storage for this file's processing
-                let mut out_masks: HashMap<u64, u32> = HashMap::with_capacity(1_000_000);
+                // Thread-local adjacency tracking
+                let mut local_adj: HashMap<u64, u32> = HashMap::with_capacity(1_000_000);
 
-                // First pass: fill out_masks with per-node outgoing bitmasks.
+                // Single pass: build adjacency masks
                 stream_kmers(
                     reader,
                     k,
@@ -195,8 +186,7 @@ pub fn build_graph_from_dir(
                     sym_mask,
                     |u, sym, _v| {
                         let bit = 1u32 << sym;
-                        let entry_u = out_masks.entry(u).or_insert(0);
-                        *entry_u |= bit;
+                        *local_adj.entry(u).or_insert(0) |= bit;
                     },
                     recode_scheme,
                 )?;
@@ -204,13 +194,13 @@ pub fn build_graph_from_dir(
                 let mut kept = 0usize;
                 let mut dropped = 0usize;
 
-                // Thread-local batch storage before merging to shared DashMaps
-                let mut local_adj: HashMap<u64, u32> = HashMap::with_capacity(out_masks.len());
-                let mut local_nodes: Vec<u64> = Vec::with_capacity(out_masks.len() * 2);
+                // Batch storage for updates
+                let mut adj_updates: Vec<(u64, u32)> = Vec::with_capacity(local_adj.len());
+                let mut node_updates: Vec<u64> = Vec::with_capacity(local_adj.len() * 2);
 
-                // Second pass: keep kmers with out-degree == 1 and collect in local storage
-                for (u, &mask) in out_masks.iter() {
-                    if mask == 0 {
+                // Filter: keep only nodes with out-degree == 1
+                for (u, mask) in local_adj.iter() {
+                    if *mask == 0 {
                         continue;
                     }
 
@@ -224,11 +214,9 @@ pub fn build_graph_from_dir(
                     let bit = 1u32 << sym;
                     let v = (((*u) << sym_bits) | (sym as u64)) & k1_mask;
 
-                    // Store in local structures instead of directly updating DashMaps
-                    local_adj.entry(*u).and_modify(|m| *m |= bit).or_insert(bit);
-                    local_nodes.push(*u);
-                    local_nodes.push(v);
-
+                    adj_updates.push((*u, bit));
+                    node_updates.push(*u);
+                    node_updates.push(v);
                     kept += 1;
                 }
 
@@ -239,33 +227,32 @@ pub fn build_graph_from_dir(
                     dropped
                 );
 
-                // Batch merge local_adj into shared adj DashMap
-                for (node, mask) in local_adj {
-                    adj.entry(node).and_modify(|m| *m |= mask).or_insert(mask);
+                // Batch merge adjacency
+                for (node, mask) in adj_updates {
+                    adj.entry(node)
+                        .and_modify(|m| *m |= mask)
+                        .or_insert(mask);
                 }
 
-                // Batch merge local_nodes into shared samples DashMap
-                // Sort and dedup to minimize redundant lookups
-                local_nodes.sort_unstable();
-                local_nodes.dedup();
+                // Sort and dedup nodes
+                node_updates.sort_unstable();
+                node_updates.dedup();
 
-                for node in local_nodes {
+                // Batch update samples - use entry API efficiently
+                for node in node_updates {
                     let mut entry = samples.entry(node).or_default();
-                    let species = entry.value_mut();
-
-                    match species.binary_search(&sid) {
-                        Ok(_) => {
-                            // already present
-                        }
-                        Err(pos) => {
-                            species.insert(pos, sid);
-                        }
+                    let species_set = entry.value_mut();
+                    
+                    // Binary search for insertion point
+                    match species_set.binary_search(&sid) {
+                        Err(pos) => species_set.insert(pos, sid),
+                        Ok(_) => {} // Already present
                     }
                 }
 
                 Ok(())
             })
-    })?; // propagate any I/O / parsing errors
+    })?;
 
     main.adj = AdjTable::from_iter(adj);
     main.samples = NodeColorTable::from_iter(samples, main.n_species);
@@ -281,18 +268,4 @@ pub fn print_graph_size(g: &Graph) {
         .map(|(_, mask)| mask.count_ones() as usize)
         .sum();
     eprintln!("graph size: nodes={} edges={}", nodes, edges);
-}
-
-#[allow(dead_code)]
-pub fn assert_adj_masks_within_alphabet(g: &Graph) {
-    // Ensures we never set adjacency bits >= alphabet size.
-    let max_bit = RECODE_ALPHABET_SIZE as u32;
-    for (_, mask) in g.adj.iter() {
-        if mask >> max_bit != 0 {
-            panic!(
-                "Adjacency has bits set >= alphabet_size ({}).",
-                RECODE_ALPHABET_SIZE
-            );
-        }
-    }
 }
