@@ -173,7 +173,7 @@ pub fn build_graph_from_dir(
     let adj: DashMap<u64, u32> = DashMap::new();
     let samples: DashMap<u64, SpeciesSet> = DashMap::new();
 
-    // Parallel over proteome files inside this pool and update the global structures on the fly.
+    // Parallel over proteome files inside this pool and batch updates to shared structures.
     pool.install(|| -> Result<()> {
         files
             .par_iter()
@@ -182,7 +182,7 @@ pub fn build_graph_from_dir(
                 let rdr = open_fasta(path)?;
                 let reader = FastaReader::new(rdr);
 
-                // with_capacity is enough for bacteria but not for eukaryotes
+                // Thread-local storage for this file's processing
                 let mut out_masks: HashMap<u64, u32> = HashMap::with_capacity(1_000_000);
 
                 // First pass: fill out_masks with per-node outgoing bitmasks.
@@ -204,21 +204,11 @@ pub fn build_graph_from_dir(
                 let mut kept = 0usize;
                 let mut dropped = 0usize;
 
-                let update_node = |node: u64| {
-                    let mut entry = samples.entry(node).or_default();
-                    let species = entry.value_mut();
+                // Thread-local batch storage before merging to shared DashMaps
+                let mut local_adj: HashMap<u64, u32> = HashMap::with_capacity(out_masks.len());
+                let mut local_nodes: Vec<u64> = Vec::with_capacity(out_masks.len() * 2);
 
-                    match species.binary_search(&sid) {
-                        Ok(_) => {
-                            // already present
-                        }
-                        Err(pos) => {
-                            species.insert(pos, sid);
-                        }
-                    }
-                };
-
-                // Second pass: keep kmers with out-degree == 1
+                // Second pass: keep kmers with out-degree == 1 and collect in local storage
                 for (u, &mask) in out_masks.iter() {
                     if mask == 0 {
                         continue;
@@ -234,10 +224,10 @@ pub fn build_graph_from_dir(
                     let bit = 1u32 << sym;
                     let v = (((*u) << sym_bits) | (sym as u64)) & k1_mask;
 
-                    adj.entry(*u).and_modify(|m| *m |= bit).or_insert(bit);
-
-                    update_node(*u);
-                    update_node(v);
+                    // Store in local structures instead of directly updating DashMaps
+                    local_adj.entry(*u).and_modify(|m| *m |= bit).or_insert(bit);
+                    local_nodes.push(*u);
+                    local_nodes.push(v);
 
                     kept += 1;
                 }
@@ -248,6 +238,30 @@ pub fn build_graph_from_dir(
                     kept,
                     dropped
                 );
+
+                // Batch merge local_adj into shared adj DashMap
+                for (node, mask) in local_adj {
+                    adj.entry(node).and_modify(|m| *m |= mask).or_insert(mask);
+                }
+
+                // Batch merge local_nodes into shared samples DashMap
+                // Sort and dedup to minimize redundant lookups
+                local_nodes.sort_unstable();
+                local_nodes.dedup();
+
+                for node in local_nodes {
+                    let mut entry = samples.entry(node).or_default();
+                    let species = entry.value_mut();
+
+                    match species.binary_search(&sid) {
+                        Ok(_) => {
+                            // already present
+                        }
+                        Err(pos) => {
+                            species.insert(pos, sid);
+                        }
+                    }
+                }
 
                 Ok(())
             })
