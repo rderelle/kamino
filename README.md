@@ -3,18 +3,19 @@
 [![codecov](https://codecov.io/github/rderelle/kamino/graph/badge.svg?token=6B8WIGZL2F)](https://codecov.io/github/rderelle/kamino)
 [![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/kamino/README.html)
 
-<br>
-<h1 align="center">kamino</h1>
+<br><br>
+<p align="center">
+  <img src="logo_kamino.svg" alt="kamino logo" width="500">
+</p>
+
 <br><br>
 
-<h2> 🚧  work in progress </h2>
-
-<br><br>
+From the Spanish word for *path*.  
 
 Builds an amino-acid alignment in a reference-free, alignment-free manner from a set of proteomes.  
 Not ‘better’ than traditional marker-based pipelines, but simpler and faster to run.  
   
-Typical usages range from between-strains to within-phylum phylogenetic analyses (bacteria, archaea and eukaryotes).
+Typical usages range from between-species to within-phylum phylogenetic analyses (bacteria, archaea and eukaryotes).
 
 <br>
 
@@ -66,26 +67,25 @@ kamino -i <input_dir> -t 4
 
 ## examples
 
-All analyses were performed using v0.1 on a MacBook M4 pro using 4 threads (other parameters set to default):  
+All analyses were performed on a MacBook M4 pro using 4 threads (other parameters set to default):  
 
 | dataset                     | taxonomic diversity  | runtime (min) | memory (GB) | alignment size (aa) |
 |-----------------------------|----------------------|---------------|-------------|---------------------|
-| 50 *Mycobacterium*          | within-genera        | 0.2           | 3           | 15.618              |
-| 400 *Mycobacterium*         | within-genera        | 1.4           | 11          | 12.291              |
-| 50 Polyporales (fungi)     | within-order         | 0.8           | 11          | 18.318              |
-| 290 *A. fumigatus* (fungi)  | within-species       | 2.7           | 14          | 64.602              |
-| 46 *Drosophila*             | within-genera        | 1             | 10          | 190.175             |
-| 55 Mammalia                 | within-class         | 1.9           | 12          | 277.334             |  
+| 50 *Mycobacterium*          | within-genera        | 0.1           | 2           | 16.088              |
+| 400 *Mycobacterium*         | within-genera        | 0.9           | 8           | 11.745              |
+| 50 Polyporales (fungi)      | within-order         | 0.5           | 7           | 17.512              |
+| 46 *Drosophila*             | within-genera        | 0.7           | 5           | 196.212             |
+| 55 Mammalia                 | within-class         | 1.5           | 8           | 328.205             |  
 
 
-And using the 400 *Mycobacterium* dataset to understand how parameters can impact the analyses (all using 4 threads):
+And using the 400 Mycobacterium dataset to examine how parameter choices affect the analyses (still with 4 threads):
 
 | parameters                | runtime (min) | memory (GB) | alignment size (aa) |
 |---------------------------|---------------|-------------|---------------------|
-| [default: k=14, d=4]      | 1.4           | 11          | 12.291              |
-| --k 15                    | 1.4           | 13          | 18.772              |
-| --depth 5                 | 1.6           | 11          | 16.773              |
-| --k 15 --depth 5          | 1.6           | 13          | 24.835              |
+| [default: k=13, d=4]      | 0.9           | 8           | 11.745              |
+| --k 14                    | 0.9           | 9           | 17.515              |
+| --depth 5                 | 1             | 8           | 17.003              |
+| --k 15 --depth 5          | 1             | 9           | 23.706              |
 
 
 ---
@@ -93,7 +93,7 @@ And using the 400 *Mycobacterium* dataset to understand how parameters can impac
 ## FAQ
 
 - **When not to use kamino?**
-    * low diversity datasets (ie, within-strain), for which genome-based approaches will be more powerful 
+    * low diversity datasets (ie, within-species), for which genome-based approaches will be more powerful 
     * very large datasets (eg, thousands of bacterial proteomes or hundreds of vertebrate proteomes)
     * very divergent datasets (eg, animal kingdom)
     * distant outgroup composed of a few isolates: these might have disproportionately more missing data
