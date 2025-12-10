@@ -85,7 +85,7 @@ And using the 400 Mycobacterium dataset to examine how parameter choices affect 
 | [default: k=13, d=4]      | 0.9           | 8           | 11.745              |
 | --k 14                    | 0.9           | 9           | 17.515              |
 | --depth 5                 | 1             | 8           | 17.003              |
-| --k 15 --depth 5          | 1             | 9           | 23.706              |
+| --k 14 --depth 5          | 1             | 9           | 23.706              |
 
 
 ---
