@@ -1,5 +1,5 @@
 [package]
-name = "kamino"
+name = "kamino-cli"
 version = "0.3.0"
 edition = "2021"
 description = "Build phylogenomic datasets in seconds."
@@ -31,3 +31,7 @@ debug = true
 
 [package.metadata.docs.rs]
 all-features = true
+
+[[bin]]
+name = "kamino"
+path = "src/main.rs"
