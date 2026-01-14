@@ -1,5 +1,5 @@
 use clap::Parser;
-use kamino::{run_with_args, Args};
+use kamino_cli::{run_with_args, Args};
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
