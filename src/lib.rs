@@ -1,31 +1,128 @@
+//! # Kamino
+//!
+//! Kamino builds an amino-acid alignment in a reference-free, alignment-free manner from
+//! a set of proteomes. It is not “better” than traditional marker-based pipelines, but it is
+//! simpler and faster to use.
+//!
+//! Typical usage ranges from between-species to within-phylum phylogenetic analyses (bacteria,
+//! archaea, and eukaryotes).
+//!
+//! ## Input modes
+//! Kamino accepts proteome files as input in one of two modes:
+//! - **Directory mode** (`--input-directory`): a directory containing FASTA proteomes
+//!   (plain text or `.gz` compressed). Each file represents one isolate. Filenames minus the
+//!   extension become sequence names in the final amino-acid alignment.
+//! - **Table mode** (`--input-file`): a tab-delimited file mapping a species/sample name
+//!   to a proteome path (one name + path pair per line). This is useful when file names
+//!   do not encode the sample name or when proteomes are located in multiple directories.
+//!
+//!
+//! ## Arguments
+//! - `-k`, `--k`: k-mer length (default: 13; must be within the valid range for the
+//!   selected recoding scheme).
+//! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position
+//!   (default: 0.85; must be ≥ 0.6).
+//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 4).
+//! - `-o`, `--output`: output prefix for generated files (default: `kamino`).
+//! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers
+//!   (default: 3; must be ≤ k-1).
+//! - `-l`, `--length-middle`: maximum number of middle positions per variant group
+//!   (default: 2 * k; must be ≥ 1).
+//! - `-m`, `--mask`: mask middle segments with long mismatch runs (default: 5).
+//! - `-t`, `--threads`: number of threads used for graph construction and analysis
+//!   (default: 1).
+//! - `-r`, `--recode`: amino-acid recoding scheme (default: `sr6`).
+//! - `-v`, `--version`: print version information and exit.
+//!
+//!
+//! ## Important things to optimize
+//! The main parameters governing the number of phylogenetic positions in the final alignment are
+//! the k-mer size (-k), the depth of the recursive graph traversal (-d), and the minimum sample
+//! frequency (-f). If the final alignment is too short, you may want to modify some
+//! of these three parameters.
+//!
+//! The default k-mer size (k=13) is set to avoid excessive memory use. Increasing the k-mer size
+//! to 14 generally yields much longer alignments, but in some cases with a substantial increase in memory
+//! usage. Please note that further increases in k-mer size do not necessarily increase the size of the
+//! final alignment, because bubble start and end k-mers present in most samples become less frequent
+//! (→ fewer variant groups → shorter final alignment).
+//!
+//! Increasing the depth of the recursive graph traversal (e.g., from 4 to 6) can also increase the size
+//! of the final alignment as kamino detects more variant groups during the graph traversal. However, runtimes
+//! become challenging at d=8 and beyond.
+//!
+//! Finally, it is also possible to produce larger alignments by decreasing the minimum fraction of samples
+//! with an amino-acid (e.g., from 0.85 to 0.8), although samples will have more missing data in the final alignment.
+//! Missing data in the alignment are represented by '-' (missing amino acid) and 'X' (ambiguous or masked amino acid).
+//!
+//!
+//! ## Less important parameters
+//! Besides testing/benchmarking, I would not recommend modifying these parameter values.
+//!
+//! The number of constant positions in the final alignment can be adjusted with the --constant parameter. These are
+//! taken from the left flank of the end k-mer in each variant group, next to the middle positions. Because these
+//! positions are recoded, some may become polymorphic once converted back to amino acids. Using the default c=3,
+//! constant positions represent 60 to 75% of the alignment.
+//!
+//! The --mask parameter controls the amino-acid masking performed by kamino to prevent long runs of polymorphism from being
+//! retained in the final alignment. These correspond to genuine but unwanted polymorphisms (e.g., micro-inversions) or,
+//! less frequently, errors made by kamino (“misaligned” paths due to the presence of two consecutive indels). The minimum length
+//! of polymorphism runs to be masked can be decreased using this parameter to be more stringent.
+//!
+//! The --length-middle parameter is used to filter out long variant groups. Increase this parameter to allow more
+//! variant groups to be retained in the final alignment. Please note that this parameter might be removed in future versions.
+//!
+//! Finally, the 6-letter recoding scheme can be modified using the --recode parameter, although the default sr6 recoding
+//! scheme performed the best in most of my tests (sr6 ≥ dayhoff6 ≫ kgb6).
+//!
+//!
+//! ## Output files
+//! Given an output prefix (by default `kamino`), the CLI emits three files:
+//! - `<prefix>_alignment.fas`: FASTA amino acid alignment of samples.
+//! - `<prefix>_missing.tsv`: tab-delimited per-sample percentage of missingness.
+//! - `<prefix>_partitions.tsv`: tab-delimited variant group coordinates (0-based) in the FASTA alignment.
+//!
+//! The log output printed to stderr includes a summary of parameter values, counts of
+//! bubble endpoints and variant groups, and alignment statistics to help interpret the analyses.
 use clap::{ArgAction, Parser};
 
 mod bubbles;
+mod filter_groups;
 mod graph;
 mod io;
+mod middle_mask;
 mod output;
 mod recode;
+mod revert_aminoacid;
 mod traverse;
 //mod util;
-mod variant_groups;
 
 pub use recode::RecodeScheme;
 
 /// Build a node-based, colored de Bruijn graph from amino-acid proteomes and analyze bubbles.
 #[derive(Parser, Debug)]
 #[command(author, version, about, disable_version_flag = true)]
+#[command(
+    group = clap::ArgGroup::new("input_source")
+        .required(true)
+        .args(["input", "input_file"])
+)]
 pub struct Args {
     /// Input directory with FASTA proteomes (plain or .gz)
-    #[arg(short, long)]
-    pub input: std::path::PathBuf,
+    #[arg(short, long = "input-directory")]
+    pub input: Option<std::path::PathBuf>,
+
+    /// Tab-delimited file mapping species name to proteome path
+    #[arg(short = 'I', long = "input-file")]
+    pub input_file: Option<std::path::PathBuf>,
 
     /// K-mer length [k=13]
     #[arg(short, long)]
     pub k: Option<usize>,
 
-    /// Minimal sample frequency [m=0.85]
+    /// Minimal fraction of samples with an amino-acid per position [m=0.85]
     #[arg(
-        short = 'm',
+        short = 'f',
         long = "min-freq",
         default_value_t = 0.85,
         hide_default_value = true
@@ -47,6 +144,10 @@ pub struct Args {
     /// Maximum number of middle positions per variant group [l=2*k]
     #[arg(short = 'l', long = "length-middle")]
     pub length_middle: Option<usize>,
+
+    /// Mask middle segments with long mismatch runs [m=5]
+    #[arg(short = 'm', long = "mask", default_value_t = 5, hide_default_value = true)]
+    pub mask: usize,
 
     /// Number of threads [t=1]
     #[arg(short = 't', long)]
@@ -106,22 +207,37 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     anyhow::ensure!(num_threads >= 1, "threads must be ≥ 1");
 
     eprintln!("kamino v{}", env!("CARGO_PKG_VERSION"));
+    let (input_label, species_inputs) = if let Some(table) = args.input_file.as_ref() {
+        (
+            format!("input_file={}", table.display()),
+            io::collect_species_inputs_from_table(table)?,
+        )
+    } else if let Some(dir) = args.input.as_ref() {
+        (
+            format!("input={}", dir.display()),
+            io::collect_species_inputs_from_dir(dir)?,
+        )
+    } else {
+        anyhow::bail!("Either --input-directory or --input-file must be provided.");
+    };
+
     eprintln!(
-        "parameters: k={} constant={} min_freq={} depth={} length_middle={} threads={} recode={} input={} output={}",
+        "parameters: k={} constant={} min_freq={} depth={} length_middle={} mask={} threads={} recode={} {} output={}",
         k,
         constant,
         min_freq,
         args.depth,
         length_middle,
+        args.mask,
         num_threads,
         args.recode,
-        args.input.display(),
+        input_label,
         args.output.display()
     );
 
     // Build global graph
     let mut g = graph::Graph::new(k, args.recode);
-    io::build_graph_from_dir(&args.input, k, &mut g, num_threads)?;
+    io::build_graph_from_inputs(&species_inputs, k, &mut g, num_threads)?;
 
     // Basic stats
     io::print_graph_size(&g);
@@ -155,7 +271,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     // traverse::print_variant_group_sequences(&g, &groups);
 
     let (alignment_len, alignment_missing_pct) = output::write_outputs_with_head(
-        &args.input,
+        &species_inputs,
         &args.output,
         &g,
         &groups,
@@ -163,6 +279,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         constant,
         min_freq,
         length_middle,
+        args.mask,
         num_threads,
     )?;
     let (fas_path, tsv_path, partitions_path) = output::output_paths(&args.output);

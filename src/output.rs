@@ -4,102 +4,11 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crate::filter_groups::build_concatenated_alignment_streaming;
 use crate::graph::Graph;
+use crate::io::SpeciesInput;
+use crate::revert_aminoacid;
 use crate::traverse::VariantGroups;
-use crate::variant_groups::{
-    build_group_block, build_variant_group_alignment, GroupOutcome, VariantGroupAlignment,
-};
-use hashbrown::HashMap;
-use rayon::prelude::*;
-
-/// Assemble the final concatenated alignment matrix for all variant groups.
-///
-/// The function walks each variant group in deterministic order, applies the
-/// middle-filter rules, and stitches the retained blocks into a single matrix
-/// while tracking the block boundaries. Consensus repainting relies on the
-/// per-species k-mer consensus gathered earlier in the pipeline.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_concatenated_alignment(
-    groups: &VariantGroups,
-    k: usize,
-    k1: usize,
-    head_keep: usize,
-    sym_bits: u32,
-    scan_k: usize,
-    species_kmer_maps: &[HashMap<u64, usize>],
-    species_kmer_consensus: &[Vec<Option<Vec<u8>>>],
-    bubble_ratio: f32,
-    max_middle_len: usize,
-    n: usize,
-) -> Result<VariantGroupAlignment> {
-    // Per-species buffers for the final concatenated alignment.
-    let mut concat: Vec<Vec<u8>> = vec![Vec::new(); n];
-    let mut partitions: Vec<(usize, usize, usize)> = Vec::new();
-    let mut current_pos: usize = 0;
-    let bubble_ratio_f = bubble_ratio as f64;
-
-    // Deterministic iteration: sort (start,end)
-    let mut keys: Vec<(u64, u64)> = groups.keys().copied().collect();
-    keys.sort_unstable();
-
-    let mut dropped_blocks_due_to_middle_filter = 0usize;
-    let mut dropped_blocks_due_to_length = 0usize;
-
-    let group_results: Vec<GroupOutcome> = keys
-        .par_iter()
-        .map(|&key| {
-            let paths = &groups[&key];
-            build_group_block(
-                key,
-                paths,
-                k,
-                k1,
-                head_keep,
-                sym_bits,
-                scan_k,
-                species_kmer_maps,
-                species_kmer_consensus,
-                bubble_ratio_f,
-                max_middle_len,
-                n,
-            )
-        })
-        .collect();
-
-    for outcome in group_results {
-        match outcome {
-            GroupOutcome::Kept {
-                filtered_rows,
-                filtered_len,
-            } => {
-                let start_pos = current_pos;
-                let end_pos = start_pos + filtered_len - 1;
-                partitions.push((start_pos, end_pos, filtered_len));
-                current_pos += filtered_len;
-
-                for (sid, row) in filtered_rows.into_iter().enumerate() {
-                    let dst = &mut concat[sid];
-                    dst.reserve(row.len());
-                    dst.extend_from_slice(&row);
-                }
-            }
-            GroupOutcome::DroppedMiddle => {
-                dropped_blocks_due_to_middle_filter += 1;
-            }
-            GroupOutcome::DroppedLength => {
-                dropped_blocks_due_to_length += 1;
-            }
-            GroupOutcome::Skipped => {}
-        }
-    }
-
-    Ok(VariantGroupAlignment {
-        concat,
-        partitions,
-        dropped_blocks_due_to_middle_filter,
-        dropped_blocks_due_to_length,
-    })
-}
 
 pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf) {
     /// Build an output path next to the base path while keeping the stem.
@@ -139,7 +48,7 @@ pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf) {
 /// files alongside summary stats.
 #[allow(clippy::too_many_arguments)]
 pub fn write_outputs_with_head(
-    input_dir: &Path,
+    inputs: &[SpeciesInput],
     out_base: &Path,
     g: &Graph,
     groups: &VariantGroups,
@@ -147,20 +56,34 @@ pub fn write_outputs_with_head(
     head_max: usize,   // user-defined n; must be ≤ k-1
     bubble_ratio: f32, // proportion of species present required to keep a column
     max_middle_len: usize,
+    mask_m: usize,
     num_threads: usize,
 ) -> Result<(usize, f64)> {
     let species = &g.species_names;
+    let n = g.n_species;
 
-    let alignment = build_variant_group_alignment(
-        input_dir,
-        g,
+    let (scan_k, species_kmer_maps, species_kmer_consensus) =
+        revert_aminoacid::build_species_kmer_consensus(
+            inputs,
+            g,
+            groups,
+            k,
+            head_max,
+            num_threads,
+        )?;
+
+    let alignment = build_concatenated_alignment_streaming(
         groups,
         k,
         head_max,
         bubble_ratio,
         max_middle_len,
-        num_threads,
-    )?;
+        mask_m,
+        scan_k,
+        &species_kmer_maps,
+        &species_kmer_consensus,
+        n,
+    );
 
     let (fas_path, tsv_path, partitions_path) = output_paths(out_base);
     let (concat, partitions, dropped_middle, dropped_length) = (

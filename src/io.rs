@@ -4,7 +4,7 @@ use flate2::read::MultiGzDecoder;
 use hashbrown::HashMap;
 use seq_io::fasta::{Reader as FastaReader, Record};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::hash::BuildHasherDefault;
 use rustc_hash::FxHasher;
@@ -56,6 +56,112 @@ pub fn collect_fasta_files(input_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[derive(Debug, Clone)]
+pub struct SpeciesInput {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+pub fn collect_species_inputs_from_dir(input_dir: &Path) -> anyhow::Result<Vec<SpeciesInput>> {
+    let files = collect_fasta_files(input_dir)?;
+    let mut seen = hashbrown::HashSet::new();
+    let mut inputs: Vec<SpeciesInput> = Vec::with_capacity(files.len());
+
+    for path in files {
+        let name = species_name_from_path(&path);
+        if !seen.insert(name.clone()) {
+            anyhow::bail!(
+                "isolate name {:?} appears more than once in input directory.",
+                name
+            );
+        }
+        inputs.push(SpeciesInput { name, path });
+    }
+
+    inputs.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    Ok(inputs)
+}
+
+pub fn collect_species_inputs_from_table(table_path: &Path) -> anyhow::Result<Vec<SpeciesInput>> {
+    let file = File::open(table_path).with_context(|| format!("open {:?}", table_path))?;
+    let reader = BufReader::new(file);
+    let base_dir = table_path.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut seen = hashbrown::HashSet::new();
+    let mut inputs: Vec<SpeciesInput> = Vec::new();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("read {:?}", table_path))?;
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut parts = trimmed.split('\t');
+        let Some(raw_name) = parts.next() else {
+            anyhow::bail!(
+                "Line {} in {:?} does not contain a species name.",
+                line_idx + 1,
+                table_path
+            );
+        };
+        let Some(raw_path) = parts.next() else {
+            anyhow::bail!(
+                "Line {} in {:?} is missing a proteome path.",
+                line_idx + 1,
+                table_path
+            );
+        };
+        if parts.next().is_some() {
+            anyhow::bail!(
+                "Line {} in {:?} has more than two tab-delimited columns.",
+                line_idx + 1,
+                table_path
+            );
+        }
+
+        let name = raw_name.trim();
+        let path_str = raw_path.trim();
+        if name.is_empty() || path_str.is_empty() {
+            anyhow::bail!(
+                "Line {} in {:?} must contain non-empty isolate name and path.",
+                line_idx + 1,
+                table_path
+            );
+        }
+
+        if !seen.insert(name.to_string()) {
+            anyhow::bail!(
+                "isolate name {:?} appears more than once in {:?}.",
+                name,
+                table_path
+            );
+        }
+
+        let mut path = PathBuf::from(path_str);
+        if path.is_relative() {
+            path = base_dir.join(path);
+        }
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("read metadata for {:?}", path))?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "Proteome path {:?} (line {} in {:?}) is not a file.",
+            path,
+            line_idx + 1,
+            table_path
+        );
+
+        inputs.push(SpeciesInput {
+            name: name.to_string(),
+            path,
+        });
+    }
+
+    inputs.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    Ok(inputs)
+}
+
 pub(crate) fn species_name_from_path(p: &std::path::Path) -> String {
     let mut stem = p
         .file_name()
@@ -95,21 +201,20 @@ pub(crate) fn open_fasta(path: &Path) -> Result<Box<dyn Read>> {
 // Graph builder
 // ------------------------------
 
-pub fn build_graph_from_dir(
-    dir: &Path,
+pub fn build_graph_from_inputs(
+    inputs: &[SpeciesInput],
     k: usize,
     main: &mut Graph,
     num_threads: usize,
 ) -> Result<()> {
-    let files = collect_fasta_files(dir)?;
-    eprintln!("proteome files: {}", files.len());
+    eprintln!("proteome files: {}", inputs.len());
 
-    main.init_species_len(files.len());
+    main.init_species_len(inputs.len());
 
     // Pre-register species sequentially for deterministic IDs
-    let mut species_ids: Vec<u16> = Vec::with_capacity(files.len());
-    for path in &files {
-        let sid = main.register_species(species_name_from_path(path)) as u16;
+    let mut species_ids: Vec<u16> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let sid = main.register_species(input.name.clone()) as u16;
         species_ids.push(sid);
     }
 
@@ -174,11 +279,11 @@ pub fn build_graph_from_dir(
     let samples: FastDashMap<u64, SpeciesSet> = FastDashMap::default();
 
     pool.install(|| -> Result<()> {
-        files
+        inputs
             .par_iter()
             .zip(species_ids.par_iter().copied())
-            .try_for_each(|(path, sid)| -> Result<()> {
-                let rdr = open_fasta(path)?;
+            .try_for_each(|(input, sid)| -> Result<()> {
+                let rdr = open_fasta(&input.path)?;
                 let reader = FastaReader::new(rdr);
 
                 // Thread-local adjacency tracking (with_capacity needs further optimisation)
@@ -237,7 +342,7 @@ pub fn build_graph_from_dir(
 
                 eprintln!(
                     "[{}] kept={} dropped={}",
-                    path.file_name().and_then(|x| x.to_str()).unwrap_or("?"),
+                    input.path.file_name().and_then(|x| x.to_str()).unwrap_or("?"),
                     kept,
                     dropped
                 );
