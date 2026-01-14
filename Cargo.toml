@@ -2,6 +2,12 @@
 name = "kamino"
 version = "0.3.0"
 edition = "2021"
+description = "Build phylogenomic datasets in seconds."
+license = "MIT"
+repository = "https://github.com/rderelle/kamino"
+readme = "README.md"
+keywords = ["bioinformatics", "phylogenomic", "k-mer"]
+categories = ["science"]
 
 [dependencies]
 anyhow = "1"
