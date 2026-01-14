@@ -4,38 +4,15 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use seq_io::fasta::{Reader as FastaReader, Record};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::graph::Graph;
-use crate::io::{collect_fasta_files, open_fasta, species_name_from_path};
+use crate::io::{open_fasta, SpeciesInput};
 use crate::recode::{recode_byte, RecodeScheme, RECODE_BITS_PER_SYMBOL};
 use crate::traverse::{PathRec, VariantGroups};
 
-/// Alignment output pieces produced for all variant groups.
-///
-/// * `concat` stores the stitched alignment rows, one per species.
-/// * `partitions` records the start/end indices for each variant group block.
-/// * `dropped_blocks_due_to_middle_filter` counts blocks discarded by the
-///   uniqueness/missing filter on middle positions.
-/// * `dropped_blocks_due_to_length` counts blocks that were too long once the
-///   middle segment limit was applied.
-pub struct VariantGroupAlignment {
-    pub concat: Vec<Vec<u8>>,
-    pub partitions: Vec<(usize, usize, usize)>,
-    pub dropped_blocks_due_to_middle_filter: usize,
-    pub dropped_blocks_due_to_length: usize,
-}
-
-/// Outcome of attempting to build a single variant-group alignment block.
-pub(crate) enum GroupOutcome {
-    Kept {
-        filtered_rows: Vec<Vec<u8>>,
-        filtered_len: usize,
-    },
-    DroppedMiddle,
-    DroppedLength,
-    Skipped,
-}
+pub(crate) type SpeciesKmerConsensus =
+    (usize, Vec<HashMap<u64, usize>>, Vec<Vec<Option<Vec<u8>>>>);
 
 enum PathData<'a> {
     Recoded {
@@ -132,247 +109,17 @@ fn encoded_kmers_from_codes(codes: &[u8], k: usize, sym_bits: u32) -> Vec<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_group_block(
-    key: (u64, u64),
-    paths: &[PathRec],
-    k: usize,
-    k1: usize,
-    head_keep: usize,
-    sym_bits: u32,
-    scan_k: usize,
-    species_kmer_maps: &[HashMap<u64, usize>],
-    species_kmer_consensus: &[Vec<Option<Vec<u8>>>],
-    bubble_ratio: f64,
-    max_middle_len: usize,
-    n: usize,
-) -> GroupOutcome {
-    // Produce a single alignment block for the group identified by `key`,
-    // repainting sequences from per-species consensus and respecting the
-    // middle-length and middle-uniqueness filters.
-    // Deterministic order for paths: by length, then lexicographically on node IDs
-    let mut local_paths: Vec<&PathRec> = paths.iter().collect();
-    local_paths.sort_unstable_by(|a, b| {
-        a.nodes
-            .len()
-            .cmp(&b.nodes.len())
-            .then_with(|| a.nodes.cmp(&b.nodes))
-    });
-
-    // Collect per-path data
-    let mut per_path: Vec<PathData> = Vec::with_capacity(local_paths.len());
-    let mut block_len: Option<usize> = None;
-
-    for p in local_paths {
-        if p.nodes.is_empty() {
-            continue;
-        }
-        let path_codes = render_path_codes(&p.nodes, k, sym_bits);
-        if path_codes.is_empty() {
-            continue;
-        }
-
-        let len = path_codes.len();
-        block_len.get_or_insert(len);
-
-        per_path.push(PathData::Recoded {
-            codes: path_codes,
-            species: &p.species,
-        });
-    }
-
-    let Some(bl) = block_len else {
-        // no usable paths for this group
-        return GroupOutcome::Skipped;
-    };
-
-    // One alignment block per group: start with '-' everywhere
-    let mut block: Vec<Vec<u8>> = vec![vec![b'-'; bl]; n];
-
-    // Merge paths into the block.
-    for data in per_path.into_iter() {
-        let PathData::Recoded { codes, species } = data;
-        // Repaint from per-k-mer 20AA consensus.
-        if scan_k == 0 || codes.len() < scan_k {
-            continue;
-        }
-        let kmers = encoded_kmers_from_codes(&codes, scan_k, sym_bits);
-
-        for (sid, row) in block.iter_mut().enumerate().take(n) {
-            if !species.get(sid).map(|b| *b).unwrap_or(false) {
-                continue;
-            }
-            let map = &species_kmer_maps[sid];
-            let cons_vec = &species_kmer_consensus[sid];
-
-            // Each k-mer kmers[j] covers positions [j .. j+scan_k) in the path.
-            for (j, &km) in kmers.iter().enumerate() {
-                let Some(&idx) = map.get(&km) else {
-                    continue;
-                };
-                let Some(ref kseq) = cons_vec[idx] else {
-                    continue;
-                };
-                debug_assert_eq!(
-                    kseq.len(),
-                    scan_k,
-                    "Consensus k-mer length mismatch for species {} in group ({}, {})",
-                    sid,
-                    key.0,
-                    key.1
-                );
-                for (offset, &newc) in kseq.iter().enumerate().take(scan_k) {
-                    let pos = j + offset;
-                    if pos >= bl {
-                        break;
-                    }
-                    let cur = row[pos];
-                    if cur == b'-' {
-                        row[pos] = newc;
-                    } else if newc == b'-' {
-                        // keep cur
-                    } else if cur == newc {
-                        // identical call; keep cur
-                    } else {
-                        row[pos] = b'X';
-                    }
-                }
-            }
-        }
-    }
-
-    // Region indices
-    let lead_full = k1;
-    let trail_full = k1;
-
-    let middle_start = lead_full;
-    let middle_end = bl - trail_full; // exclusive
-    let middle_len = middle_end - middle_start;
-
-    // Missing cutoff based on presence ratio requirement (presence_ratio = 1 - missing_ratio >= bubble_ratio)
-    let missing_cutoff = 1.0 - bubble_ratio;
-
-    // Trailing constant slice: the end k-mer contributes k-1 columns
-    let tail_const_start = bl - k1;
-
-    let tail_const_keep = head_keep.min(bl - tail_const_start);
-    let tail_const_end = tail_const_start.saturating_add(tail_const_keep);
-
-    // Columns from the trailing context (beginning of end k-mer determined from
-    // the last non-variable column): filter ONLY on missing ratio (constant
-    // columns allowed).
-    let mut keep_tail_cols: Vec<usize> = Vec::with_capacity(tail_const_keep);
-    for col in tail_const_start..tail_const_end {
-        let mut missing = 0usize;
-        for row in block.iter().take(n) {
-            let b = row[col];
-            if b == b'-' || b == b'X' {
-                missing += 1;
-            }
-        }
-        let missing_ratio = (missing as f64) / (n as f64);
-        if missing_ratio <= missing_cutoff {
-            keep_tail_cols.push(col);
-        }
-    }
-
-    // Filter middle positions on missing ratio (polymorphism is checked at the group level)
-    let mut keep_middle_cols: Vec<usize> = Vec::with_capacity(middle_len);
-    let mut has_polymorphic_middle = false;
-
-    for col in middle_start..middle_end {
-        if col >= tail_const_start && col < tail_const_end {
-            // Skip positions reserved for the trailing constant context.
-            continue;
-        }
-
-        let mut counts = [0usize; 256];
-        let mut missing = 0usize;
-
-        for row in block.iter().take(n) {
-            let b = row[col];
-            if b == b'-' || b == b'X' {
-                missing += 1;
-            }
-            counts[b as usize] += 1;
-        }
-
-        let missing_ratio = (missing as f64) / (n as f64);
-        if missing_ratio > missing_cutoff {
-            // Too much missing: drop this column.
-            continue;
-        }
-
-        // Check if this column is polymorphic among non-missing AAs.
-        let mut unique_non_gap = 0usize;
-        for (aa, &cnt) in counts.iter().enumerate() {
-            if cnt == 0 {
-                continue;
-            }
-            if aa != b'-' as usize && aa != b'X' as usize {
-                unique_non_gap += 1;
-                if unique_non_gap > 1 {
-                    has_polymorphic_middle = true;
-                    break;
-                }
-            }
-        }
-
-        // Keep all columns that pass the missing filter, even if monomorphic.
-        keep_middle_cols.push(col);
-    }
-
-    // If nothing survives the missing filter, drop the block.
-    if keep_middle_cols.is_empty() {
-        return GroupOutcome::DroppedMiddle;
-    }
-
-    // If no middle column is polymorphic, drop the block.
-    if !has_polymorphic_middle {
-        return GroupOutcome::DroppedMiddle;
-    }
-
-    if keep_middle_cols.len() > max_middle_len {
-        return GroupOutcome::DroppedLength;
-    }
-
-    let block_len_filtered = keep_middle_cols.len() + keep_tail_cols.len();
-    debug_assert!(block_len_filtered > 0);
-
-    let mut filtered_rows: Vec<Vec<u8>> = Vec::with_capacity(n);
-    for row in block.iter().take(n) {
-        let mut dst: Vec<u8> = Vec::with_capacity(block_len_filtered);
-
-        for &col in &keep_middle_cols {
-            dst.push(row[col]);
-        }
-        for &col in &keep_tail_cols {
-            dst.push(row[col]);
-        }
-        filtered_rows.push(dst);
-    }
-
-    GroupOutcome::Kept {
-        filtered_rows,
-        filtered_len: block_len_filtered,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_variant_group_alignment(
-    input_dir: &Path,
+pub(crate) fn build_species_kmer_consensus(
+    inputs: &[SpeciesInput],
     g: &Graph,
     groups: &VariantGroups,
     k: usize,
     head_max: usize,
-    bubble_ratio: f32,
-    max_middle_len: usize,
     num_threads: usize,
-) -> Result<VariantGroupAlignment> {
+) -> Result<SpeciesKmerConsensus> {
+    let _ = head_max;
     let species = &g.species_names;
     let n = g.n_species;
-
-    let k1 = k - 1;
-    let head_keep = head_max;
     let sym_bits = RECODE_BITS_PER_SYMBOL;
     let recode_scheme: RecodeScheme = g.recode_scheme;
 
@@ -429,11 +176,10 @@ pub fn build_variant_group_alignment(
     // PHASE 2: stream proteomes from disk and build per-k-mer 20AA consensus
     // --------------------------------------------------------------------
     // Get FASTA files and map them to species IDs (same logic as load_proteomes).
-    let files = collect_fasta_files(input_dir)?;
-    if files.len() != species.len() {
+    if inputs.len() != species.len() {
         bail!(
             "Input FASTA count ({}) does not match graph species count ({}).",
-            files.len(),
+            inputs.len(),
             species.len()
         );
     }
@@ -459,13 +205,10 @@ pub fn build_variant_group_alignment(
 
     let mut work: Vec<Option<SpeciesWork>> = (0..n).map(|_| None).collect();
 
-    for path in files {
-        let name = species_name_from_path(&path);
-        let Some(&sid) = name_to_sid.get(&name) else {
-            bail!(
-                "Species {:?} from input directory not found in graph.",
-                name
-            );
+    for input in inputs {
+        let name = &input.name;
+        let Some(&sid) = name_to_sid.get(name) else {
+            bail!("Species {:?} from input list not found in graph.", name);
         };
 
         let map = std::mem::take(&mut species_kmer_maps[sid]);
@@ -473,7 +216,7 @@ pub fn build_variant_group_alignment(
 
         work[sid] = Some(SpeciesWork {
             sid,
-            path,
+            path: input.path.clone(),
             map,
             consensus,
         });
@@ -483,7 +226,7 @@ pub fn build_variant_group_alignment(
     let pool = ThreadPoolBuilder::new()
         .num_threads(n_threads)
         .build()
-        .expect("Failed to build Rayon thread pool in build_variant_group_alignment");
+        .expect("Failed to build Rayon thread pool in build_species_kmer_consensus");
 
     pool.install(|| -> Result<()> {
         work.par_iter_mut()
@@ -603,17 +346,114 @@ pub fn build_variant_group_alignment(
         species_kmer_consensus[opt.sid] = opt.consensus;
     }
 
-    crate::output::build_concatenated_alignment(
-        groups,
-        k,
-        k1,
-        head_keep,
-        sym_bits,
-        scan_k,
-        &species_kmer_maps,
-        &species_kmer_consensus,
-        bubble_ratio,
-        max_middle_len,
-        n,
-    )
+    Ok((scan_k, species_kmer_maps, species_kmer_consensus))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_raw_group_block(
+    key: (u64, u64),
+    paths: &[PathRec],
+    k: usize,
+    k1: usize,
+    head_keep: usize,
+    sym_bits: u32,
+    scan_k: usize,
+    species_kmer_maps: &[HashMap<u64, usize>],
+    species_kmer_consensus: &[Vec<Option<Vec<u8>>>],
+    n: usize,
+) -> Option<Vec<Vec<u8>>> {
+    let _ = k1;
+    let _ = head_keep;
+    // Deterministic order for paths: by length, then lexicographically on node IDs
+    let mut local_paths: Vec<&PathRec> = paths.iter().collect();
+    local_paths.sort_unstable_by(|a, b| {
+        a.nodes
+            .len()
+            .cmp(&b.nodes.len())
+            .then_with(|| a.nodes.cmp(&b.nodes))
+    });
+
+    // Collect per-path data
+    let mut per_path: Vec<PathData> = Vec::with_capacity(local_paths.len());
+    let mut block_len: Option<usize> = None;
+
+    for p in local_paths {
+        if p.nodes.is_empty() {
+            continue;
+        }
+        let path_codes = render_path_codes(&p.nodes, k, sym_bits);
+        if path_codes.is_empty() {
+            continue;
+        }
+
+        let len = path_codes.len();
+        block_len.get_or_insert(len);
+
+        per_path.push(PathData::Recoded {
+            codes: path_codes,
+            species: &p.species,
+        });
+    }
+
+    let Some(bl) = block_len else {
+        // no usable paths for this group
+        return None;
+    };
+
+    // One alignment block per group: start with '-' everywhere
+    let mut block: Vec<Vec<u8>> = vec![vec![b'-'; bl]; n];
+
+    // Merge paths into the block.
+    for data in per_path.into_iter() {
+        let PathData::Recoded { codes, species } = data;
+        // Repaint from per-k-mer 20AA consensus.
+        if scan_k == 0 || codes.len() < scan_k {
+            continue;
+        }
+        let kmers = encoded_kmers_from_codes(&codes, scan_k, sym_bits);
+
+        for (sid, row) in block.iter_mut().enumerate().take(n) {
+            if !species.get(sid).map(|b| *b).unwrap_or(false) {
+                continue;
+            }
+            let map = &species_kmer_maps[sid];
+            let cons_vec = &species_kmer_consensus[sid];
+
+            // Each k-mer kmers[j] covers positions [j .. j+scan_k) in the path.
+            for (j, &km) in kmers.iter().enumerate() {
+                let Some(&idx) = map.get(&km) else {
+                    continue;
+                };
+                let Some(ref kseq) = cons_vec[idx] else {
+                    continue;
+                };
+                debug_assert_eq!(
+                    kseq.len(),
+                    scan_k,
+                    "Consensus k-mer length mismatch for species {} in group ({}, {})",
+                    sid,
+                    key.0,
+                    key.1
+                );
+                for (offset, &newc) in kseq.iter().enumerate().take(scan_k) {
+                    let pos = j + offset;
+                    if pos >= bl {
+                        break;
+                    }
+                    let cur = row[pos];
+                    if cur == b'-' {
+                        row[pos] = newc;
+                    } else if newc == b'-' {
+                        // keep cur
+                    } else if cur == newc {
+                        // identical call; keep cur
+                    } else {
+                        row[pos] = b'X';
+                    }
+                }
+            }
+        }
+    }
+
+    Some(block)
 }

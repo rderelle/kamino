@@ -271,6 +271,13 @@ fn collect_paths_iterative_species_from_last_bifurcation(
             }
             // ---------- END NEW SPECIES LOGIC ----------
 
+            if parent.node != start
+                && parent.total_outdeg > 1
+                && !next_ref_species.any()
+            {
+                continue;
+            }
+
             // Prepare child frame
             let child_mask = g.adj.get(next).unwrap_or(0);
             let child_outdeg = child_mask.count_ones() as usize;
