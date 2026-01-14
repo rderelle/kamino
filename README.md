@@ -1,6 +1,7 @@
 [![Cargo Build & Test](https://github.com/rderelle/kamino/actions/workflows/ci.yml/badge.svg)](https://github.com/rderelle/kamino/actions/workflows/ci.yml)
 [![Clippy check](https://github.com/rderelle/kamino/actions/workflows/clippy.yml/badge.svg)](https://github.com/rderelle/kamino/actions/workflows/clippy.yml)
 [![codecov](https://codecov.io/github/rderelle/kamino/graph/badge.svg?token=6B8WIGZL2F)](https://codecov.io/github/rderelle/kamino)
+[![Crates.io](https://img.shields.io/crates/v/kamino-cli.svg)](https://crates.io/crates/kamino-cli)
 [![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/kamino/README.html)
 
 <br><br>
