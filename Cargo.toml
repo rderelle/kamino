@@ -28,3 +28,6 @@ codegen-units = 1
 opt-level = 3
 panic = "abort"
 debug = true
+
+[package.metadata.docs.rs]
+all-features = true
