@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use kamino::{run_with_args, Args};
+use kamino_cli::{run_with_args, Args};
 
 #[test]
 fn golden_3diff() {
@@ -41,7 +41,7 @@ fn golden_3diff() {
         length_middle: None,
         mask: 5,
         threads: None,
-        recode: kamino::RecodeScheme::Dayhoff6,
+        recode: kamino_cli::RecodeScheme::Dayhoff6,
         version: (),
     };
 
