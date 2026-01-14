@@ -31,13 +31,14 @@ fn golden_3diff() {
     let output_prefix = work_dir.join("kamino");
 
     let args = Args {
-        input: input_abs,
+        input: Some(input_abs),
         k: None,
         min_freq: 0.85,
         depth: 4,
         output: output_prefix,
         constant: None,
         length_middle: None,
+        mask: 5,
         threads: None,
         recode: kamino::RecodeScheme::Dayhoff6,
         version: (),
