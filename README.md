@@ -89,7 +89,7 @@ And using the 400 Mycobacterium dataset to examine how parameter choices affect 
     * list to be completed ...
 
 - **Is the output reproducible?**
-<p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given a specific version, a set of parameters and input proteomes.</p>
+<p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
 
 - **How to get more phylogenetic positions?**
     * increase the k-mer size (-k), but can substantially raise memory usage
