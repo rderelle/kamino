@@ -29,7 +29,7 @@ kamino performs the following successive steps:
 - builds a global assembly graph and identifies variant groups as described <a href="https://academic.oup.com/mbe/article/42/4/msaf077/8103706">here</a> (-d)
 - converts variant group paths back to amino acids using a sliding window
 - mask long polymorphism runs within variant groups (-m)
-- filters variant groups by missing data and middle-length thresholds (-m and -l)
+- filters variant groups by missing data and middle-length thresholds (-f and -l)
 - extracts middle positions and incorporate 'constant' positions (-c)
 - outputs the final amino acid alignment (-o)
 
