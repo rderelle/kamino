@@ -1,9 +1,9 @@
 use hashbrown::HashMap;
 
-use crate::recode::RECODE_BITS_PER_SYMBOL;
-use crate::revert_aminoacid;
-use crate::traverse::VariantGroups;
 use crate::middle_mask::mask_middle_if_diff_run;
+use crate::recode::RECODE_BITS_PER_SYMBOL;
+use crate::revert_aminoacid::{self, KmerNameStats};
+use crate::traverse::VariantGroups;
 
 /// Alignment output pieces produced for all variant groups.
 ///
@@ -16,6 +16,7 @@ use crate::middle_mask::mask_middle_if_diff_run;
 pub struct VariantGroupAlignment {
     pub concat: Vec<Vec<u8>>,
     pub partitions: Vec<(usize, usize, usize)>,
+    pub partition_names: Vec<String>,
     pub dropped_blocks_due_to_middle_filter: usize,
     pub dropped_blocks_due_to_length: usize,
 }
@@ -176,6 +177,8 @@ pub(crate) fn build_concatenated_alignment_streaming(
     scan_k: usize,
     species_kmer_maps: &[HashMap<u64, usize>],
     species_kmer_consensus: &[Vec<Option<Vec<u8>>>],
+    species_kmer_name_stats: &[Vec<KmerNameStats>],
+    word_list: &[String],
     n: usize,
 ) -> VariantGroupAlignment {
     let k1 = k - 1;
@@ -184,6 +187,7 @@ pub(crate) fn build_concatenated_alignment_streaming(
     // Per-species buffers for the final concatenated alignment.
     let mut concat: Vec<Vec<u8>> = vec![Vec::new(); n];
     let mut partitions: Vec<(usize, usize, usize)> = Vec::new();
+    let mut partition_names: Vec<String> = Vec::new();
     let mut current_pos: usize = 0;
 
     // Deterministic iteration: sort (start,end)
@@ -195,7 +199,7 @@ pub(crate) fn build_concatenated_alignment_streaming(
 
     for key in keys {
         let paths = &groups[&key];
-        let Some(mut block) = revert_aminoacid::build_raw_group_block(
+        let Some((mut block, group_name_stats)) = revert_aminoacid::build_raw_group_block(
             key,
             paths,
             k,
@@ -205,6 +209,7 @@ pub(crate) fn build_concatenated_alignment_streaming(
             scan_k,
             species_kmer_maps,
             species_kmer_consensus,
+            species_kmer_name_stats,
             n,
         ) else {
             continue;
@@ -225,6 +230,7 @@ pub(crate) fn build_concatenated_alignment_streaming(
                 let start_pos = current_pos;
                 let end_pos = start_pos + filtered_len - 1;
                 partitions.push((start_pos, end_pos, filtered_len));
+                partition_names.push(build_consensus_name(&group_name_stats, word_list));
                 current_pos += filtered_len;
 
                 for (sid, row) in filtered_rows.into_iter().enumerate() {
@@ -246,7 +252,32 @@ pub(crate) fn build_concatenated_alignment_streaming(
     VariantGroupAlignment {
         concat,
         partitions,
+        partition_names,
         dropped_blocks_due_to_middle_filter,
         dropped_blocks_due_to_length,
     }
+}
+
+fn build_consensus_name(stats: &KmerNameStats, word_list: &[String]) -> String {
+    if stats.total_sets == 0 {
+        return String::new();
+    }
+    let mut word_ids: Vec<u32> = stats
+        .word_counts
+        .iter()
+        .filter(|(_, count)| (*count as u64) * 2 >= stats.total_sets as u64)
+        .map(|(word_id, _)| *word_id)
+        .collect();
+    word_ids.sort_unstable();
+    let mut output = String::new();
+    for (idx, word_id) in word_ids.iter().enumerate() {
+        let Some(word) = word_list.get(*word_id as usize) else {
+            continue;
+        };
+        if idx > 0 && !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(word);
+    }
+    output
 }

@@ -121,7 +121,7 @@ fn collect_variant_groups(
         }
 
         // Final global selection
-        post_select_variant_groups(all_kept)
+        post_select_variant_groups(all_kept, g)
     })
 }
 
@@ -308,7 +308,7 @@ fn collect_paths_iterative_species_from_last_bifurcation(
 /// (ii) require ≥2 paths at that length,
 /// (iii) require union species ≥ need.
 fn filter_one_group_3steps(
-    _g: &Graph,
+    g: &Graph,
     key: (u64, u64),
     paths: Vec<PathRec>,
     need: usize,
@@ -356,6 +356,10 @@ fn filter_one_group_3steps(
         return None;
     }
 
+    if !middle_ends_polymorphic_recoded(&kept_paths, g.k) {
+        return None;
+    }
+
     // (iii) union species across kept paths must be ≥ need
     let mut union_all: BitVec<u32, Lsb0> = BitVec::repeat(false, n_species);
     for p in &kept_paths {
@@ -371,8 +375,63 @@ fn filter_one_group_3steps(
     Some((key, kept_paths))
 }
 
+/// True if the middle segment starts and ends with polymorphic recoded symbols.
+fn middle_ends_polymorphic_recoded(paths: &[PathRec], k: usize) -> bool {
+    if paths.len() < 2 {
+        return false;
+    }
+
+    let k1 = k.saturating_sub(1);
+    if k1 == 0 {
+        return false;
+    }
+
+    let mut first_symbol: Option<u8> = None;
+    let mut last_symbol: Option<u8> = None;
+    let mut first_poly = false;
+    let mut last_poly = false;
+
+    for p in paths {
+        if p.nodes.len() < 2 {
+            return false;
+        }
+
+        let edges = p.nodes.len() - 1;
+        if edges <= k1 {
+            return false;
+        }
+
+        let first = edge_sym_from_node(p.nodes[1]);
+        let last = edge_sym_from_node(p.nodes[edges - k1]);
+
+        match first_symbol {
+            None => first_symbol = Some(first),
+            Some(prev) if prev != first => first_poly = true,
+            _ => {}
+        }
+
+        match last_symbol {
+            None => last_symbol = Some(last),
+            Some(prev) if prev != last => last_poly = true,
+            _ => {}
+        }
+
+        if first_poly && last_poly {
+            return true;
+        }
+    }
+
+    first_poly && last_poly
+}
+
+#[inline]
+fn edge_sym_from_node(node: u64) -> u8 {
+    let mask = (1u64 << RECODE_BITS_PER_SYMBOL) - 1;
+    (node & mask) as u8
+}
+
 /// Score, sort, and keep non-overlapping (start,end) groups.
-fn post_select_variant_groups(mut groups: VariantGroups) -> VariantGroups {
+fn post_select_variant_groups(mut groups: VariantGroups, g: &Graph) -> VariantGroups {
     let mut scored: Vec<ScoredGroup> = Vec::new();
 
     // Compute score (number of paths / path length)
@@ -393,17 +452,41 @@ fn post_select_variant_groups(mut groups: VariantGroups) -> VariantGroups {
             .then_with(|| a.0 .0 .1.cmp(&b.0 .0 .1)) // then by end node
     });
 
-    let mut used_starts: HashSet<u64, RandomState> = HashSet::with_hasher(RandomState::new());
-    let mut used_ends: HashSet<u64, RandomState> = HashSet::with_hasher(RandomState::new());
+    let mut used_kmers: HashSet<u64, RandomState> = HashSet::with_hasher(RandomState::new());
     let mut kept: VariantGroups = VariantGroups::default();
 
     for ((key, paths), _score, _len) in scored {
-        let (s, e) = key;
-        if used_starts.contains(&s) || used_ends.contains(&e) {
+        let mut group_kmers: Vec<u64> = Vec::new();
+        let mut overlaps = false;
+
+        for path in &paths {
+            if path.nodes.len() < 2 {
+                overlaps = true;
+                break;
+            }
+
+            for win in path.nodes.windows(2) {
+                let edge_sym = edge_sym_from_node(win[1]) as u64;
+                let kmer = ((win[0] << RECODE_BITS_PER_SYMBOL) | edge_sym) & g.k_mask;
+                if used_kmers.contains(&kmer) {
+                    overlaps = true;
+                    break;
+                }
+                group_kmers.push(kmer);
+            }
+
+            if overlaps {
+                break;
+            }
+        }
+
+        if overlaps {
             continue;
         }
-        used_starts.insert(s);
-        used_ends.insert(e);
+
+        for kmer in group_kmers {
+            used_kmers.insert(kmer);
+        }
         kept.insert(key, paths);
     }
 

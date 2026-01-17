@@ -18,11 +18,11 @@
 //!
 //!
 //! ## Arguments
-//! - `-k`, `--k`: k-mer length (default: 13; must be within the valid range for the
+//! - `-k`, `--k`: k-mer length (default: 14; must be within the valid range for the
 //!   selected recoding scheme).
 //! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position
 //!   (default: 0.85; must be ≥ 0.6).
-//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 4).
+//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 6).
 //! - `-o`, `--output`: output prefix for generated files (default: `kamino`).
 //! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers
 //!   (default: 3; must be ≤ k-1).
@@ -41,15 +41,12 @@
 //! frequency (-f). If the final alignment is too short, you may want to modify some
 //! of these three parameters.
 //!
-//! The default k-mer size (k=13) is set to avoid excessive memory use. Increasing the k-mer size
-//! to 14 generally yields much longer alignments, but in some cases with a substantial increase in memory
-//! usage. Please note that further increases in k-mer size do not necessarily increase the size of the
-//! final alignment, because bubble start and end k-mers present in most samples become less frequent
-//! (→ fewer variant groups → shorter final alignment).
+//! Increasing the k-mer size may yield longer alignments, but only up to a point: bubble start and 
+//! end k-mers shared by most samples become less frequent, resulting in fewer variant groups and a 
+//! shorter final alignment.
 //!
-//! Increasing the depth of the recursive graph traversal (e.g., from 4 to 6) can also increase the size
-//! of the final alignment as kamino detects more variant groups during the graph traversal. However, runtimes
-//! become challenging at d=8 and beyond.
+//! Increasing the depth of the recursive graph traversal (e.g., from 6 to 8) can also increase the size
+//! of the final alignment as kamino detects more variant groups during the graph traversal. 
 //!
 //! Finally, it is also possible to produce larger alignments by decreasing the minimum fraction of samples
 //! with an amino-acid (e.g., from 0.85 to 0.8), although samples will have more missing data in the final alignment.
@@ -77,13 +74,16 @@
 //!
 //!
 //! ## Output files
-//! Given an output prefix (by default `kamino`), the CLI emits three files:
-//! - `<prefix>_alignment.fas`: FASTA amino acid alignment of samples.
-//! - `<prefix>_missing.tsv`: tab-delimited per-sample percentage of missingness.
-//! - `<prefix>_partitions.tsv`: tab-delimited variant group coordinates (0-based) in the FASTA alignment.
+//! The names of the three output files are controlled by a prefix (-o; default: `kamino`). The prefix
+//! may include a directory path (e.g. `-o my_analyses/taxon1`). Note that the output directory is not
+//! created by kamino and must already exist.
 //!
-//! The log output printed to stderr includes a summary of parameter values, counts of
-//! bubble endpoints and variant groups, and alignment statistics to help interpret the analyses.
+//! The three output files are:
+//! - `<prefix>_alignment.fas`: FASTA amino acid alignment of all samples.
+//! - `<prefix>_missing.tsv`: Tab-delimited per-sample missingness percentages.
+//! - `<prefix>_partitions.tsv`: Tab-delimited variant group coordinates (0-based) in the FASTA
+//!   alignment, along with consensus protein names when the input proteomes are annotated.
+//!
 use clap::{ArgAction, Parser};
 
 mod bubbles;
@@ -116,7 +116,7 @@ pub struct Args {
     #[arg(short = 'I', long = "input-file")]
     pub input_file: Option<std::path::PathBuf>,
 
-    /// K-mer length [k=13]
+    /// K-mer length [k=14]
     #[arg(short, long)]
     pub k: Option<usize>,
 
@@ -129,8 +129,8 @@ pub struct Args {
     )]
     pub min_freq: f32,
 
-    /// Maximum traversal depth from each start node [d=4]
-    #[arg(short, long, default_value_t = 4, hide_default_value = true)]
+    /// Maximum traversal depth from each start node [d=6]
+    #[arg(short, long, default_value_t = 6, hide_default_value = true)]
     pub depth: usize,
 
     /// Output prefix [o=kamino]
@@ -164,7 +164,7 @@ pub struct Args {
 
 pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     // k defaults and limits for SR6
-    let default_k = 13usize;
+    let default_k = 14usize;
     let max_k = 21usize;
     let default_constant = 3usize;
 
