@@ -67,16 +67,6 @@ All analyses were performed on a MacBook M4 pro using 4 threads (other parameter
 | 55 Mammalia                 | within-class         | 1.5           | 8           | 328.205             |  
 
 
-And using the 400 Mycobacterium dataset to examine how parameter choices affect the analyses (still with 4 threads):
-
-| parameters                | runtime (min) | memory (GB) | alignment size (aa) |
-|---------------------------|---------------|-------------|---------------------|
-| [default: k=13, d=4]      | 0.9           | 8           | 11.745              |
-| --k 14                    | 0.9           | 9           | 17.515              |
-| --depth 5                 | 1             | 8           | 17.003              |
-| --k 14 --depth 5          | 1             | 9           | 23.706              |
-
-
 ---
 
 ## FAQ
@@ -92,9 +82,7 @@ And using the 400 Mycobacterium dataset to examine how parameter choices affect 
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
 
 - **How to get more phylogenetic positions?**
-    * increase the k-mer size (-k), but can substantially raise memory usage
-    * increase the maximum depth of the graph traversal (-d), but increases the runtime
-    * lower the minimum proportion of isolates per position (-m), if that is acceptable for downstream analyses
+<p>Increase the k-mer size (-k), increase the maximum depth of the graph traversal (-d), or lower the minimum proportion of isolates with amino acid per position (-m) if that is acceptable for downstream analyses.</p>
 
  
 
