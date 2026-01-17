@@ -18,11 +18,11 @@
 //!
 //!
 //! ## Arguments
-//! - `-k`, `--k`: k-mer length (default: 13; must be within the valid range for the
+//! - `-k`, `--k`: k-mer length (default: 14; must be within the valid range for the
 //!   selected recoding scheme).
 //! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position
 //!   (default: 0.85; must be ≥ 0.6).
-//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 4).
+//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 6).
 //! - `-o`, `--output`: output prefix for generated files (default: `kamino`).
 //! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers
 //!   (default: 3; must be ≤ k-1).
