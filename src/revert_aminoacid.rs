@@ -10,9 +10,65 @@ use crate::graph::Graph;
 use crate::io::{open_fasta, SpeciesInput};
 use crate::recode::{recode_byte, RecodeScheme, RECODE_BITS_PER_SYMBOL};
 use crate::traverse::{PathRec, VariantGroups};
+use std::sync::{Arc, Mutex};
 
-pub(crate) type SpeciesKmerConsensus =
-    (usize, Vec<HashMap<u64, usize>>, Vec<Vec<Option<Vec<u8>>>>);
+pub(crate) type SpeciesKmerConsensus = (
+    usize,
+    Vec<HashMap<u64, usize>>,
+    Vec<Vec<Option<Vec<u8>>>>,
+    Vec<Vec<KmerNameStats>>,
+    Vec<String>,
+);
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KmerNameStats {
+    pub total_sets: u32,
+    pub word_counts: Vec<(u32, u32)>,
+}
+
+impl KmerNameStats {
+    fn add_words(&mut self, word_ids: &[u32]) {
+        if word_ids.is_empty() {
+            return;
+        }
+        self.total_sets = self.total_sets.saturating_add(1);
+        for &word_id in word_ids {
+            if let Some(entry) = self
+                .word_counts
+                .iter_mut()
+                .find(|(existing_id, _)| *existing_id == word_id)
+            {
+                entry.1 = entry.1.saturating_add(1);
+            } else {
+                self.word_counts.push((word_id, 1));
+            }
+        }
+    }
+}
+
+struct WordInterner {
+    map: HashMap<String, u32>,
+    words: Vec<String>,
+}
+
+impl WordInterner {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            words: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, word: &str) -> u32 {
+        if let Some(id) = self.map.get(word) {
+            return *id;
+        }
+        let id = self.words.len() as u32;
+        self.words.push(word.to_string());
+        self.map.insert(self.words[id as usize].clone(), id);
+        id
+    }
+}
 
 enum PathData<'a> {
     Recoded {
@@ -137,6 +193,8 @@ pub(crate) fn build_species_kmer_consensus(
     let mut species_kmer_maps: Vec<HashMap<u64, usize>> = vec![HashMap::new(); n];
     // species_kmer_consensus[sid][idx]: Option<Vec<u8>> = consensus 20AA k-mer
     let mut species_kmer_consensus: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::new(); n];
+    // species_kmer_name_stats[sid][idx]: KmerNameStats for protein name words
+    let mut species_kmer_name_stats: Vec<Vec<KmerNameStats>> = vec![Vec::new(); n];
 
     for paths in groups.values() {
         for p in paths {
@@ -145,9 +203,10 @@ pub(crate) fn build_species_kmer_consensus(
             let kmers = encoded_kmers_from_codes(&path_codes, scan_k, sym_bits);
 
             // For every species present on this path, register these k-mers.
-            for (sid, (map, cons_vec)) in species_kmer_maps
+            for (sid, ((map, cons_vec), name_stats)) in species_kmer_maps
                 .iter_mut()
                 .zip(species_kmer_consensus.iter_mut())
+                .zip(species_kmer_name_stats.iter_mut())
                 .enumerate()
                 .take(n)
             {
@@ -161,6 +220,7 @@ pub(crate) fn build_species_kmer_consensus(
                         Entry::Vacant(e) => {
                             let idx = cons_vec.len();
                             cons_vec.push(None); // consensus will be filled in phase 2
+                            name_stats.push(KmerNameStats::default());
                             e.insert(idx);
                         }
                         Entry::Occupied(_) => {
@@ -196,11 +256,13 @@ pub(crate) fn build_species_kmer_consensus(
         path: PathBuf,
         map: HashMap<u64, usize>,
         consensus: Vec<Option<Vec<u8>>>,
+        name_stats: Vec<KmerNameStats>,
     }
 
     struct ThreadBuffers {
         aa_ring: Vec<u8>,
         window: Vec<u8>,
+        kmer_hits: hashbrown::HashSet<usize>,
     }
 
     let mut work: Vec<Option<SpeciesWork>> = (0..n).map(|_| None).collect();
@@ -213,14 +275,18 @@ pub(crate) fn build_species_kmer_consensus(
 
         let map = std::mem::take(&mut species_kmer_maps[sid]);
         let consensus = std::mem::take(&mut species_kmer_consensus[sid]);
+        let name_stats = std::mem::take(&mut species_kmer_name_stats[sid]);
 
         work[sid] = Some(SpeciesWork {
             sid,
             path: input.path.clone(),
             map,
             consensus,
+            name_stats,
         });
     }
+
+    let word_interner = Arc::new(Mutex::new(WordInterner::new()));
 
     let n_threads = num_threads.max(1);
     let pool = ThreadPoolBuilder::new()
@@ -235,6 +301,7 @@ pub(crate) fn build_species_kmer_consensus(
                 || ThreadBuffers {
                     aa_ring: vec![0u8; scan_k],
                     window: Vec::with_capacity(scan_k),
+                    kmer_hits: hashbrown::HashSet::new(),
                 },
                 |buffers, work_item| {
                     if work_item.map.is_empty() {
@@ -246,6 +313,32 @@ pub(crate) fn build_species_kmer_consensus(
 
                     while let Some(rec) = fasta.next() {
                         let rec = rec?;
+                        let mut name_words: Vec<u32> = Vec::new();
+                        let header = match rec.desc() {
+                            Some(desc) => {
+                                let mut header = rec.id().unwrap_or("").to_string();
+                                header.push(' ');
+                                header.push_str(desc.unwrap_or(""));
+                                header
+                            }
+                            None => rec.id().unwrap_or("").to_string(),
+                        };
+                        if !header.is_empty() {
+                            let mut interner = word_interner.lock().expect("word interner lock");
+                            for (idx, word) in header.split_whitespace().enumerate() {
+                                if idx == 0 {
+                                    continue;
+                                }
+                                if word.starts_with('[') {
+                                    break;
+                                }
+                                let word_id = interner.intern(word);
+                                if !name_words.contains(&word_id) {
+                                    name_words.push(word_id);
+                                }
+                            }
+                        }
+
                         let seq = rec.seq();
                         if seq.len() < scan_k {
                             continue;
@@ -321,7 +414,18 @@ pub(crate) fn build_species_kmer_consensus(
                                         }
                                     }
                                 }
+                                if !name_words.is_empty() {
+                                    buffers.kmer_hits.insert(idx);
+                                }
                             }
+                        }
+
+                        if !name_words.is_empty() {
+                            for idx in buffers.kmer_hits.drain() {
+                                work_item.name_stats[idx].add_words(&name_words);
+                            }
+                        } else {
+                            buffers.kmer_hits.clear();
                         }
                     }
 
@@ -344,9 +448,22 @@ pub(crate) fn build_species_kmer_consensus(
     for opt in work.into_iter().flatten() {
         species_kmer_maps[opt.sid] = opt.map;
         species_kmer_consensus[opt.sid] = opt.consensus;
+        species_kmer_name_stats[opt.sid] = opt.name_stats;
     }
 
-    Ok((scan_k, species_kmer_maps, species_kmer_consensus))
+    let word_list = word_interner
+        .lock()
+        .expect("word interner lock")
+        .words
+        .clone();
+
+    Ok((
+        scan_k,
+        species_kmer_maps,
+        species_kmer_consensus,
+        species_kmer_name_stats,
+        word_list,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,8 +477,9 @@ pub(crate) fn build_raw_group_block(
     scan_k: usize,
     species_kmer_maps: &[HashMap<u64, usize>],
     species_kmer_consensus: &[Vec<Option<Vec<u8>>>],
+    species_kmer_name_stats: &[Vec<KmerNameStats>],
     n: usize,
-) -> Option<Vec<Vec<u8>>> {
+) -> Option<(Vec<Vec<u8>>, KmerNameStats)> {
     let _ = k1;
     let _ = head_keep;
     // Deterministic order for paths: by length, then lexicographically on node IDs
@@ -403,6 +521,9 @@ pub(crate) fn build_raw_group_block(
     // One alignment block per group: start with '-' everywhere
     let mut block: Vec<Vec<u8>> = vec![vec![b'-'; bl]; n];
 
+    let mut group_name_stats = KmerNameStats::default();
+    let mut group_seen_kmers: hashbrown::HashSet<(usize, usize)> = hashbrown::HashSet::new();
+
     // Merge paths into the block.
     for data in per_path.into_iter() {
         let PathData::Recoded { codes, species } = data;
@@ -418,6 +539,7 @@ pub(crate) fn build_raw_group_block(
             }
             let map = &species_kmer_maps[sid];
             let cons_vec = &species_kmer_consensus[sid];
+            let name_vec = &species_kmer_name_stats[sid];
 
             // Each k-mer kmers[j] covers positions [j .. j+scan_k) in the path.
             for (j, &km) in kmers.iter().enumerate() {
@@ -451,9 +573,29 @@ pub(crate) fn build_raw_group_block(
                         row[pos] = b'X';
                     }
                 }
+
+                if group_seen_kmers.insert((sid, idx)) {
+                    let name_stats = &name_vec[idx];
+                    if name_stats.total_sets > 0 {
+                        group_name_stats.total_sets = group_name_stats
+                            .total_sets
+                            .saturating_add(name_stats.total_sets);
+                        for (word_id, count) in &name_stats.word_counts {
+                            if let Some(entry) = group_name_stats
+                                .word_counts
+                                .iter_mut()
+                                .find(|(existing_id, _)| existing_id == word_id)
+                            {
+                                entry.1 = entry.1.saturating_add(*count);
+                            } else {
+                                group_name_stats.word_counts.push((*word_id, *count));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    Some(block)
+    Some((block, group_name_stats))
 }

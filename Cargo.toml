@@ -1,6 +1,6 @@
 [package]
 name = "kamino-cli"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Build phylogenomic datasets in seconds."
 license = "MIT"

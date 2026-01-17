@@ -62,7 +62,7 @@ pub fn write_outputs_with_head(
     let species = &g.species_names;
     let n = g.n_species;
 
-    let (scan_k, species_kmer_maps, species_kmer_consensus) =
+    let (scan_k, species_kmer_maps, species_kmer_consensus, species_kmer_name_stats, word_list) =
         revert_aminoacid::build_species_kmer_consensus(
             inputs,
             g,
@@ -82,13 +82,16 @@ pub fn write_outputs_with_head(
         scan_k,
         &species_kmer_maps,
         &species_kmer_consensus,
+        &species_kmer_name_stats,
+        &word_list,
         n,
     );
 
     let (fas_path, tsv_path, partitions_path) = output_paths(out_base);
-    let (concat, partitions, dropped_middle, dropped_length) = (
+    let (concat, partitions, partition_names, dropped_middle, dropped_length) = (
         alignment.concat,
         alignment.partitions,
+        alignment.partition_names,
         alignment.dropped_blocks_due_to_middle_filter,
         alignment.dropped_blocks_due_to_length,
     );
@@ -141,9 +144,11 @@ pub fn write_outputs_with_head(
     let ph =
         File::create(&partitions_path).with_context(|| format!("create {:?}", partitions_path))?;
     let mut pw = BufWriter::new(ph);
-    writeln!(pw, "start_pos\tend_pos\tlength")?;
-    for (start, end, len) in partitions {
-        writeln!(pw, "{}\t{}\t{}", start, end, len)?;
+    writeln!(pw, "start_pos\tend_pos\tlength\tconsensus protein name")?;
+    for ((start, end, len), consensus_name) in
+        partitions.into_iter().zip(partition_names.into_iter())
+    {
+        writeln!(pw, "{}\t{}\t{}\t{}", start, end, len, consensus_name)?;
     }
     pw.flush()?;
 
