@@ -59,7 +59,7 @@
 //! The number of constant positions in the final alignment can be adjusted with the --constant parameter. These are
 //! taken from the left flank of the end k-mer in each variant group, next to the middle positions. Because these
 //! positions are recoded, some may become polymorphic once converted back to amino acids. Using the default c=3,
-//! constant positions represent 60 to 75% of the alignment.
+//! constant positions represent 50 to 60% of the alignment.
 //!
 //! The --mask parameter controls the amino-acid masking performed by kamino to prevent long runs of polymorphism from being
 //! retained in the final alignment. These correspond to genuine but unwanted polymorphisms (e.g., micro-inversions) or,
