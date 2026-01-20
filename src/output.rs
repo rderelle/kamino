@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use crate::filter_groups::build_concatenated_alignment_streaming;
 use crate::graph::Graph;
 use crate::io::SpeciesInput;
+use crate::phylo;
 use crate::revert_aminoacid;
 use crate::traverse::VariantGroups;
 
-pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf) {
+pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     /// Build an output path next to the base path while keeping the stem.
     fn build_path(base: &Path, suffix: &str, ext: &str) -> PathBuf {
         let stem = base
@@ -38,7 +39,8 @@ pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let fas = build_path(out_base, "_alignment", "fas");
     let tsv = build_path(out_base, "_missing", "tsv");
     let partitions = build_path(out_base, "_partitions", "tsv");
-    (fas, tsv, partitions)
+    let tree = build_path(out_base, "_NJ", "tree");
+    (fas, tsv, partitions, tree)
 }
 
 /// Write FASTA and TSV outputs while trimming the head and middle segments.
@@ -58,6 +60,7 @@ pub fn write_outputs_with_head(
     max_middle_len: usize,
     mask_m: usize,
     num_threads: usize,
+    generate_nj: bool,
 ) -> Result<(usize, f64)> {
     let species = &g.species_names;
     let n = g.n_species;
@@ -87,7 +90,7 @@ pub fn write_outputs_with_head(
         n,
     );
 
-    let (fas_path, tsv_path, partitions_path) = output_paths(out_base);
+    let (fas_path, tsv_path, partitions_path, tree_path) = output_paths(out_base);
     let (concat, partitions, partition_names, dropped_middle, dropped_length) = (
         alignment.concat,
         alignment.partitions,
@@ -160,5 +163,17 @@ pub fn write_outputs_with_head(
         "dropped due to exceeding middle length limit: {}",
         dropped_length
     );
+
+    // NJ tree
+    if generate_nj {
+        let tree = phylo::nj_tree_newick(species, &concat, num_threads)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let tree_file =
+            File::create(&tree_path).with_context(|| format!("create {:?}", tree_path))?;
+        let mut tree_writer = BufWriter::new(tree_file);
+        writeln!(tree_writer, "{}", tree)?;
+        tree_writer.flush()?;
+    }
+
     Ok((total_len, alignment_missing_pct))
 }

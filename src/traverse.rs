@@ -16,7 +16,7 @@ pub struct PathRec {
 /// VariantGroups: map (start,end) -> list of paths (with species sets)
 pub type VariantGroups = HashMap<(u64, u64), Vec<PathRec>, RandomState>;
 
-type ScoredGroup = (((u64, u64), Vec<PathRec>), f64, usize);
+type ScoredGroup = (((u64, u64), Vec<PathRec>), usize, usize);
 
 /// Public entry point expected by main.rs:
 /// find_variant_groups(&g, &start_kmers, &end_kmers, max_depth, bubble_ratio, num_threads)
@@ -361,14 +361,7 @@ fn filter_one_group_3steps(
     }
 
     // (iii) union species across kept paths must be ≥ need
-    let mut union_all: BitVec<u32, Lsb0> = BitVec::repeat(false, n_species);
-    for p in &kept_paths {
-        if union_all.len() < p.species.len() {
-            union_all.resize(p.species.len(), false);
-        }
-        union_all |= p.species.as_bitslice();
-    }
-    if union_all.count_ones() < need {
+    if union_species_count(&kept_paths, n_species) < need {
         return None;
     }
 
@@ -430,32 +423,41 @@ fn edge_sym_from_node(node: u64) -> u8 {
     (node & mask) as u8
 }
 
+fn union_species_count(paths: &[PathRec], n_species: usize) -> usize {
+    let mut union_all: BitVec<u32, Lsb0> = BitVec::repeat(false, n_species);
+    for p in paths {
+        if union_all.len() < p.species.len() {
+            union_all.resize(p.species.len(), false);
+        }
+        union_all |= p.species.as_bitslice();
+    }
+    union_all.count_ones()
+}
+
 /// Score, sort, and keep non-overlapping (start,end) groups.
 fn post_select_variant_groups(mut groups: VariantGroups, g: &Graph) -> VariantGroups {
     let mut scored: Vec<ScoredGroup> = Vec::new();
 
-    // Compute score (number of paths / path length)
+    // Compute union species count and path length
     for (key, paths) in groups.drain() {
         let path_len = paths[0].nodes.len().saturating_sub(1); // all paths have the same length
-        let n_paths = paths.len();
-        let score = n_paths as f64 / path_len as f64;
+        let n_species = union_species_count(&paths, g.n_species);
 
-        scored.push(((key, paths), score, path_len));
+        scored.push(((key, paths), n_species, path_len));
     }
 
-    // Sort by score desc, then (start, end) for determinism
+    // Sort by union species desc, then path length desc, then start k-mer
     scored.sort_unstable_by(|a, b| {
-        // a.1 = score_a, b.1 = score_b
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0 .0 .0.cmp(&b.0 .0 .0)) // then by start node
-            .then_with(|| a.0 .0 .1.cmp(&b.0 .0 .1)) // then by end node
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0 .0 .0.cmp(&b.0 .0 .0))
+            .then_with(|| a.0 .0 .1.cmp(&b.0 .0 .1))
     });
 
     let mut used_kmers: HashSet<u64, RandomState> = HashSet::with_hasher(RandomState::new());
     let mut kept: VariantGroups = VariantGroups::default();
 
-    for ((key, paths), _score, _len) in scored {
+    for ((key, paths), _species, _len) in scored {
         let mut group_kmers: Vec<u64> = Vec::new();
         let mut overlaps = false;
 

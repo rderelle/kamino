@@ -32,6 +32,7 @@
 //! - `-t`, `--threads`: number of threads used for graph construction and analysis
 //!   (default: 1).
 //! - `-r`, `--recode`: amino-acid recoding scheme (default: `sr6`).
+//! - `--nj`: generate a NJ tree from kamino alignment [nj=false]
 //! - `-v`, `--version`: print version information and exit.
 //!
 //!
@@ -61,12 +62,12 @@
 //! positions are recoded, some may become polymorphic once converted back to amino acids. Using the default c=3,
 //! constant positions represent 50 to 60% of the alignment.
 //!
-//! The --mask parameter controls the amino-acid masking performed by kamino to prevent long runs of polymorphism from being
+//! The `--mask parameter` controls the amino-acid masking performed by kamino to prevent long runs of polymorphism from being
 //! retained in the final alignment. These correspond to genuine but unwanted polymorphisms (e.g., micro-inversions) or,
 //! less frequently, errors made by kamino (“misaligned” paths due to the presence of two consecutive indels). The minimum length
 //! of polymorphism runs to be masked can be decreased using this parameter to be more stringent.
 //!
-//! The --length-middle parameter is used to filter out long variant groups. Increase this parameter to allow more
+//! The `--length-middle` parameter is used to filter out long variant groups. Increase this parameter to allow more
 //! variant groups to be retained in the final alignment. Please note that this parameter might be removed in future versions.
 //!
 //! Finally, the 6-letter recoding scheme can be modified using the --recode parameter, although the default sr6 recoding
@@ -74,7 +75,7 @@
 //!
 //!
 //! ## Output files
-//! The names of the three output files are controlled by a prefix (-o; default: `kamino`). The prefix
+//! The names of the output files are controlled by a prefix (-o; default: `kamino`). The prefix
 //! may include a directory path (e.g. `-o my_analyses/taxon1`). Note that the output directory is not
 //! created by kamino and must already exist.
 //!
@@ -84,6 +85,11 @@
 //! - `<prefix>_partitions.tsv`: Tab-delimited variant group coordinates (0-based) in the FASTA
 //!   alignment, along with consensus protein names when the input proteomes are annotated.
 //!
+//! Additionally, a Neighbor-Joining (NJ) tree can be produced from the amino acid alignment
+//! when the `--nj` argument is specified. Pairwise distances are computed using an F81
+//! correction with LG stationary amino-acid frequencies. The resulting tree provides an
+//! overview of isolate relationships and is not intended for detailed phylogenetic inference.
+//!
 use clap::{ArgAction, Parser};
 
 mod bubbles;
@@ -92,6 +98,7 @@ mod graph;
 mod io;
 mod middle_mask;
 mod output;
+mod phylo;
 mod recode;
 mod revert_aminoacid;
 mod traverse;
@@ -101,7 +108,7 @@ pub use recode::RecodeScheme;
 
 /// Build a node-based, colored de Bruijn graph from amino-acid proteomes and analyze bubbles.
 #[derive(Parser, Debug)]
-#[command(author, version, about, disable_version_flag = true)]
+#[command(name = "kamino", author, version, about, disable_version_flag = true)]
 #[command(
     group = clap::ArgGroup::new("input_source")
         .required(true)
@@ -156,6 +163,10 @@ pub struct Args {
     /// Recoding scheme [r=sr6]
     #[arg(short = 'r', long = "recode", value_enum, default_value_t = RecodeScheme::SR6, hide_default_value = true)]
     pub recode: RecodeScheme,
+
+    /// Generate a NJ tree from kamino alignment [nj=false]
+    #[arg(long = "nj", default_value_t = false, hide_default_value = true)]
+    pub nj: bool,
 
     /// Display version information.
     #[arg(short = 'v', long = "version", action = ArgAction::Version)]
@@ -281,18 +292,31 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         length_middle,
         args.mask,
         num_threads,
+        args.nj,
     )?;
-    let (fas_path, tsv_path, partitions_path) = output::output_paths(&args.output);
+    
+    let (fas_path, tsv_path, partitions_path, tree_path) = output::output_paths(&args.output);
     eprintln!(
         "alignment: length={} missing={:.1}%",
         alignment_len, alignment_missing_pct
     );
-    eprintln!(
-        "output files:  {}, {}, and {}",
-        fas_path.display(),
-        tsv_path.display(),
-        partitions_path.display()
-    );
+    
+    if args.nj {
+        eprintln!(
+            "output files:  {}, {}, {}, and {}",
+            fas_path.display(),
+            tsv_path.display(),
+            partitions_path.display(),
+            tree_path.display()
+        );
+    } else {
+        eprintln!(
+            "output files:  {}, {}, and {}",
+            fas_path.display(),
+            tsv_path.display(),
+            partitions_path.display()
+        );
+    }
 
     Ok(())
 }
