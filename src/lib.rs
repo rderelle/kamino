@@ -32,6 +32,7 @@
 //! - `-t`, `--threads`: number of threads used for graph construction and analysis
 //!   (default: 1).
 //! - `-r`, `--recode`: amino-acid recoding scheme (default: `sr6`).
+//! - `--nj`: generate a NJ tree from kamino alignment [nj=false]
 //! - `-v`, `--version`: print version information and exit.
 //!
 //!
@@ -163,7 +164,7 @@ pub struct Args {
     #[arg(short = 'r', long = "recode", value_enum, default_value_t = RecodeScheme::SR6, hide_default_value = true)]
     pub recode: RecodeScheme,
 
-    /// Generate NJ tree from kamino alignment [nj=false]
+    /// Generate a NJ tree from kamino alignment [nj=false]
     #[arg(long = "nj", default_value_t = false, hide_default_value = true)]
     pub nj: bool,
 
