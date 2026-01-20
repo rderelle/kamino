@@ -108,7 +108,7 @@ pub use recode::RecodeScheme;
 
 /// Build a node-based, colored de Bruijn graph from amino-acid proteomes and analyze bubbles.
 #[derive(Parser, Debug)]
-#[command(author, version, about, disable_version_flag = true)]
+#[command(name = "kamino", author, version, about, disable_version_flag = true)]
 #[command(
     group = clap::ArgGroup::new("input_source")
         .required(true)
