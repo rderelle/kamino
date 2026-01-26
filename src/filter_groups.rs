@@ -1,8 +1,8 @@
-use hashbrown::HashMap;
+use anyhow::{bail, Result};
+use hashbrown::{HashMap, HashSet};
 
-use crate::middle_mask::mask_middle_if_diff_run;
-use crate::recode::RECODE_BITS_PER_SYMBOL;
-use crate::revert_aminoacid::{self, KmerNameStats};
+use crate::io::SpeciesInput;
+use crate::revert_aminoacid::{self, GroupLayout, KmerNameStats, WordInterner};
 use crate::traverse::VariantGroups;
 
 /// Alignment output pieces produced for all variant groups.
@@ -21,6 +21,11 @@ pub struct VariantGroupAlignment {
     pub dropped_blocks_due_to_length: usize,
 }
 
+pub(crate) struct GroupKeptMatrix {
+    pub k: usize,
+    pub data: Vec<u8>,
+}
+
 pub(crate) enum FilterOutcome {
     Kept {
         filtered_rows: Vec<Vec<u8>>,
@@ -31,74 +36,122 @@ pub(crate) enum FilterOutcome {
     Skipped,
 }
 
-pub(crate) fn filter_group_block(
-    block: &mut [Vec<u8>],
-    k1: usize,
-    head_keep: usize,
+fn mask_middle_if_diff_run_kept(
+    matrix: &mut GroupKeptMatrix,
+    layout: &GroupLayout,
+    m: usize,
+    n: usize,
+) {
+    let middle_len = layout.middle_len as usize;
+    if middle_len == 0 || middle_len < m {
+        return;
+    }
+
+    let mut consensus: Vec<u8> = vec![b'X'; middle_len];
+    for (col, consensus_cell) in consensus.iter_mut().enumerate().take(middle_len) {
+        let mut counts = [0usize; 256];
+        let mut valid_votes = 0usize;
+        for sid in 0..n {
+            let idx = sid * matrix.k + col;
+            let b = matrix.data[idx];
+            if b == b'-' || b == b'X' {
+                continue;
+            }
+            counts[b as usize] += 1;
+            valid_votes += 1;
+        }
+        if valid_votes == 0 {
+            *consensus_cell = b'X';
+            continue;
+        }
+        let mut best = b'X';
+        let mut best_count = 0usize;
+        for (aa, &count) in counts.iter().enumerate() {
+            if count > best_count {
+                best_count = count;
+                best = aa as u8;
+            }
+        }
+        if best_count * 2 >= valid_votes {
+            *consensus_cell = best;
+        } else {
+            *consensus_cell = b'X';
+        }
+    }
+
+    for sid in 0..n {
+        let row_start = sid * matrix.k;
+        let row = &mut matrix.data[row_start..row_start + matrix.k];
+        let mut run = 0usize;
+        let mut should_mask = false;
+        for col in 0..middle_len {
+            let a = row[col];
+            let c = consensus[col];
+            if a == b'-' || a == b'X' || c == b'-' || c == b'X' {
+                run = 0;
+                continue;
+            }
+            if a != c {
+                run += 1;
+            } else {
+                run = 0;
+            }
+            if run >= m {
+                should_mask = true;
+                break;
+            }
+        }
+        if should_mask {
+            for cell in row.iter_mut().take(middle_len) {
+                *cell = b'X';
+            }
+        }
+    }
+}
+
+fn filter_group_kept(
+    matrix: &mut GroupKeptMatrix,
+    layout: &GroupLayout,
     bubble_ratio: f32,
     max_middle_len: usize,
     mask_m: usize,
+    n: usize,
 ) -> FilterOutcome {
-    let n = block.len();
-    let Some(bl) = block.first().map(|row| row.len()) else {
-        return FilterOutcome::Skipped;
-    };
-    if bl == 0 {
+    if matrix.k == 0 || matrix.data.is_empty() {
         return FilterOutcome::Skipped;
     }
 
-    // Region indices
-    let lead_full = k1;
-    let trail_full = k1;
+    mask_middle_if_diff_run_kept(matrix, layout, mask_m, n);
 
-    let middle_start = lead_full;
-    let middle_end = bl - trail_full; // exclusive
-    let middle_len = middle_end - middle_start;
-
-    mask_middle_if_diff_run(block, k1, mask_m);
-
-    // Missing cutoff based on presence ratio requirement (presence_ratio = 1 - missing_ratio >= bubble_ratio)
+    let middle_len = layout.middle_len as usize;
+    let tail_keep = layout.tail_const_keep as usize;
     let missing_cutoff = 1.0 - bubble_ratio as f64;
 
-    // Trailing constant slice: the end k-mer contributes k-1 columns
-    let tail_const_start = bl - k1;
-
-    let tail_const_keep = head_keep.min(bl - tail_const_start);
-    let tail_const_end = tail_const_start.saturating_add(tail_const_keep);
-
-    // Columns from the trailing context (beginning of end k-mer determined from
-    // the last non-variable column): filter ONLY on missing ratio (constant
-    // columns allowed).
-    let mut keep_tail_cols: Vec<usize> = Vec::with_capacity(tail_const_keep);
-    for col in tail_const_start..tail_const_end {
+    let mut keep_tail_cols: Vec<usize> = Vec::with_capacity(tail_keep);
+    for col in 0..tail_keep {
         let mut missing = 0usize;
-        for row in block.iter().take(n) {
-            let b = row[col];
+        let idx = middle_len + col;
+        for sid in 0..n {
+            let b = matrix.data[sid * matrix.k + idx];
             if b == b'-' || b == b'X' {
                 missing += 1;
             }
         }
         let missing_ratio = (missing as f64) / (n as f64);
         if missing_ratio <= missing_cutoff {
-            keep_tail_cols.push(col);
+            keep_tail_cols.push(idx);
         }
     }
 
-    // Filter middle positions on missing ratio (polymorphism is checked at the group level)
     let mut keep_middle_cols: Vec<usize> = Vec::with_capacity(middle_len);
     let mut has_polymorphic_middle = false;
 
-    for col in middle_start..middle_end {
-        if col >= tail_const_start && col < tail_const_end {
-            // Skip positions reserved for the trailing constant context.
-            continue;
-        }
-
+    for col in 0..middle_len {
         let mut counts = [0usize; 256];
         let mut missing = 0usize;
 
-        for row in block.iter().take(n) {
-            let b = row[col];
+        for sid in 0..n {
+            let b = matrix.data[sid * matrix.k + col];
             if b == b'-' || b == b'X' {
                 missing += 1;
             }
@@ -107,11 +160,9 @@ pub(crate) fn filter_group_block(
 
         let missing_ratio = (missing as f64) / (n as f64);
         if missing_ratio > missing_cutoff {
-            // Too much missing: drop this column.
             continue;
         }
 
-        // Check if this column is polymorphic among non-missing AAs.
         let mut unique_non_gap = 0usize;
         for (aa, &cnt) in counts.iter().enumerate() {
             if cnt == 0 {
@@ -126,16 +177,13 @@ pub(crate) fn filter_group_block(
             }
         }
 
-        // Keep all columns that pass the missing filter, even if monomorphic.
         keep_middle_cols.push(col);
     }
 
-    // If nothing survives the missing filter, drop the block.
     if keep_middle_cols.is_empty() {
         return FilterOutcome::DroppedMiddle;
     }
 
-    // If no middle column is polymorphic, drop the block.
     if !has_polymorphic_middle {
         return FilterOutcome::DroppedMiddle;
     }
@@ -148,9 +196,10 @@ pub(crate) fn filter_group_block(
     debug_assert!(block_len_filtered > 0);
 
     let mut filtered_rows: Vec<Vec<u8>> = Vec::with_capacity(n);
-    for row in block.iter().take(n) {
+    for sid in 0..n {
+        let row_start = sid * matrix.k;
+        let row = &matrix.data[row_start..row_start + matrix.k];
         let mut dst: Vec<u8> = Vec::with_capacity(block_len_filtered);
-
         for &col in &keep_middle_cols {
             dst.push(row[col]);
         }
@@ -168,21 +217,19 @@ pub(crate) fn filter_group_block(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_concatenated_alignment_streaming(
+    inputs: &[SpeciesInput],
+    species: &[String],
+    recode_scheme: crate::RecodeScheme,
     groups: &VariantGroups,
-    k: usize,
-    head_keep: usize,
+    layouts: &[GroupLayout],
     bubble_ratio: f32,
     max_middle_len: usize,
     mask_m: usize,
     scan_k: usize,
-    species_kmer_maps: &[HashMap<u64, usize>],
-    species_kmer_consensus: &[Vec<Option<Vec<u8>>>],
-    species_kmer_name_stats: &[Vec<KmerNameStats>],
-    word_list: &[String],
-    n: usize,
-) -> VariantGroupAlignment {
-    let k1 = k - 1;
-    let sym_bits = RECODE_BITS_PER_SYMBOL;
+    num_threads: usize,
+) -> Result<VariantGroupAlignment> {
+    let _ = num_threads;
+    let n = species.len();
 
     // Per-species buffers for the final concatenated alignment.
     let mut concat: Vec<Vec<u8>> = vec![Vec::new(); n];
@@ -190,39 +237,133 @@ pub(crate) fn build_concatenated_alignment_streaming(
     let mut partition_names: Vec<String> = Vec::new();
     let mut current_pos: usize = 0;
 
-    // Deterministic iteration: sort (start,end)
-    let mut keys: Vec<(u64, u64)> = groups.keys().copied().collect();
-    keys.sort_unstable();
-
     let mut dropped_blocks_due_to_middle_filter = 0usize;
     let mut dropped_blocks_due_to_length = 0usize;
 
-    for key in keys {
-        let paths = &groups[&key];
-        let Some((mut block, group_name_stats)) = revert_aminoacid::build_raw_group_block(
-            key,
-            paths,
-            k,
-            k1,
-            head_keep,
-            sym_bits,
-            scan_k,
-            species_kmer_maps,
-            species_kmer_consensus,
-            species_kmer_name_stats,
-            n,
-        ) else {
-            continue;
+    if inputs.len() != species.len() {
+        bail!(
+            "Input FASTA count ({}) does not match graph species count ({}).",
+            inputs.len(),
+            species.len()
+        );
+    }
+
+    let mut name_to_sid: HashMap<String, usize> = HashMap::new();
+    for (sid, name) in species.iter().enumerate() {
+        name_to_sid.insert(name.clone(), sid);
+    }
+
+    let mut kmers_of_interest: HashSet<u64> = HashSet::new();
+    for layout in layouts {
+        for &km in &layout.unique_kmers {
+            kmers_of_interest.insert(km);
+        }
+    }
+
+    let mut matrices: Vec<GroupKeptMatrix> = layouts
+        .iter()
+        .map(|layout| GroupKeptMatrix {
+            k: layout.kept_len(),
+            data: vec![b'-'; layout.kept_len() * n],
+        })
+        .collect();
+
+    let mut group_name_stats: Vec<KmerNameStats> = vec![KmerNameStats::default(); layouts.len()];
+    let mut word_interner = WordInterner::new();
+
+    for input in inputs {
+        let Some(&sid) = name_to_sid.get(&input.name) else {
+            bail!(
+                "Species {:?} from input list not found in graph.",
+                input.name
+            );
         };
 
-        match filter_group_block(
-            &mut block,
-            k1,
-            head_keep,
-            bubble_ratio,
-            max_middle_len,
-            mask_m,
-        ) {
+        let species_map = revert_aminoacid::build_species_kmer_map(
+            input,
+            recode_scheme,
+            scan_k,
+            &kmers_of_interest,
+            &mut word_interner,
+        )?;
+
+        let mut seen_kmers: HashSet<u64> = HashSet::new();
+
+        for (gidx, layout) in layouts.iter().enumerate() {
+            if layout.paths.is_empty() || layout.kept_len() == 0 {
+                continue;
+            }
+
+            let matrix = &mut matrices[gidx];
+            let row_start = sid * matrix.k;
+            let row = &mut matrix.data[row_start..row_start + matrix.k];
+
+            seen_kmers.clear();
+
+            let paths = &groups[&layout.key];
+            for (path_layout, &path_idx) in layout.paths.iter().zip(layout.path_indices.iter()) {
+                let path = &paths[path_idx];
+                if !path.species.get(sid).map(|b| *b).unwrap_or(false) {
+                    continue;
+                }
+
+                for (kmer, pos0) in path_layout.kmers.iter().zip(path_layout.pos0.iter()) {
+                    let Some(&idx) = species_map.map.get(kmer) else {
+                        continue;
+                    };
+
+                    let offset = idx as usize * scan_k;
+                    let window = &species_map.windows[offset..offset + scan_k];
+
+                    for (t, &newc) in window.iter().enumerate().take(scan_k) {
+                        let pos = *pos0 as usize + t;
+                        if pos >= layout.bl as usize {
+                            break;
+                        }
+                        let Some(kept_idx) = layout.kept_index(pos as u32) else {
+                            continue;
+                        };
+
+                        let cur = row[kept_idx];
+                        if cur == b'-' {
+                            row[kept_idx] = newc;
+                        } else if newc == b'-' {
+                            // keep cur
+                        } else if cur == newc {
+                            // identical call; keep cur
+                        } else {
+                            row[kept_idx] = b'X';
+                        }
+                    }
+
+                    if seen_kmers.insert(*kmer) {
+                        let name_stats = &species_map.name_stats[idx as usize];
+                        if name_stats.total_sets > 0 {
+                            let group_stats = &mut group_name_stats[gidx];
+                            group_stats.total_sets =
+                                group_stats.total_sets.saturating_add(name_stats.total_sets);
+                            for (word_id, count) in &name_stats.word_counts {
+                                if let Some(entry) = group_stats
+                                    .word_counts
+                                    .iter_mut()
+                                    .find(|(existing_id, _)| existing_id == word_id)
+                                {
+                                    entry.1 = entry.1.saturating_add(*count);
+                                } else {
+                                    group_stats.word_counts.push((*word_id, *count));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let word_list = word_interner.words;
+
+    for (gidx, (layout, matrix)) in layouts.iter().zip(matrices.iter_mut()).enumerate() {
+        match filter_group_kept(matrix, layout, bubble_ratio, max_middle_len, mask_m, n) {
             FilterOutcome::Kept {
                 filtered_rows,
                 filtered_len,
@@ -230,7 +371,7 @@ pub(crate) fn build_concatenated_alignment_streaming(
                 let start_pos = current_pos;
                 let end_pos = start_pos + filtered_len - 1;
                 partitions.push((start_pos, end_pos, filtered_len));
-                partition_names.push(build_consensus_name(&group_name_stats, word_list));
+                partition_names.push(build_consensus_name(&group_name_stats[gidx], &word_list));
                 current_pos += filtered_len;
 
                 for (sid, row) in filtered_rows.into_iter().enumerate() {
@@ -249,13 +390,13 @@ pub(crate) fn build_concatenated_alignment_streaming(
         }
     }
 
-    VariantGroupAlignment {
+    Ok(VariantGroupAlignment {
         concat,
         partitions,
         partition_names,
         dropped_blocks_due_to_middle_filter,
         dropped_blocks_due_to_length,
-    }
+    })
 }
 
 fn build_consensus_name(stats: &KmerNameStats, word_list: &[String]) -> String {

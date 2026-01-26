@@ -96,7 +96,6 @@ mod bubbles;
 mod filter_groups;
 mod graph;
 mod io;
-mod middle_mask;
 mod output;
 mod phylo;
 mod recode;
@@ -105,6 +104,65 @@ mod traverse;
 //mod util;
 
 pub use recode::RecodeScheme;
+
+struct TraversalArtifacts {
+    groups: traverse::VariantGroups,
+    species_names: Vec<String>,
+    n_species: usize,
+    recode_scheme: RecodeScheme,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_traverse(
+    species_inputs: &[io::SpeciesInput],
+    k: usize,
+    min_freq: f32,
+    depth: usize,
+    num_threads: usize,
+    recode_scheme: RecodeScheme,
+) -> anyhow::Result<TraversalArtifacts> {
+    // Build global graph
+    let mut g = graph::Graph::new(k, recode_scheme);
+    io::build_graph_from_inputs(species_inputs, k, &mut g, num_threads)?;
+
+    // Basic stats
+    io::print_graph_size(&g);
+    //io::print_outdegree_histogram(&g);
+
+    // Bubble endpoints
+    let (start_kmers, end_kmers) = bubbles::find_bubble_endpoints(&g, min_freq, num_threads);
+    eprintln!(
+        "bubble endpoints: start={} end={}",
+        start_kmers.len(),
+        end_kmers.len()
+    );
+
+    // Traverse VGs
+    let groups = traverse::find_variant_groups(
+        &g,
+        &start_kmers,
+        &end_kmers,
+        depth,
+        min_freq,
+        num_threads,
+    );
+    let total_paths: usize = groups.values().map(|v| v.len()).sum();
+    eprintln!(
+        "variant groups: groups={} paths={}",
+        groups.len(),
+        total_paths
+    );
+
+    // Emit amino-acid sequences per path for each variant group (call disabled, keep for debugging)
+    // traverse::print_variant_group_sequences(&g, &groups);
+
+    Ok(TraversalArtifacts {
+        groups,
+        species_names: g.species_names.clone(),
+        n_species: g.n_species,
+        recode_scheme: g.recode_scheme,
+    })
+}
 
 /// Build a node-based, colored de Bruijn graph from amino-acid proteomes and analyze bubbles.
 #[derive(Parser, Debug)]
@@ -246,46 +304,22 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         args.output.display()
     );
 
-    // Build global graph
-    let mut g = graph::Graph::new(k, args.recode);
-    io::build_graph_from_inputs(&species_inputs, k, &mut g, num_threads)?;
-
-    // Basic stats
-    io::print_graph_size(&g);
-    //io::print_outdegree_histogram(&g);
-
-    // Bubble endpoints
-    let (start_kmers, end_kmers) = bubbles::find_bubble_endpoints(&g, min_freq, num_threads);
-    eprintln!(
-        "bubble endpoints: start={} end={}",
-        start_kmers.len(),
-        end_kmers.len()
-    );
-
-    // Traverse VGs
-    let groups = traverse::find_variant_groups(
-        &g,
-        &start_kmers,
-        &end_kmers,
-        args.depth,
+    let traversal = run_traverse(
+        &species_inputs,
+        k,
         min_freq,
+        args.depth,
         num_threads,
-    );
-    let total_paths: usize = groups.values().map(|v| v.len()).sum();
-    eprintln!(
-        "variant groups: groups={} paths={}",
-        groups.len(),
-        total_paths
-    );
-
-    // Emit amino-acid sequences per path for each variant group (call disabled, keep for debugging)
-    // traverse::print_variant_group_sequences(&g, &groups);
+        args.recode,
+    )?;
 
     let (alignment_len, alignment_missing_pct) = output::write_outputs_with_head(
         &species_inputs,
         &args.output,
-        &g,
-        &groups,
+        &traversal.species_names,
+        traversal.n_species,
+        traversal.recode_scheme,
+        &traversal.groups,
         k,
         constant,
         min_freq,

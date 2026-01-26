@@ -1,24 +1,34 @@
-use anyhow::{bail, Result};
-use bitvec::prelude::*;
-use hashbrown::HashMap;
-use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
+use anyhow::Result;
+use hashbrown::{HashMap, HashSet};
 use seq_io::fasta::{Reader as FastaReader, Record};
-use std::path::PathBuf;
 
-use crate::graph::Graph;
 use crate::io::{open_fasta, SpeciesInput};
 use crate::recode::{recode_byte, RecodeScheme, RECODE_BITS_PER_SYMBOL};
 use crate::traverse::{PathRec, VariantGroups};
-use std::sync::{Arc, Mutex};
 
-pub(crate) type SpeciesKmerConsensus = (
-    usize,
-    Vec<HashMap<u64, usize>>,
-    Vec<Vec<Option<Vec<u8>>>>,
-    Vec<Vec<KmerNameStats>>,
-    Vec<String>,
-);
+pub(crate) struct GroupLayout {
+    pub key: (u64, u64),
+    pub bl: u32,
+    pub paths: Vec<GroupPathLayout>,
+    pub path_indices: Vec<usize>,
+    pub unique_kmers: Vec<u64>,
+    pub middle_start: u32,
+    pub middle_len: u32,
+    pub tail_const_start: u32,
+    pub tail_const_keep: u32,
+    pub kept_pos: Vec<u16>,
+}
+
+pub(crate) struct GroupPathLayout {
+    pub kmers: Vec<u64>,
+    pub pos0: Vec<u32>,
+}
+
+pub(crate) struct SpeciesKmerMap {
+    pub map: HashMap<u64, u32>,
+    pub windows: Vec<u8>,
+    pub name_stats: Vec<KmerNameStats>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct KmerNameStats {
@@ -46,13 +56,13 @@ impl KmerNameStats {
     }
 }
 
-struct WordInterner {
+pub(crate) struct WordInterner {
     map: HashMap<String, u32>,
-    words: Vec<String>,
+    pub(crate) words: Vec<String>,
 }
 
 impl WordInterner {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             map: HashMap::new(),
             words: Vec::new(),
@@ -70,11 +80,23 @@ impl WordInterner {
     }
 }
 
-enum PathData<'a> {
-    Recoded {
-        codes: Vec<u8>,
-        species: &'a BitVec<u32, Lsb0>,
-    },
+impl GroupLayout {
+    #[inline]
+    pub(crate) fn kept_index(&self, pos: u32) -> Option<usize> {
+        if pos >= self.middle_start && pos < self.middle_start + self.middle_len {
+            return Some((pos - self.middle_start) as usize);
+        }
+        if pos >= self.tail_const_start && pos < self.tail_const_start + self.tail_const_keep {
+            let offset = pos - self.tail_const_start;
+            return Some((self.middle_len + offset) as usize);
+        }
+        None
+    }
+
+    #[inline]
+    pub(crate) fn kept_len(&self) -> usize {
+        self.kept_pos.len()
+    }
 }
 
 /// Decode packed (k-1)-mer node into AA codes (MSB..LSB).
@@ -164,438 +186,266 @@ fn encoded_kmers_from_codes(codes: &[u8], k: usize, sym_bits: u32) -> Vec<u64> {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_species_kmer_consensus(
-    inputs: &[SpeciesInput],
-    g: &Graph,
-    groups: &VariantGroups,
-    k: usize,
-    head_max: usize,
-    num_threads: usize,
-) -> Result<SpeciesKmerConsensus> {
-    let _ = head_max;
-    let species = &g.species_names;
-    let n = g.n_species;
-    let sym_bits = RECODE_BITS_PER_SYMBOL;
-    let recode_scheme: RecodeScheme = g.recode_scheme;
-
-    // Set scan_k (=21 or less if short k-mer size)
+pub(crate) fn scan_k_from_k(k: usize) -> usize {
     let min_vg_len: usize = 2 * (k - 1) + 1;
-    let scan_k: usize = min_vg_len.min(21);
+    min_vg_len.min(21)
+}
+pub(crate) fn build_species_kmer_map(
+    input: &SpeciesInput,
+    recode_scheme: RecodeScheme,
+    scan_k: usize,
+    kmers_of_interest: &HashSet<u64>,
+    word_interner: &mut WordInterner,
+) -> Result<SpeciesKmerMap> {
+    if scan_k == 0 {
+        return Ok(SpeciesKmerMap {
+            map: HashMap::new(),
+            windows: Vec::new(),
+            name_stats: Vec::new(),
+        });
+    }
 
-    // --------------------------------------------------------------------
-    // PHASE 1: from variant groups, collect per-species k-mers
-    // --------------------------------------------------------------------
+    let sym_bits = RECODE_BITS_PER_SYMBOL;
+    let mask = kmer_mask(sym_bits, scan_k);
+    let reader = open_fasta(&input.path)?;
+    let mut fasta = FastaReader::new(reader);
 
-    use hashbrown::hash_map::Entry;
+    let mut map: HashMap<u64, u32> = HashMap::new();
+    let mut windows: Vec<u8> = Vec::new();
+    let mut name_stats: Vec<KmerNameStats> = Vec::new();
 
-    // species_kmer_maps[sid]: recoded k-mer (u64) -> index in species_kmer_consensus[sid]
-    let mut species_kmer_maps: Vec<HashMap<u64, usize>> = vec![HashMap::new(); n];
-    // species_kmer_consensus[sid][idx]: Option<Vec<u8>> = consensus 20AA k-mer
-    let mut species_kmer_consensus: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::new(); n];
-    // species_kmer_name_stats[sid][idx]: KmerNameStats for protein name words
-    let mut species_kmer_name_stats: Vec<Vec<KmerNameStats>> = vec![Vec::new(); n];
+    let mut aa_ring: Vec<u8> = vec![0u8; scan_k];
+    let mut window: Vec<u8> = Vec::with_capacity(scan_k);
+    let mut kmer_hits: HashSet<u32> = HashSet::new();
 
-    for paths in groups.values() {
-        for p in paths {
-            // Recoded symbol sequence for this path (Dayhoff6 codes).
-            let path_codes = render_path_codes(&p.nodes, k, sym_bits);
-            let kmers = encoded_kmers_from_codes(&path_codes, scan_k, sym_bits);
-
-            // For every species present on this path, register these k-mers.
-            for (sid, ((map, cons_vec), name_stats)) in species_kmer_maps
-                .iter_mut()
-                .zip(species_kmer_consensus.iter_mut())
-                .zip(species_kmer_name_stats.iter_mut())
-                .enumerate()
-                .take(n)
-            {
-                let present = p.species.get(sid).map(|b| *b).unwrap_or(false);
-                if !present {
+    while let Some(rec) = fasta.next() {
+        let rec = rec?;
+        let mut name_words: Vec<u32> = Vec::new();
+        let header = match rec.desc() {
+            Some(desc) => {
+                let mut header = rec.id().unwrap_or("").to_string();
+                header.push(' ');
+                header.push_str(desc.unwrap_or(""));
+                header
+            }
+            None => rec.id().unwrap_or("").to_string(),
+        };
+        if !header.is_empty() {
+            for (idx, word) in header.split_whitespace().enumerate() {
+                if idx == 0 {
                     continue;
                 }
-
-                for &km in &kmers {
-                    match map.entry(km) {
-                        Entry::Vacant(e) => {
-                            let idx = cons_vec.len();
-                            cons_vec.push(None); // consensus will be filled in phase 2
-                            name_stats.push(KmerNameStats::default());
-                            e.insert(idx);
-                        }
-                        Entry::Occupied(_) => {
-                            // already tracked; nothing to do
-                        }
-                    }
+                if word.starts_with('[') {
+                    break;
+                }
+                let word_id = word_interner.intern(word);
+                if !name_words.contains(&word_id) {
+                    name_words.push(word_id);
                 }
             }
         }
-    }
 
-    // --------------------------------------------------------------------
-    // PHASE 2: stream proteomes from disk and build per-k-mer 20AA consensus
-    // --------------------------------------------------------------------
-    // Get FASTA files and map them to species IDs (same logic as load_proteomes).
-    if inputs.len() != species.len() {
-        bail!(
-            "Input FASTA count ({}) does not match graph species count ({}).",
-            inputs.len(),
-            species.len()
-        );
-    }
-
-    let mut name_to_sid: HashMap<String, usize> = HashMap::new();
-    for (sid, name) in species.iter().enumerate() {
-        name_to_sid.insert(name.clone(), sid);
-    }
-
-    let mask = kmer_mask(sym_bits, scan_k);
-
-    struct SpeciesWork {
-        sid: usize,
-        path: PathBuf,
-        map: HashMap<u64, usize>,
-        consensus: Vec<Option<Vec<u8>>>,
-        name_stats: Vec<KmerNameStats>,
-    }
-
-    struct ThreadBuffers {
-        aa_ring: Vec<u8>,
-        window: Vec<u8>,
-        kmer_hits: hashbrown::HashSet<usize>,
-    }
-
-    let mut work: Vec<Option<SpeciesWork>> = (0..n).map(|_| None).collect();
-
-    for input in inputs {
-        let name = &input.name;
-        let Some(&sid) = name_to_sid.get(name) else {
-            bail!("Species {:?} from input list not found in graph.", name);
-        };
-
-        let map = std::mem::take(&mut species_kmer_maps[sid]);
-        let consensus = std::mem::take(&mut species_kmer_consensus[sid]);
-        let name_stats = std::mem::take(&mut species_kmer_name_stats[sid]);
-
-        work[sid] = Some(SpeciesWork {
-            sid,
-            path: input.path.clone(),
-            map,
-            consensus,
-            name_stats,
-        });
-    }
-
-    let word_interner = Arc::new(Mutex::new(WordInterner::new()));
-
-    let n_threads = num_threads.max(1);
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(n_threads)
-        .build()
-        .expect("Failed to build Rayon thread pool in build_species_kmer_consensus");
-
-    pool.install(|| -> Result<()> {
-        work.par_iter_mut()
-            .filter_map(|opt| opt.as_mut())
-            .try_for_each_init(
-                || ThreadBuffers {
-                    aa_ring: vec![0u8; scan_k],
-                    window: Vec::with_capacity(scan_k),
-                    kmer_hits: hashbrown::HashSet::new(),
-                },
-                |buffers, work_item| {
-                    if work_item.map.is_empty() {
-                        return Ok(());
-                    }
-
-                    let reader = open_fasta(&work_item.path)?;
-                    let mut fasta = FastaReader::new(reader);
-
-                    while let Some(rec) = fasta.next() {
-                        let rec = rec?;
-                        let mut name_words: Vec<u32> = Vec::new();
-                        let header = match rec.desc() {
-                            Some(desc) => {
-                                let mut header = rec.id().unwrap_or("").to_string();
-                                header.push(' ');
-                                header.push_str(desc.unwrap_or(""));
-                                header
-                            }
-                            None => rec.id().unwrap_or("").to_string(),
-                        };
-                        if !header.is_empty() {
-                            let mut interner = word_interner.lock().expect("word interner lock");
-                            for (idx, word) in header.split_whitespace().enumerate() {
-                                if idx == 0 {
-                                    continue;
-                                }
-                                if word.starts_with('[') {
-                                    break;
-                                }
-                                let word_id = interner.intern(word);
-                                if !name_words.contains(&word_id) {
-                                    name_words.push(word_id);
-                                }
-                            }
-                        }
-
-                        let seq = rec.seq();
-                        if seq.len() < scan_k {
-                            continue;
-                        }
-
-                        let map = &work_item.map;
-                        let cons_vec = &mut work_item.consensus;
-
-                        let mut val: u64 = 0;
-                        let mut have: usize = 0;
-                        let mut filled: usize = 0;
-                        let mut head: usize = 0;
-
-                        for &b in seq {
-                            let aa = b.to_ascii_uppercase();
-                            let code = recode_byte(aa, recode_scheme);
-
-                            if code == 255 {
-                                // Unknown symbol: reset window.
-                                val = 0;
-                                have = 0;
-                                filled = 0;
-                                head = 0;
-                                continue;
-                            }
-
-                            if filled < scan_k {
-                                buffers.aa_ring[filled] = aa;
-                                filled += 1;
-                            } else {
-                                buffers.aa_ring[head] = aa;
-                                head = (head + 1) % scan_k;
-                            }
-
-                            val = (val << sym_bits) | code as u64;
-
-                            if have + 1 < scan_k {
-                                have += 1;
-                                continue;
-                            }
-
-                            if have + 1 > scan_k {
-                                val &= mask;
-                            } else {
-                                have = scan_k;
-                            }
-
-                            if have < scan_k {
-                                continue;
-                            }
-
-                            if let Some(&idx) = map.get(&val) {
-                                buffers.window.clear();
-                                for i in 0..scan_k {
-                                    let pos = (head + i) % scan_k;
-                                    buffers.window.push(buffers.aa_ring[pos]);
-                                }
-
-                                let entry = &mut cons_vec[idx];
-                                if entry.is_none() {
-                                    let mut seq_cons = vec![0u8; scan_k];
-                                    seq_cons.clone_from_slice(&buffers.window);
-                                    *entry = Some(seq_cons);
-                                } else {
-                                    // Update consensus: first AA wins, conflicts become 'X'.
-                                    let seq_cons = entry.as_mut().unwrap();
-                                    for (i, &aa_new) in buffers.window.iter().enumerate() {
-                                        let aa_old = seq_cons[i];
-                                        if aa_old == 0 {
-                                            seq_cons[i] = aa_new;
-                                        } else if aa_old != aa_new {
-                                            seq_cons[i] = b'X';
-                                        }
-                                    }
-                                }
-                                if !name_words.is_empty() {
-                                    buffers.kmer_hits.insert(idx);
-                                }
-                            }
-                        }
-
-                        if !name_words.is_empty() {
-                            for idx in buffers.kmer_hits.drain() {
-                                work_item.name_stats[idx].add_words(&name_words);
-                            }
-                        } else {
-                            buffers.kmer_hits.clear();
-                        }
-                    }
-
-                    // After scanning this species' proteome, turn any still-0 bytes into '-'.
-                    for opt in &mut work_item.consensus {
-                        if let Some(seq_cons) = opt.as_mut() {
-                            for aa in seq_cons.iter_mut() {
-                                if *aa == 0 {
-                                    *aa = b'-';
-                                }
-                            }
-                        }
-                    }
-
-                    Ok(())
-                },
-            )
-    })?;
-
-    for opt in work.into_iter().flatten() {
-        species_kmer_maps[opt.sid] = opt.map;
-        species_kmer_consensus[opt.sid] = opt.consensus;
-        species_kmer_name_stats[opt.sid] = opt.name_stats;
-    }
-
-    let word_list = word_interner
-        .lock()
-        .expect("word interner lock")
-        .words
-        .clone();
-
-    Ok((
-        scan_k,
-        species_kmer_maps,
-        species_kmer_consensus,
-        species_kmer_name_stats,
-        word_list,
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_raw_group_block(
-    key: (u64, u64),
-    paths: &[PathRec],
-    k: usize,
-    k1: usize,
-    head_keep: usize,
-    sym_bits: u32,
-    scan_k: usize,
-    species_kmer_maps: &[HashMap<u64, usize>],
-    species_kmer_consensus: &[Vec<Option<Vec<u8>>>],
-    species_kmer_name_stats: &[Vec<KmerNameStats>],
-    n: usize,
-) -> Option<(Vec<Vec<u8>>, KmerNameStats)> {
-    let _ = k1;
-    let _ = head_keep;
-    // Deterministic order for paths: by length, then lexicographically on node IDs
-    let mut local_paths: Vec<&PathRec> = paths.iter().collect();
-    local_paths.sort_unstable_by(|a, b| {
-        a.nodes
-            .len()
-            .cmp(&b.nodes.len())
-            .then_with(|| a.nodes.cmp(&b.nodes))
-    });
-
-    // Collect per-path data
-    let mut per_path: Vec<PathData> = Vec::with_capacity(local_paths.len());
-    let mut block_len: Option<usize> = None;
-
-    for p in local_paths {
-        if p.nodes.is_empty() {
-            continue;
-        }
-        let path_codes = render_path_codes(&p.nodes, k, sym_bits);
-        if path_codes.is_empty() {
+        let seq = rec.seq();
+        if seq.len() < scan_k {
             continue;
         }
 
-        let len = path_codes.len();
-        block_len.get_or_insert(len);
+        let mut val: u64 = 0;
+        let mut have: usize = 0;
+        let mut filled: usize = 0;
+        let mut head: usize = 0;
 
-        per_path.push(PathData::Recoded {
-            codes: path_codes,
-            species: &p.species,
-        });
-    }
+        for &b in seq {
+            let aa = b.to_ascii_uppercase();
+            let code = recode_byte(aa, recode_scheme);
 
-    let Some(bl) = block_len else {
-        // no usable paths for this group
-        return None;
-    };
-
-    // One alignment block per group: start with '-' everywhere
-    let mut block: Vec<Vec<u8>> = vec![vec![b'-'; bl]; n];
-
-    let mut group_name_stats = KmerNameStats::default();
-    let mut group_seen_kmers: hashbrown::HashSet<(usize, usize)> = hashbrown::HashSet::new();
-
-    // Merge paths into the block.
-    for data in per_path.into_iter() {
-        let PathData::Recoded { codes, species } = data;
-        // Repaint from per-k-mer 20AA consensus.
-        if scan_k == 0 || codes.len() < scan_k {
-            continue;
-        }
-        let kmers = encoded_kmers_from_codes(&codes, scan_k, sym_bits);
-
-        for (sid, row) in block.iter_mut().enumerate().take(n) {
-            if !species.get(sid).map(|b| *b).unwrap_or(false) {
+            if code == 255 {
+                // Unknown symbol: reset window.
+                val = 0;
+                have = 0;
+                filled = 0;
+                head = 0;
                 continue;
             }
-            let map = &species_kmer_maps[sid];
-            let cons_vec = &species_kmer_consensus[sid];
-            let name_vec = &species_kmer_name_stats[sid];
 
-            // Each k-mer kmers[j] covers positions [j .. j+scan_k) in the path.
-            for (j, &km) in kmers.iter().enumerate() {
-                let Some(&idx) = map.get(&km) else {
-                    continue;
-                };
-                let Some(ref kseq) = cons_vec[idx] else {
-                    continue;
-                };
-                debug_assert_eq!(
-                    kseq.len(),
-                    scan_k,
-                    "Consensus k-mer length mismatch for species {} in group ({}, {})",
-                    sid,
-                    key.0,
-                    key.1
-                );
-                for (offset, &newc) in kseq.iter().enumerate().take(scan_k) {
-                    let pos = j + offset;
-                    if pos >= bl {
-                        break;
-                    }
-                    let cur = row[pos];
-                    if cur == b'-' {
-                        row[pos] = newc;
-                    } else if newc == b'-' {
-                        // keep cur
-                    } else if cur == newc {
-                        // identical call; keep cur
-                    } else {
-                        row[pos] = b'X';
-                    }
-                }
+            if filled < scan_k {
+                aa_ring[filled] = aa;
+                filled += 1;
+            } else {
+                aa_ring[head] = aa;
+                head = (head + 1) % scan_k;
+            }
 
-                if group_seen_kmers.insert((sid, idx)) {
-                    let name_stats = &name_vec[idx];
-                    if name_stats.total_sets > 0 {
-                        group_name_stats.total_sets = group_name_stats
-                            .total_sets
-                            .saturating_add(name_stats.total_sets);
-                        for (word_id, count) in &name_stats.word_counts {
-                            if let Some(entry) = group_name_stats
-                                .word_counts
-                                .iter_mut()
-                                .find(|(existing_id, _)| existing_id == word_id)
-                            {
-                                entry.1 = entry.1.saturating_add(*count);
-                            } else {
-                                group_name_stats.word_counts.push((*word_id, *count));
-                            }
-                        }
-                    }
+            val = (val << sym_bits) | code as u64;
+
+            if have + 1 < scan_k {
+                have += 1;
+                continue;
+            }
+
+            if have + 1 > scan_k {
+                val &= mask;
+            } else {
+                have = scan_k;
+            }
+
+            if have < scan_k {
+                continue;
+            }
+
+            if !kmers_of_interest.contains(&val) {
+                continue;
+            }
+
+            let idx = if let Some(&idx) = map.get(&val) {
+                idx
+            } else {
+                let idx = map.len() as u32;
+                map.insert(val, idx);
+                windows.resize(windows.len() + scan_k, 0u8);
+                name_stats.push(KmerNameStats::default());
+                idx
+            };
+
+            window.clear();
+            for i in 0..scan_k {
+                let pos = (head + i) % scan_k;
+                window.push(aa_ring[pos]);
+            }
+
+            let start = idx as usize * scan_k;
+            let slot = &mut windows[start..start + scan_k];
+            for (i, &aa_new) in window.iter().enumerate() {
+                let aa_old = slot[i];
+                if aa_old == 0 {
+                    slot[i] = aa_new;
+                } else if aa_old != aa_new {
+                    slot[i] = b'X';
                 }
             }
+            if !name_words.is_empty() {
+                kmer_hits.insert(idx);
+            }
+        }
+
+        if !name_words.is_empty() {
+            for idx in kmer_hits.drain() {
+                name_stats[idx as usize].add_words(&name_words);
+            }
+        } else {
+            kmer_hits.clear();
         }
     }
 
-    Some((block, group_name_stats))
+    for slot in windows.iter_mut() {
+        if *slot == 0 {
+            *slot = b'-';
+        }
+    }
+
+    Ok(SpeciesKmerMap {
+        map,
+        windows,
+        name_stats,
+    })
+}
+
+pub(crate) fn build_group_layouts(
+    groups: &VariantGroups,
+    k: usize,
+    head_keep: usize,
+    scan_k: usize,
+) -> Vec<GroupLayout> {
+    let sym_bits = RECODE_BITS_PER_SYMBOL;
+    let k1 = k - 1;
+
+    let mut keys: Vec<(u64, u64)> = groups.keys().copied().collect();
+    keys.sort_unstable();
+
+    let mut layouts = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        let paths = &groups[&key];
+        let mut local_paths: Vec<(usize, &PathRec)> = paths.iter().enumerate().collect();
+        local_paths.sort_unstable_by(|(_, a), (_, b)| {
+            a.nodes
+                .len()
+                .cmp(&b.nodes.len())
+                .then_with(|| a.nodes.cmp(&b.nodes))
+        });
+
+        let mut paths_layout: Vec<GroupPathLayout> = Vec::with_capacity(local_paths.len());
+        let mut path_indices: Vec<usize> = Vec::with_capacity(local_paths.len());
+        let mut block_len: Option<usize> = None;
+        let mut unique_kmers: HashSet<u64> = HashSet::new();
+
+        for (idx, p) in local_paths {
+            let mut path_kmers_out: Vec<u64> = Vec::new();
+            let mut path_pos0_out: Vec<u32> = Vec::new();
+            if p.nodes.is_empty() {
+                continue;
+            }
+            let path_codes = render_path_codes(&p.nodes, k, sym_bits);
+            if path_codes.is_empty() {
+                continue;
+            }
+            let len = path_codes.len();
+            block_len.get_or_insert(len);
+
+            if scan_k == 0 || path_codes.len() < scan_k {
+                paths_layout.push(GroupPathLayout {
+                    kmers: path_kmers_out,
+                    pos0: path_pos0_out,
+                });
+                path_indices.push(idx);
+                continue;
+            }
+            let path_kmers = encoded_kmers_from_codes(&path_codes, scan_k, sym_bits);
+            for (j, &km) in path_kmers.iter().enumerate() {
+                path_kmers_out.push(km);
+                path_pos0_out.push(j as u32);
+                unique_kmers.insert(km);
+            }
+
+            paths_layout.push(GroupPathLayout {
+                kmers: path_kmers_out,
+                pos0: path_pos0_out,
+            });
+            path_indices.push(idx);
+        }
+
+        let Some(bl) = block_len else {
+            continue;
+        };
+
+        let middle_start = k1 as u32;
+        let middle_end = bl.saturating_sub(k1) as u32;
+        let middle_len = middle_end.saturating_sub(middle_start);
+        let tail_const_start = middle_end;
+        let tail_const_keep = head_keep.min(bl.saturating_sub(k1)) as u32;
+
+        let mut kept_pos: Vec<u16> =
+            Vec::with_capacity((middle_len + tail_const_keep).try_into().unwrap_or(0usize));
+        for pos in middle_start..middle_end {
+            kept_pos.push(pos as u16);
+        }
+        for pos in tail_const_start..tail_const_start + tail_const_keep {
+            kept_pos.push(pos as u16);
+        }
+
+        layouts.push(GroupLayout {
+            key,
+            bl: bl as u32,
+            paths: paths_layout,
+            path_indices,
+            unique_kmers: unique_kmers.into_iter().collect(),
+            middle_start,
+            middle_len,
+            tail_const_start,
+            tail_const_keep,
+            kept_pos,
+        });
+    }
+
+    layouts
 }
