@@ -5,11 +5,11 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::filter_groups::build_concatenated_alignment_streaming;
-use crate::graph::Graph;
 use crate::io::SpeciesInput;
 use crate::phylo;
 use crate::revert_aminoacid;
 use crate::traverse::VariantGroups;
+use crate::RecodeScheme;
 
 pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     /// Build an output path next to the base path while keeping the stem.
@@ -52,7 +52,9 @@ pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
 pub fn write_outputs_with_head(
     inputs: &[SpeciesInput],
     out_base: &Path,
-    g: &Graph,
+    species: &[String],
+    _n: usize,
+    recode_scheme: RecodeScheme,
     groups: &VariantGroups,
     k: usize,
     head_max: usize,   // user-defined n; must be ≤ k-1
@@ -62,33 +64,21 @@ pub fn write_outputs_with_head(
     num_threads: usize,
     generate_nj: bool,
 ) -> Result<(usize, f64)> {
-    let species = &g.species_names;
-    let n = g.n_species;
-
-    let (scan_k, species_kmer_maps, species_kmer_consensus, species_kmer_name_stats, word_list) =
-        revert_aminoacid::build_species_kmer_consensus(
-            inputs,
-            g,
-            groups,
-            k,
-            head_max,
-            num_threads,
-        )?;
+    let scan_k = revert_aminoacid::scan_k_from_k(k);
+    let layouts = revert_aminoacid::build_group_layouts(groups, k, head_max, scan_k);
 
     let alignment = build_concatenated_alignment_streaming(
+        inputs,
+        species,
+        recode_scheme,
         groups,
-        k,
-        head_max,
+        &layouts,
         bubble_ratio,
         max_middle_len,
         mask_m,
         scan_k,
-        &species_kmer_maps,
-        &species_kmer_consensus,
-        &species_kmer_name_stats,
-        &word_list,
-        n,
-    );
+        num_threads,
+    )?;
 
     let (fas_path, tsv_path, partitions_path, tree_path) = output_paths(out_base);
     let (concat, partitions, partition_names, dropped_middle, dropped_length) = (
