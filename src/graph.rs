@@ -330,7 +330,6 @@ impl NodeColorTable {
 }
 
 impl<'a> NodeColorSlice<'a> {
-
     pub fn iter_ones(self) -> NodeColorOnes<'a> {
         NodeColorOnes {
             species: self.species,

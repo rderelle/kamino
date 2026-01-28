@@ -25,6 +25,7 @@ Typical usages range from between-species to within-phylum phylogenetic analyses
 kamino performs the following successive steps:
 - lists proteome files from the input directory (-i or -I)
 - recodes proteins with a 6-letters recoding scheme (-r)
+- simplifies proteomes by discarding *non-conserved* proteins
 - simplifies proteomes by discarding out-branching k-mers 
 - builds a global assembly graph and identifies variant groups as described <a href="https://academic.oup.com/mbe/article/42/4/msaf077/8103706">here</a> (-d)
 - converts variant group paths back to amino acids using a sliding window
@@ -82,7 +83,7 @@ All analyses were performed on a MacBook "M4 Pro" using v0.4.0 and 4 threads (ot
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
 
 - **How to get more phylogenetic positions?**
-<p>Increase the k-mer size (-k), increase the maximum depth of the graph traversal (-d), or lower the minimum proportion of isolates with amino acid per position (-m) if that is acceptable for downstream analyses.</p>
+<p>Iincrease the maximum depth of the graph traversal (-d) or lower the minimum proportion of isolates with amino acid per position (-m) if that is acceptable for downstream analyses.</p>
 
  
 

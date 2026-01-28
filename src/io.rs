@@ -2,15 +2,19 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use flate2::read::MultiGzDecoder;
 use hashbrown::HashMap;
+use rustc_hash::FxHasher;
 use seq_io::fasta::{Reader as FastaReader, Record};
 use std::fs::File;
+use std::hash::BuildHasherDefault;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::hash::BuildHasherDefault;
-use rustc_hash::FxHasher;
 
 use crate::graph::{AdjTable, Graph, NodeColorTable, SpeciesSet};
-use crate::recode::{recode_byte, RecodeScheme, RECODE_BITS_PER_SYMBOL};
+use crate::proba_filter::{
+    protein_passes_counts, stream_recoded_edges, stream_recoded_kmers, AtomicCountMinSketch,
+    BloomFilter, BLOOM_BITS, CMS_DEPTH, CMS_WIDTH,
+};
+use crate::recode::RECODE_BITS_PER_SYMBOL;
 
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -142,8 +146,8 @@ pub fn collect_species_inputs_from_table(table_path: &Path) -> anyhow::Result<Ve
         if path.is_relative() {
             path = base_dir.join(path);
         }
-        let metadata = std::fs::metadata(&path)
-            .with_context(|| format!("read metadata for {:?}", path))?;
+        let metadata =
+            std::fs::metadata(&path).with_context(|| format!("read metadata for {:?}", path))?;
         anyhow::ensure!(
             metadata.is_file(),
             "Proteome path {:?} (line {} in {:?}) is not a file.",
@@ -204,6 +208,7 @@ pub(crate) fn open_fasta(path: &Path) -> Result<Box<dyn Read>> {
 pub fn build_graph_from_inputs(
     inputs: &[SpeciesInput],
     k: usize,
+    min_freq: f32,
     main: &mut Graph,
     num_threads: usize,
 ) -> Result<()> {
@@ -219,61 +224,43 @@ pub fn build_graph_from_inputs(
     }
 
     let sym_bits = RECODE_BITS_PER_SYMBOL;
-    let k_mask = main.k_mask;
     let k1_mask = main.k1_mask;
     let recode_scheme = main.recode_scheme;
-    let sym_mask: u64 = if sym_bits >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << sym_bits) - 1
-    };
 
-    // Single-pass kmer streaming
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn stream_kmers<R: Read>(
-        mut reader: FastaReader<R>,
-        k: usize,
-        sym_bits: u32,
-        k_mask: u64,
-        k1_mask: u64,
-        sym_mask: u64,
-        mut on_edge: impl FnMut(u64, u32, u64),
-        scheme: RecodeScheme,
-    ) -> Result<()> {
-        while let Some(rec) = reader.next() {
-            let rec = rec?;
-            let seq = rec.seq();
-
-            let mut roll: u64 = 0;
-            let mut have: usize = 0;
-
-            for &b in seq {
-                let a = recode_byte(b, scheme);
-                if a == 255 {
-                    roll = 0;
-                    have = 0;
-                    continue;
-                }
-                roll = ((roll << sym_bits) | (a as u64)) & k_mask;
-                if have < k {
-                    have += 1;
-                }
-                if have == k {
-                    let prefix = (roll >> sym_bits) & k1_mask;
-                    let sym = (roll & sym_mask) as u32;
-                    let suffix = ((prefix << sym_bits) | (sym as u64)) & k1_mask;
-                    on_edge(prefix, sym, suffix);
-                }
-            }
-        }
-        Ok(())
-    }
+    let k1 = k.saturating_sub(1);
+    let min_needed = (min_freq * inputs.len().max(1) as f32).ceil() as u32;
+    // CMS estimates the number of species containing a (k-1)-mer.
+    let min_needed_cms = min_needed;
 
     let pool = ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build()
         .expect("Failed to build local Rayon thread pool");
+
+    // Thread-safe CMS updated in parallel; each species only increments once per k-mer.
+    let cms_atomic = AtomicCountMinSketch::new(CMS_WIDTH, CMS_DEPTH);
+    pool.install(|| -> Result<()> {
+        inputs.par_iter().try_for_each(|input| -> Result<()> {
+            let rdr = open_fasta(&input.path)?;
+            let mut reader = FastaReader::new(rdr);
+            // Per-species Bloom filter to prevent double-counting within a proteome.
+            let mut species_bloom = BloomFilter::new(BLOOM_BITS);
+
+            while let Some(rec) = reader.next() {
+                let rec = rec?;
+                let seq = rec.seq();
+                stream_recoded_kmers(seq, k1, sym_bits, k1_mask, recode_scheme, |kmer| {
+                    if !species_bloom.test_and_set(kmer) {
+                        cms_atomic.increment(kmer);
+                    }
+                });
+            }
+
+            Ok(())
+        })
+    })?;
+    // Snapshot the CMS before the filtering stage.
+    let cms = cms_atomic.snapshot();
 
     let adj: FastDashMap<u64, u32> = FastDashMap::default();
     let samples: FastDashMap<u64, SpeciesSet> = FastDashMap::default();
@@ -284,34 +271,53 @@ pub fn build_graph_from_inputs(
             .zip(species_ids.par_iter().copied())
             .try_for_each(|(input, sid)| -> Result<()> {
                 let rdr = open_fasta(&input.path)?;
-                let reader = FastaReader::new(rdr);
+                let mut reader = FastaReader::new(rdr);
 
                 // Thread-local adjacency tracking (with_capacity needs further optimisation)
                 let mut local_adj: FastHashMap<u64, u32> = FastHashMap::with_capacity_and_hasher(
                     1_000_000,
-                    BuildHasherDefault::<FxHasher>::default()
+                    BuildHasherDefault::<FxHasher>::default(),
                 );
 
-                // Single pass: build adjacency masks
-                stream_kmers(
-                    reader,
-                    k,
-                    sym_bits,
-                    k_mask,
-                    k1_mask,
-                    sym_mask,
-                    |u, sym, _v| {
-                        let bit = 1u32 << sym;
-                        *local_adj.entry(u).or_insert(0) |= bit;
-                    },
-                    recode_scheme,
-                )?;
+                let mut passed = 0usize;
+                let mut filtered = 0usize;
+
+                while let Some(rec) = reader.next() {
+                    let rec = rec?;
+                    let seq = rec.seq();
+
+                    if !protein_passes_counts(
+                        seq,
+                        k1,
+                        sym_bits,
+                        k1_mask,
+                        recode_scheme,
+                        min_needed_cms,
+                        |kmer| cms.estimate(kmer),
+                    ) {
+                        filtered += 1;
+                        continue;
+                    }
+
+                    passed += 1;
+                    stream_recoded_edges(
+                        seq,
+                        k1,
+                        sym_bits,
+                        k1_mask,
+                        recode_scheme,
+                        |u, sym, _v| {
+                            let bit = 1u32 << sym;
+                            *local_adj.entry(u).or_insert(0) |= bit;
+                        },
+                    );
+                }
 
                 let mut kept = 0usize;
                 let mut dropped = 0usize;
 
                 // Pre-allocate based on expected filtering
-                let estimated = local_adj.len();  // 95%+ pass rate
+                let estimated = local_adj.len(); // 95%+ pass rate
                 let mut adj_updates: Vec<(u64, u32)> = Vec::with_capacity(estimated);
                 let mut node_updates: Vec<u64> = Vec::with_capacity(estimated * 2);
 
@@ -340,18 +346,24 @@ pub fn build_graph_from_inputs(
                 // Drop local_adj early to free memory
                 drop(local_adj);
 
+                let proteins_total = passed + filtered;
+                let kmers_total = kept + dropped;
                 eprintln!(
-                    "[{}] kept={} dropped={}",
-                    input.path.file_name().and_then(|x| x.to_str()).unwrap_or("?"),
+                    "[{}] proteins={}/{} kmers={}/{}",
+                    input
+                        .path
+                        .file_name()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or("?"),
+                    passed,
+                    proteins_total,
                     kept,
-                    dropped
+                    kmers_total
                 );
 
                 // Batch merge adjacency
                 for (node, mask) in adj_updates {
-                    adj.entry(node)
-                        .and_modify(|m| *m |= mask)
-                        .or_insert(mask);
+                    adj.entry(node).and_modify(|m| *m |= mask).or_insert(mask);
                 }
 
                 // Sort and dedup nodes
@@ -360,7 +372,8 @@ pub fn build_graph_from_inputs(
 
                 // Batch update samples
                 for node in node_updates {
-                    samples.entry(node)
+                    samples
+                        .entry(node)
                         .and_modify(|species_set| {
                             if let Err(pos) = species_set.binary_search(&sid) {
                                 species_set.insert(pos, sid);
