@@ -42,12 +42,12 @@
 //! frequency (-f). If the final alignment is too short, you may want to modify some
 //! of these three parameters.
 //!
-//! Increasing the k-mer size may yield longer alignments, but only up to a point: bubble start and 
-//! end k-mers shared by most samples become less frequent, resulting in fewer variant groups and a 
+//! Increasing the k-mer size may yield longer alignments, but only up to a point: bubble start and
+//! end k-mers shared by most samples become less frequent, resulting in fewer variant groups and a
 //! shorter final alignment.
 //!
 //! Increasing the depth of the recursive graph traversal (e.g., from 6 to 8) can also increase the size
-//! of the final alignment as kamino detects more variant groups during the graph traversal. 
+//! of the final alignment as kamino detects more variant groups during the graph traversal.
 //!
 //! Finally, it is also possible to produce larger alignments by decreasing the minimum fraction of samples
 //! with an amino-acid (e.g., from 0.85 to 0.8), although samples will have more missing data in the final alignment.
@@ -98,6 +98,7 @@ mod graph;
 mod io;
 mod output;
 mod phylo;
+mod proba_filter;
 mod recode;
 mod revert_aminoacid;
 mod traverse;
@@ -123,7 +124,7 @@ fn run_traverse(
 ) -> anyhow::Result<TraversalArtifacts> {
     // Build global graph
     let mut g = graph::Graph::new(k, recode_scheme);
-    io::build_graph_from_inputs(species_inputs, k, &mut g, num_threads)?;
+    io::build_graph_from_inputs(species_inputs, k, min_freq, &mut g, num_threads)?;
 
     // Basic stats
     io::print_graph_size(&g);
@@ -138,14 +139,8 @@ fn run_traverse(
     );
 
     // Traverse VGs
-    let groups = traverse::find_variant_groups(
-        &g,
-        &start_kmers,
-        &end_kmers,
-        depth,
-        min_freq,
-        num_threads,
-    );
+    let groups =
+        traverse::find_variant_groups(&g, &start_kmers, &end_kmers, depth, min_freq, num_threads);
     let total_paths: usize = groups.values().map(|v| v.len()).sum();
     eprintln!(
         "variant groups: groups={} paths={}",
@@ -211,7 +206,12 @@ pub struct Args {
     pub length_middle: Option<usize>,
 
     /// Mask middle segments with long mismatch runs [m=5]
-    #[arg(short = 'm', long = "mask", default_value_t = 5, hide_default_value = true)]
+    #[arg(
+        short = 'm',
+        long = "mask",
+        default_value_t = 5,
+        hide_default_value = true
+    )]
     pub mask: usize,
 
     /// Number of threads [t=1]
@@ -328,13 +328,13 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         num_threads,
         args.nj,
     )?;
-    
+
     let (fas_path, tsv_path, partitions_path, tree_path) = output::output_paths(&args.output);
     eprintln!(
         "alignment: length={} missing={:.1}%",
         alignment_len, alignment_missing_pct
     );
-    
+
     if args.nj {
         eprintln!(
             "output files:  {}, {}, {}, and {}",
