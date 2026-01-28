@@ -11,9 +11,9 @@
 use crate::recode::{recode_byte, RecodeScheme};
 use std::sync::atomic::{AtomicU16, Ordering};
 
-pub const BLOOM_BITS: usize = 1 << 23; // 1,048,576 bits (~128 KiB) per proteome
+pub const BLOOM_BITS: usize = 1 << 23;
 pub const BLOOM_HASHES: usize = 2;
-pub const CMS_WIDTH: usize = 1 << 24; // 524,288 counters (~1 MiB per row)
+pub const CMS_WIDTH: usize = 1 << 24;
 pub const CMS_DEPTH: usize = 4;
 pub const MIN_GOOD_KMERS: u32 = 2;
 
