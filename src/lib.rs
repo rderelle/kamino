@@ -1,6 +1,6 @@
-//! # Kamino
+//! # kamino
 //!
-//! Kamino builds an amino-acid alignment in a reference-free, alignment-free manner from
+//! kamino builds an amino-acid alignment in a reference-free, alignment-free manner from
 //! a set of proteomes. It is not “better” than traditional marker-based pipelines, but it is
 //! simpler and faster to use.
 //!
@@ -8,7 +8,7 @@
 //! archaea, and eukaryotes).
 //!
 //! ## Input modes
-//! Kamino accepts proteome files as input in one of two modes:
+//! kamino accepts proteome files as input in one of two modes:
 //! - **Directory mode** (`--input-directory`): a directory containing FASTA proteomes
 //!   (plain text or `.gz` compressed). Each file represents one isolate. Filenames minus the
 //!   extension become sequence names in the final amino-acid alignment.
@@ -39,19 +39,20 @@
 //! ## Important things to optimize
 //! The main parameters governing the number of phylogenetic positions in the final alignment are
 //! the k-mer size (-k), the depth of the recursive graph traversal (-d), and the minimum sample
-//! frequency (-f). If the final alignment is too short, you may want to modify some
-//! of these three parameters.
+//! frequency (-f).
 //!
-//! Increasing the k-mer size may yield longer alignments, but only up to a point: bubble start and
-//! end k-mers shared by most samples become less frequent, resulting in fewer variant groups and a
-//! shorter final alignment.
+//! The default k-mer size has already been chosen to maximise the final alignment length, and
+//! increasing it usually does not substantially increase the number of variant groups. It may,
+//! however, be useful to decrease the k-mer size from 14 to 13 if memory consumption is too high.
 //!
-//! Increasing the depth of the recursive graph traversal (e.g., from 6 to 8) can also increase the size
-//! of the final alignment as kamino detects more variant groups during the graph traversal.
+//! Increasing the depth of the recursive graph traversal (e.g. from 6 to 8) generally increases
+//! the size of the final alignment, as kamino detects more variant groups during graph traversal.
+//! This is typically the most effective approach if the alignment is deemed too short.
 //!
-//! Finally, it is also possible to produce larger alignments by decreasing the minimum fraction of samples
-//! with an amino-acid (e.g., from 0.85 to 0.8), although samples will have more missing data in the final alignment.
-//! Missing data in the alignment are represented by '-' (missing amino acid) and 'X' (ambiguous or masked amino acid).
+//! Finally, larger alignments can also be produced by decreasing the minimum fraction of samples
+//! required to carry an amino acid (e.g. from 0.85 to 0.8), at the cost of increased missing data
+//! in the final alignment. Missing data are represented by '-' (missing amino acid) and 'X'
+//! (ambiguous or masked amino acid).
 //!
 //!
 //! ## Less important parameters
