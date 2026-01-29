@@ -56,16 +56,15 @@ kamino -I <tabular_file> -t 4
 
 ## examples
 
-All analyses were performed on a MacBook "M4 Pro" using v0.4.0 and 4 threads (other parameters set to default unless specified):  
+All analyses were performed on a MacBook *M4 Pro* using v0.6.0 and 4 threads (other parameters set to default):  
 
 | dataset                     | taxonomic diversity  | runtime (min) | memory (GB) | alignment size (aa) |
 |-----------------------------|----------------------|---------------|-------------|---------------------|
-| 50 *Mycobacterium*          | within-genera        | 0.1           | 2           | 19,283              |
-| 400 *Mycobacterium*         | within-genera        | 0.9           | 8           | 13,753              |
-| 50 Polyporales (fungi)      | within-order         | 0.5           | 8           | 21,808              |
-| 46 *Drosophila*             | within-genera        | 0.7           | 7           | 194,021             |
-| 55 Mammalia                 | within-class         | 1.6           | 14          | 291,437             |  
-| 55 Mammalia  `-k 13`        | within-class         | 1.9           | 8           | 191,962             |
+| 50 *Mycobacterium*          | within-genera        | 0.1           | 1           | 24,678              |
+| 400 *Mycobacterium*         | within-genera        | 0.7           | 3           | 19,485              |
+| 50 Polyporales (fungi)      | within-order         | 0.4           | 4           | 28,373              |
+| 46 *Drosophila*             | within-genera        | 0.7           | 5           | 223,600             |
+| 55 Mammalia                 | within-class         | 1.7           | 8           | 333,410             |  
 
 ---
 
