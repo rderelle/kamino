@@ -209,6 +209,7 @@ pub fn build_graph_from_inputs(
     inputs: &[SpeciesInput],
     k: usize,
     min_freq: f32,
+    length_middle: usize,
     main: &mut Graph,
     num_threads: usize,
 ) -> Result<()> {
@@ -293,6 +294,7 @@ pub fn build_graph_from_inputs(
                         k1_mask,
                         recode_scheme,
                         min_needed_cms,
+                        length_middle,
                         |kmer| cms.estimate(kmer),
                     ) {
                         filtered += 1;

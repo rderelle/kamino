@@ -120,12 +120,13 @@ fn run_traverse(
     k: usize,
     min_freq: f32,
     depth: usize,
+    length_middle: usize,
     num_threads: usize,
     recode_scheme: RecodeScheme,
 ) -> anyhow::Result<TraversalArtifacts> {
     // Build global graph
     let mut g = graph::Graph::new(k, recode_scheme);
-    io::build_graph_from_inputs(species_inputs, k, min_freq, &mut g, num_threads)?;
+    io::build_graph_from_inputs(species_inputs, k, min_freq, length_middle, &mut g, num_threads)?;
 
     // Basic stats
     io::print_graph_size(&g);
@@ -310,6 +311,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         k,
         min_freq,
         args.depth,
+        length_middle,
         num_threads,
         args.recode,
     )?;
