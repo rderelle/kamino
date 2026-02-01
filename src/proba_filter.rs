@@ -225,6 +225,7 @@ pub fn stream_recoded_edges(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn protein_passes_counts(
     seq: &[u8],
     k: usize,
@@ -232,11 +233,12 @@ pub fn protein_passes_counts(
     k_mask: u64,
     scheme: RecodeScheme,
     min_needed: u32,
+    length_middle: usize,
     mut count: impl FnMut(u64) -> u32,
 ) -> bool {
     let mut roll: u64 = 0;
     let mut have: usize = 0;
-    let mut last_hit_start: usize = usize::MAX;
+    let mut last_hit_start: Option<usize> = None;
     let mut good_hits = 0u32;
     for (idx, &b) in seq.iter().enumerate() {
         let a = recode_byte(b, scheme);
@@ -251,12 +253,22 @@ pub fn protein_passes_counts(
         }
         if have == k && count(roll) >= min_needed {
             let start = idx + 1 - k;
-            if last_hit_start == usize::MAX || start >= last_hit_start + k {
-                good_hits += 1;
-                last_hit_start = start;
-                if good_hits >= MIN_GOOD_KMERS {
-                    return true;
+            if let Some(prev_start) = last_hit_start {
+                if start >= prev_start + k {
+                    let gap = start - (prev_start + k);
+                    if gap <= length_middle {
+                        good_hits += 1;
+                        if good_hits >= MIN_GOOD_KMERS {
+                            return true;
+                        }
+                    } else {
+                        good_hits = 1;
+                    }
+                    last_hit_start = Some(start);
                 }
+            } else {
+                good_hits = 1;
+                last_hit_start = Some(start);
             }
         }
     }
