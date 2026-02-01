@@ -225,6 +225,7 @@ pub fn stream_recoded_edges(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn protein_passes_counts(
     seq: &[u8],
     k: usize,
