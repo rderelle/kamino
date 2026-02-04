@@ -72,8 +72,7 @@ All analyses were performed on a MacBook *M4 Pro* using v0.6.1 and 4 threads (ot
 
 - **When not to use kamino?**
     * low diversity datasets (ie, within-species), for which genome-based approaches will be more powerful 
-    * very large datasets (eg, thousands of bacterial proteomes or hundreds of vertebrate proteomes)
-    * very divergent datasets (eg, animal kingdom)
+    * highly divergent datasets (eg, animal kingdom)
     * distant outgroup composed of a few isolates: these might have disproportionately more missing data
     * list to be completed ...
 
