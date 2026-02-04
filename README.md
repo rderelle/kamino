@@ -79,7 +79,7 @@ All analyses were performed on a MacBook *M4 Pro* using v0.6.1 and 4 threads (ot
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
 
 - **How to get more phylogenetic positions?**
-<p>Increase the maximum depth of the graph traversal (-d) or lower the minimum proportion of isolates with amino acid per position (-m) if that is acceptable for downstream analyses.</p>
+<p>Increase the maximum depth of the graph traversal (-d) or lower the minimum proportion of isolates with amino acid per position (-f) if that is acceptable for downstream analyses.</p>
 
  
 
