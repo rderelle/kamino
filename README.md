@@ -56,15 +56,15 @@ kamino -I <tabular_file> -t 4
 
 ## examples
 
-All analyses were performed on a MacBook *M4 Pro* using v0.6.0 and 4 threads (other parameters set to default):  
+All analyses were performed on a MacBook *M4 Pro* using v0.6.1 and 4 threads (other parameters set to default):  
 
 | dataset                     | taxonomic diversity  | runtime (min) | memory (GB) | alignment size (aa) |
 |-----------------------------|----------------------|---------------|-------------|---------------------|
-| 50 *Mycobacterium*          | within-genera        | 0.1           | 1           | 24,678              |
-| 400 *Mycobacterium*         | within-genera        | 0.7           | 3           | 19,485              |
-| 50 Polyporales (fungi)      | within-order         | 0.4           | 4           | 28,373              |
-| 46 *Drosophila*             | within-genera        | 0.7           | 5           | 223,600             |
-| 55 Mammalia                 | within-class         | 1.7           | 8           | 333,410             |  
+| 50 *Mycobacterium*          | within-genera        | 0.1           | 0.7         | 24,678              |
+| 400 *Mycobacterium*         | within-genera        | 0.5           | 2.5         | 21,011              |
+| 50 Polyporales (fungi)      | within-order         | 0.3           | 3.8         | 29,483              |
+| 165 Arthropoda              | within-phylum        | 1.1           | 8.5         | 13,002              |
+| 55 Mammalia                 | within-class         | 1.6           | 8.1         | 334,108             |  
 
 ---
 
@@ -81,7 +81,7 @@ All analyses were performed on a MacBook *M4 Pro* using v0.6.0 and 4 threads (ot
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
 
 - **How to get more phylogenetic positions?**
-<p>Iincrease the maximum depth of the graph traversal (-d) or lower the minimum proportion of isolates with amino acid per position (-m) if that is acceptable for downstream analyses.</p>
+<p>Increase the maximum depth of the graph traversal (-d) or lower the minimum proportion of isolates with amino acid per position (-m) if that is acceptable for downstream analyses.</p>
 
  
 
