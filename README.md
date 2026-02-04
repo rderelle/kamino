@@ -74,7 +74,6 @@ All analyses were performed on a MacBook *M4 Pro* using v0.6.1 and 4 threads (ot
     * low diversity datasets (ie, within-species), for which genome-based approaches will be more powerful 
     * highly divergent datasets (eg, animal kingdom)
     * distant outgroup composed of a few isolates: these might have disproportionately more missing data
-    * list to be completed ...
 
 - **Is the output reproducible?**
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
