@@ -22,7 +22,7 @@
 //!   selected recoding scheme).
 //! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position
 //!   (default: 0.85; must be ≥ 0.6).
-//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 6).
+//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 8).
 //! - `-o`, `--output`: output prefix for generated files (default: `kamino`).
 //! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers
 //!   (default: 3; must be ≤ k-1).
@@ -45,7 +45,7 @@
 //! increasing it usually does not substantially increase the number of variant groups. It may,
 //! however, be useful to decrease the k-mer size from 14 to 13 if memory consumption is too high.
 //!
-//! Increasing the depth of the recursive graph traversal (e.g. from 6 to 8) generally increases
+//! Increasing the depth of the recursive graph traversal (e.g. from 8 to 10) generally increases
 //! the size of the final alignment, as kamino detects more variant groups during graph traversal.
 //! This is typically the most effective approach if the alignment is deemed too short.
 //!
@@ -68,8 +68,8 @@
 //! less frequently, errors made by kamino (“misaligned” paths due to the presence of two consecutive indels). The minimum length
 //! of polymorphism runs to be masked can be decreased using this parameter to be more stringent.
 //!
-//! The `--length-middle` parameter is used to filter out long variant groups. Increase this parameter to allow more
-//! variant groups to be retained in the final alignment. Please note that this parameter might be removed in future versions.
+//! The `--length-middle` parameter is used to filter out long variant groups. Increase this parameter to allow longer
+//! variant groups to be retained in the final alignment.
 //!
 //! Finally, the 6-letter recoding scheme can be modified using the --recode parameter, although the default sr6 recoding
 //! scheme performed the best in most of my tests (sr6 ≥ dayhoff6 ≫ kgb6).
@@ -126,7 +126,14 @@ fn run_traverse(
 ) -> anyhow::Result<TraversalArtifacts> {
     // Build global graph
     let mut g = graph::Graph::new(k, recode_scheme);
-    io::build_graph_from_inputs(species_inputs, k, min_freq, length_middle, &mut g, num_threads)?;
+    io::build_graph_from_inputs(
+        species_inputs,
+        k,
+        min_freq,
+        length_middle,
+        &mut g,
+        num_threads,
+    )?;
 
     // Basic stats
     io::print_graph_size(&g);
@@ -141,8 +148,15 @@ fn run_traverse(
     );
 
     // Traverse VGs
-    let groups =
-        traverse::find_variant_groups(&g, &start_kmers, &end_kmers, depth, min_freq, num_threads);
+    let groups = traverse::find_variant_groups(
+        &g,
+        &start_kmers,
+        &end_kmers,
+        depth,
+        min_freq,
+        length_middle,
+        num_threads,
+    );
     let total_paths: usize = groups.values().map(|v| v.len()).sum();
     eprintln!(
         "variant groups: groups={} paths={}",
@@ -192,7 +206,7 @@ pub struct Args {
     pub min_freq: f32,
 
     /// Maximum traversal depth from each start node [d=6]
-    #[arg(short, long, default_value_t = 6, hide_default_value = true)]
+    #[arg(short, long, default_value_t = 8, hide_default_value = true)]
     pub depth: usize,
 
     /// Output prefix [o=kamino]
@@ -326,7 +340,6 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         k,
         constant,
         min_freq,
-        length_middle,
         args.mask,
         num_threads,
         args.nj,
