@@ -11,14 +11,11 @@ use crate::traverse::VariantGroups;
 /// * `partitions` records the start/end indices for each variant group block.
 /// * `dropped_blocks_due_to_middle_filter` counts blocks discarded by the
 ///   uniqueness/missing filter on middle positions.
-/// * `dropped_blocks_due_to_length` counts blocks that were too long once the
-///   middle segment limit was applied.
 pub struct VariantGroupAlignment {
     pub concat: Vec<Vec<u8>>,
     pub partitions: Vec<(usize, usize, usize)>,
     pub partition_names: Vec<String>,
     pub dropped_blocks_due_to_middle_filter: usize,
-    pub dropped_blocks_due_to_length: usize,
 }
 
 pub(crate) struct GroupKeptMatrix {
@@ -32,7 +29,6 @@ pub(crate) enum FilterOutcome {
         filtered_len: usize,
     },
     DroppedMiddle,
-    DroppedLength,
     Skipped,
 }
 
@@ -113,7 +109,6 @@ fn filter_group_kept(
     matrix: &mut GroupKeptMatrix,
     layout: &GroupLayout,
     bubble_ratio: f32,
-    max_middle_len: usize,
     mask_m: usize,
     n: usize,
 ) -> FilterOutcome {
@@ -188,10 +183,6 @@ fn filter_group_kept(
         return FilterOutcome::DroppedMiddle;
     }
 
-    if keep_middle_cols.len() > max_middle_len {
-        return FilterOutcome::DroppedLength;
-    }
-
     let block_len_filtered = keep_middle_cols.len() + keep_tail_cols.len();
     debug_assert!(block_len_filtered > 0);
 
@@ -223,7 +214,6 @@ pub(crate) fn build_concatenated_alignment_streaming(
     groups: &VariantGroups,
     layouts: &[GroupLayout],
     bubble_ratio: f32,
-    max_middle_len: usize,
     mask_m: usize,
     scan_k: usize,
     num_threads: usize,
@@ -238,7 +228,6 @@ pub(crate) fn build_concatenated_alignment_streaming(
     let mut current_pos: usize = 0;
 
     let mut dropped_blocks_due_to_middle_filter = 0usize;
-    let mut dropped_blocks_due_to_length = 0usize;
 
     if inputs.len() != species.len() {
         bail!(
@@ -363,7 +352,7 @@ pub(crate) fn build_concatenated_alignment_streaming(
     let word_list = word_interner.words;
 
     for (gidx, (layout, matrix)) in layouts.iter().zip(matrices.iter_mut()).enumerate() {
-        match filter_group_kept(matrix, layout, bubble_ratio, max_middle_len, mask_m, n) {
+        match filter_group_kept(matrix, layout, bubble_ratio, mask_m, n) {
             FilterOutcome::Kept {
                 filtered_rows,
                 filtered_len,
@@ -383,9 +372,6 @@ pub(crate) fn build_concatenated_alignment_streaming(
             FilterOutcome::DroppedMiddle => {
                 dropped_blocks_due_to_middle_filter += 1;
             }
-            FilterOutcome::DroppedLength => {
-                dropped_blocks_due_to_length += 1;
-            }
             FilterOutcome::Skipped => {}
         }
     }
@@ -395,7 +381,6 @@ pub(crate) fn build_concatenated_alignment_streaming(
         partitions,
         partition_names,
         dropped_blocks_due_to_middle_filter,
-        dropped_blocks_due_to_length,
     })
 }
 

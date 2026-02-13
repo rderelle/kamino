@@ -19,13 +19,22 @@ pub type VariantGroups = HashMap<(u64, u64), Vec<PathRec>, RandomState>;
 type ScoredGroup = (((u64, u64), Vec<PathRec>), usize, usize);
 
 /// Public entry point expected by main.rs:
-/// find_variant_groups(&g, &start_kmers, &end_kmers, max_depth, bubble_ratio, num_threads)
+/// find_variant_groups(
+///     &g,
+///     &start_kmers,
+///     &end_kmers,
+///     max_depth,
+///     bubble_ratio,
+///     length_middle,
+///     num_threads,
+/// )
 pub fn find_variant_groups(
     g: &Graph,
     start_kmers: &HashSet<u64>,
     end_kmers: &HashSet<u64>,
     max_depth: usize,
     bubble_ratio: f32,
+    length_middle: usize,
     num_threads: usize,
 ) -> VariantGroups {
     // Infer number of species from node bitvectors
@@ -48,6 +57,7 @@ pub fn find_variant_groups(
         max_depth,
         mask_k1,
         min_path_edges,
+        length_middle,
         num_threads,
         n_species,
     )
@@ -62,6 +72,7 @@ fn collect_variant_groups(
     max_depth: usize,
     mask_k1: u64,
     min_path_edges: usize,
+    length_middle: usize,
     num_threads: usize,
     n_species: usize,
 ) -> VariantGroups {
@@ -101,7 +112,7 @@ fn collect_variant_groups(
                 for key in keys {
                     if let Some(paths) = per_start.remove(&key) {
                         if let Some((k, v)) =
-                            filter_one_group_3steps(g, key, paths, need, n_species)
+                            filter_one_group_3steps(g, key, paths, need, n_species, length_middle)
                         {
                             kept_local.insert(k, v);
                         }
@@ -310,6 +321,7 @@ fn filter_one_group_3steps(
     paths: Vec<PathRec>,
     need: usize,
     n_species: usize,
+    length_middle: usize,
 ) -> Option<((u64, u64), Vec<PathRec>)> {
     // (i) Choose path length by union species across paths of that length
     let mut unions_by_len: HashMap<usize, BitVec<u32, Lsb0>> = HashMap::new();
@@ -341,6 +353,13 @@ fn filter_one_group_3steps(
         return None; // ambiguous best length
     }
     let keep_len = items[0].0;
+
+    let max_allowed_len = 2usize
+        .saturating_mul(g.k.saturating_sub(1))
+        .saturating_add(length_middle);
+    if keep_len > max_allowed_len {
+        return None;
+    }
 
     // Keep only paths of the chosen length
     let kept_paths: Vec<PathRec> = paths

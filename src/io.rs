@@ -352,11 +352,7 @@ pub fn build_graph_from_inputs(
                 let kmers_total = kept + dropped;
                 eprintln!(
                     "[{}] proteins={}/{} kmers={}/{}",
-                    input
-                        .path
-                        .file_name()
-                        .and_then(|x| x.to_str())
-                        .unwrap_or("?"),
+                    input.name,
                     passed,
                     proteins_total,
                     kept,

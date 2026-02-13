@@ -43,11 +43,11 @@ pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     (fas, tsv, partitions, tree)
 }
 
-/// Write FASTA and TSV outputs while trimming the head and middle segments.
+/// Write FASTA and TSV outputs while trimming the head segment.
 ///
-/// The function orchestrates variant-group alignment building, applies user
-/// limits on leading positions and middle length, and emits the three output
-/// files alongside summary stats.
+/// The function orchestrates variant-group alignment building, applies
+/// leading-position and middle-column quality filters, and emits the three
+/// output files alongside summary stats.
 #[allow(clippy::too_many_arguments)]
 pub fn write_outputs_with_head(
     inputs: &[SpeciesInput],
@@ -59,7 +59,6 @@ pub fn write_outputs_with_head(
     k: usize,
     head_max: usize,   // user-defined n; must be ≤ k-1
     bubble_ratio: f32, // proportion of species present required to keep a column
-    max_middle_len: usize,
     mask_m: usize,
     num_threads: usize,
     generate_nj: bool,
@@ -74,19 +73,17 @@ pub fn write_outputs_with_head(
         groups,
         &layouts,
         bubble_ratio,
-        max_middle_len,
         mask_m,
         scan_k,
         num_threads,
     )?;
 
     let (fas_path, tsv_path, partitions_path, tree_path) = output_paths(out_base);
-    let (concat, partitions, partition_names, dropped_middle, dropped_length) = (
+    let (concat, partitions, partition_names, dropped_middle) = (
         alignment.concat,
         alignment.partitions,
         alignment.partition_names,
         alignment.dropped_blocks_due_to_middle_filter,
-        alignment.dropped_blocks_due_to_length,
     );
 
     // FASTA
@@ -148,10 +145,6 @@ pub fn write_outputs_with_head(
     eprintln!(
         "dropped due to unique/missing middle filtering: {}",
         dropped_middle
-    );
-    eprintln!(
-        "dropped due to exceeding middle length limit: {}",
-        dropped_length
     );
 
     // NJ tree
