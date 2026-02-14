@@ -16,7 +16,7 @@ From the Spanish word for *path*.
 Builds an amino-acid alignment in a reference-free, alignment-free manner from a set of proteomes.  
 Not ‘better’ than traditional marker-based pipelines, but simpler and faster to run.  
   
-Typical usages range from between-species to within-phylum phylogenetic analyses (bacteria, archaea and eukaryotes).
+Typical usages range from between-species to within-family (bacteria and archaea) or within-phylum (eukaryotes) phylum phylogenetic analyses.
 
 <br>
 
