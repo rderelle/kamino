@@ -11,7 +11,7 @@
 
 <br><br>
 
-From the Spanish word for *path*.  
+From the Spanish word for *path* (not a Star Wars planet!).  
 
 Builds an amino-acid alignment in a reference-free, alignment-free manner from a set of proteomes.  
 Not ‘better’ than traditional marker-based pipelines, but simpler and faster to run.  
