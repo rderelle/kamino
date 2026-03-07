@@ -175,6 +175,9 @@ pub fn stream_recoded_kmers(
     let mut roll: u64 = 0;
     let mut have: usize = 0;
     for &b in seq {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
         let a = recode_byte(b, scheme);
         if a == 255 {
             roll = 0;
@@ -204,6 +207,9 @@ pub fn stream_recoded_edges(
     let mut have: usize = 0;
     let mut prev: Option<u64> = None;
     for &b in seq {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
         let a = recode_byte(b, scheme);
         if a == 255 {
             roll = 0;
@@ -238,9 +244,14 @@ pub fn protein_passes_counts(
 ) -> bool {
     let mut roll: u64 = 0;
     let mut have: usize = 0;
+    let mut pos: usize = 0;
     let mut last_hit_start: Option<usize> = None;
     let mut good_hits = 0u32;
-    for (idx, &b) in seq.iter().enumerate() {
+    for &b in seq {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        pos += 1;
         let a = recode_byte(b, scheme);
         if a == 255 {
             roll = 0;
@@ -252,7 +263,7 @@ pub fn protein_passes_counts(
             have += 1;
         }
         if have == k && count(roll) >= min_needed {
-            let start = idx + 1 - k;
+            let start = pos - k;
             if let Some(prev_start) = last_hit_start {
                 if start >= prev_start + k {
                     let gap = start - (prev_start + k);
