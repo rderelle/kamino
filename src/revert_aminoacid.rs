@@ -256,6 +256,9 @@ pub(crate) fn build_species_kmer_map(
         let mut head: usize = 0;
 
         for &b in seq {
+            if b.is_ascii_whitespace() {
+                continue;
+            }
             let aa = b.to_ascii_uppercase();
             let code = recode_byte(aa, recode_scheme);
 
