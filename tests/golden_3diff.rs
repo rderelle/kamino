@@ -33,6 +33,7 @@ fn golden_3diff() {
     let args = Args {
         input: Some(input_abs),
         input_file: None,
+        genomes: false,
         k: None,
         min_freq: 0.85,
         depth: 4,
