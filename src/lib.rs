@@ -16,8 +16,16 @@
 //!   to a proteome path (one name + path pair per line). This is useful when file names
 //!   do not encode the sample name or when proteomes are located in multiple directories.
 //!
+//! In the directory mode, files are recognized by their extension (.fas, .fasta, .faa, .fa, .fna; gzipped ot not).
+//!
+//! For **bacterial** isolates, the phylogenomic alignment can also be generated directly from genome assemblies 
+//! by selecting the option `--genomes` (using either `-i` or `-I`). In this case, an ultra-fast but approximate 
+//! protein prediction is performed, and the predicted proteomes are written to a temporary directory.
 //!
 //! ## Arguments
+//! - `-i`, --input-directory <INPUT>: input directory with FASTA proteomes (plain or .gz)
+//! - `-I`, --input-file <INPUT_FILE>: tab-delimited file mapping species name to proteome path
+//! - `--genomes`: treat input files as bacterial genomes and predict proteomes before analysis
 //! - `-k`, `--k`: k-mer length (default: 14; must be within the valid range for the
 //!   selected recoding scheme).
 //! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position
@@ -195,7 +203,7 @@ pub struct Args {
     #[arg(short = 'I', long = "input-file")]
     pub input_file: Option<std::path::PathBuf>,
 
-    /// Treat input files as genome FASTA and predict proteomes before analysis
+    /// Treat input files as bacterial genomes and predict proteomes before analysis
     #[arg(long = "genomes", default_value_t = false, hide_default_value = true)]
     pub genomes: bool,
 
