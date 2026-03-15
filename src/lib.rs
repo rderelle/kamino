@@ -91,6 +91,7 @@
 //! correction with LG stationary amino-acid frequencies. The resulting tree provides an
 //! overview of isolate relationships and is not intended for detailed phylogenetic inference.
 //!
+use anyhow::Context;
 use clap::{ArgAction, Parser};
 
 mod bubbles;
@@ -100,6 +101,7 @@ mod io;
 mod output;
 mod phylo;
 mod proba_filter;
+mod protein_prediction;
 mod recode;
 mod revert_aminoacid;
 mod traverse;
@@ -181,6 +183,7 @@ fn run_traverse(
 #[command(
     group = clap::ArgGroup::new("input_source")
         .required(true)
+        .multiple(true)
         .args(["input", "input_file"])
 )]
 pub struct Args {
@@ -191,6 +194,10 @@ pub struct Args {
     /// Tab-delimited file mapping species name to proteome path
     #[arg(short = 'I', long = "input-file")]
     pub input_file: Option<std::path::PathBuf>,
+
+    /// Treat input files as genome FASTA and predict proteomes before analysis
+    #[arg(long = "genomes", default_value_t = false, hide_default_value = true)]
+    pub genomes: bool,
 
     /// K-mer length [k=14]
     #[arg(short, long)]
@@ -292,19 +299,27 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     anyhow::ensure!(num_threads >= 1, "threads must be ≥ 1");
 
     eprintln!("kamino v{}", env!("CARGO_PKG_VERSION"));
-    let (input_label, species_inputs) = if let Some(table) = args.input_file.as_ref() {
-        (
-            format!("input_file={}", table.display()),
-            io::collect_species_inputs_from_table(table)?,
-        )
-    } else if let Some(dir) = args.input.as_ref() {
-        (
-            format!("input={}", dir.display()),
-            io::collect_species_inputs_from_dir(dir)?,
-        )
-    } else {
-        anyhow::bail!("Either --input-directory or --input-file must be provided.");
-    };
+    let mut species_inputs = Vec::new();
+    let mut input_labels: Vec<String> = Vec::new();
+
+    if let Some(table) = args.input_file.as_ref() {
+        input_labels.push(format!("input_file={}", table.display()));
+        species_inputs.extend(io::collect_species_inputs_from_table(table)?);
+    }
+
+    if let Some(dir) = args.input.as_ref() {
+        input_labels.push(format!("input={}", dir.display()));
+        species_inputs.extend(io::collect_species_inputs_from_dir(dir)?);
+    }
+
+    let output_dir = args
+        .output
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut genomes_tmpdir = None;
+
+    let input_label = input_labels.join(" ");
 
     eprintln!(
         "parameters: k={} constant={} min_freq={} depth={} length_middle={} mask={} threads={} recode={} {} output={}",
@@ -318,6 +333,32 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         args.recode,
         input_label,
         args.output.display()
+    );
+
+    if args.genomes {
+        eprintln!("genome files: {}", species_inputs.len());
+
+        let tmpdir = tempfile::Builder::new()
+            .prefix("tmp_kamino_")
+            .rand_bytes(6)
+            .tempdir_in(&output_dir)
+            .with_context(|| {
+                format!(
+                    "create temporary directory for predicted proteomes in {}",
+                    output_dir.display()
+                )
+            })?;
+
+        let predicted =
+            protein_prediction::predict_proteomes(&species_inputs, tmpdir.path(), num_threads)?;
+        species_inputs = predicted;
+        input_labels.push("genomes=true".to_string());
+        genomes_tmpdir = Some(tmpdir);
+    }
+
+    anyhow::ensure!(
+        !species_inputs.is_empty(),
+        "At least one input source with files must be provided."
     );
 
     let traversal = run_traverse(
@@ -367,6 +408,8 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
             partitions_path.display()
         );
     }
+
+    drop(genomes_tmpdir);
 
     Ok(())
 }

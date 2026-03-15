@@ -34,12 +34,12 @@ pub fn collect_fasta_files(input_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
             if let Some(stem) = p.file_stem() {
                 let stem_path = Path::new(stem);
                 let inner = stem_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                matches_ignore_ascii(inner, &["fa", "fas", "fasta", "faa"])
+                matches_ignore_ascii(inner, &["fa", "fas", "fasta", "faa", "fna"])
             } else {
                 false
             }
         } else {
-            matches_ignore_ascii(ext, &["fa", "fas", "fasta", "faa"])
+            matches_ignore_ascii(ext, &["fa", "fas", "fasta", "faa", "fna"])
         }
     }
 
@@ -352,11 +352,7 @@ pub fn build_graph_from_inputs(
                 let kmers_total = kept + dropped;
                 eprintln!(
                     "[{}] proteins={}/{} kmers={}/{}",
-                    input.name,
-                    passed,
-                    proteins_total,
-                    kept,
-                    kmers_total
+                    input.name, passed, proteins_total, kept, kmers_total
                 );
 
                 // Batch merge adjacency
