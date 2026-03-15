@@ -51,7 +51,7 @@ A basic run using four threads can be performed with either of the following com
 kamino -i <input_dir> -t 4
 kamino -I <tabular_file> -t 4
 ```
-In the directory mode, files are recognized by their extension (.fas, .fasta, .faa, .fa, .fna; gzpied ot not).
+In the directory mode, files are recognized by their extension (.fas, .fasta, .faa, .fa, .fna; gzipped ot not).
 
 For **bacterial** isolates, the phylogenomic alignment can also be generated directly from genome assemblies by selecting the option `--genomes` (using either `-i` or `-I`). In this case, an ultra-fast but approximate protein prediction is performed, and the predicted proteomes are written to a temporary directory.
 
