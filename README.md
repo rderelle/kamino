@@ -44,12 +44,24 @@ conda install bioconda::kamino
 ---
 
 ## running kamino
-Input consists of proteome files in FASTA format (gzipped or not), with one file per sample. Files can be placed in a single directory (specified with the -i argument), or their paths can be provided in a tab-delimited file using -I.
+Input consists of proteome files in FASTA format (gzipped or not), with one file per sample. Files can be placed in a single directory (specified with the `-i` argument), or their paths can be provided in a tab-delimited file using `-I`.
 
 A basic run using four threads can be performed with either of the following commands:
 ```bash
 kamino -i <input_dir> -t 4
 kamino -I <tabular_file> -t 4
+```
+In the directory mode, files are recognized by their extension (.fas, .fasta, .faa, .fa, .fna; gzpied ot not).
+
+For **bacterial** isolates, the phylogenomic alignment can also be generated directly from genome assemblies by selecting the option `--genomes` (using either `-i` or `-I`). In this case, an ultra-fast but approximate protein prediction is performed, and the predicted proteomes are written to a temporary directory.
+
+```bash
+kamino -i <input_dir> -t 4 --genomes
+```
+Finally, a Neighbour-joinging tree can be generated in addition to other output files by selecting the option `--NJ`.
+
+```bash
+kamino -i <input_dir> -t 4 --NJ
 ```
 ---
 
@@ -79,7 +91,7 @@ All analyses were performed on a MacBook *M4 Pro* using v0.6.1 and 4 threads (ot
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
 
 - **How to get more phylogenetic positions?**
-<p>Increase the maximum depth of the graph traversal (-d) or lower the minimum proportion of isolates with amino acid per position (-f) if that is acceptable for downstream analyses.</p>
+<p>Increase the maximum depth of the graph traversal (`-d`) or lower the minimum proportion of isolates with amino acid per position (`-f`) if that is acceptable for downstream analyses.</p>
 
  
 
