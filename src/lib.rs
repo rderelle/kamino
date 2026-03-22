@@ -35,7 +35,7 @@
 //! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers
 //!   (default: 3; must be ≤ k-1).
 //! - `-l`, `--length-middle`: maximum number of middle positions per variant group
-//!   (default: 2 * k; must be ≥ 1).
+//!   (default: 35; must be ≥ 1).
 //! - `-m`, `--mask`: mask middle segments with long mismatch runs (default: 5).
 //! - `-t`, `--threads`: number of threads used for graph construction and analysis
 //!   (default: 1).
@@ -220,7 +220,7 @@ pub struct Args {
     )]
     pub min_freq: f32,
 
-    /// Maximum traversal depth from each start node [d=6]
+    /// Maximum traversal depth from each start node [d=8]
     #[arg(short, long, default_value_t = 8, hide_default_value = true)]
     pub depth: usize,
 
@@ -232,9 +232,9 @@ pub struct Args {
     #[arg(short, long)]
     pub constant: Option<usize>,
 
-    /// Maximum number of middle positions per variant group [l=2*k]
-    #[arg(short = 'l', long = "length-middle")]
-    pub length_middle: Option<usize>,
+    /// Maximum number of middle positions per variant group [l=35]
+    #[arg(short = 'l', long = "length-middle", default_value_t = 35, hide_default_value = true)]
+    pub length_middle: usize,
 
     /// Mask middle segments with long mismatch runs [m=5]
     #[arg(
@@ -246,8 +246,8 @@ pub struct Args {
     pub mask: usize,
 
     /// Number of threads [t=1]
-    #[arg(short = 't', long)]
-    pub threads: Option<usize>,
+    #[arg(short = 't', long, default_value_t = 1, hide_default_value = true)]
+    pub threads: usize,
 
     /// Recoding scheme [r=sr6]
     #[arg(short = 'r', long = "recode", value_enum, default_value_t = RecodeScheme::SR6, hide_default_value = true)]
@@ -295,16 +295,14 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         k1
     );
 
-    let length_middle = args.length_middle.unwrap_or_else(|| 2 * k);
     anyhow::ensure!(
-        length_middle >= 1,
+        args.length_middle >= 1,
         "length_middle ({}) must be ≥ 1.",
-        length_middle
+        args.length_middle
     );
 
     // Decide how many threads to use (default: 1)
-    let num_threads: usize = args.threads.unwrap_or(1);
-    anyhow::ensure!(num_threads >= 1, "threads must be ≥ 1");
+    anyhow::ensure!(args.threads >= 1, "threads must be ≥ 1");
 
     eprintln!("kamino v{}", env!("CARGO_PKG_VERSION"));
     let mut species_inputs = Vec::new();
@@ -335,9 +333,9 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         constant,
         min_freq,
         args.depth,
-        length_middle,
+        args.length_middle,
         args.mask,
-        num_threads,
+        args.threads,
         args.recode,
         input_label,
         args.output.display()
@@ -358,7 +356,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
             })?;
 
         let predicted =
-            protein_prediction::predict_proteomes(&species_inputs, tmpdir.path(), num_threads)?;
+            protein_prediction::predict_proteomes(&species_inputs, tmpdir.path(), args.threads)?;
         species_inputs = predicted;
         input_labels.push("genomes=true".to_string());
         genomes_tmpdir = Some(tmpdir);
@@ -374,8 +372,8 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         k,
         min_freq,
         args.depth,
-        length_middle,
-        num_threads,
+        args.length_middle,
+        args.threads,
         args.recode,
     )?;
 
@@ -390,7 +388,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         constant,
         min_freq,
         args.mask,
-        num_threads,
+        args.threads,
         args.nj,
     )?;
 
