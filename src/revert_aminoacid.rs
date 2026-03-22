@@ -1,6 +1,7 @@
 use anyhow::Result;
 use hashbrown::{HashMap, HashSet};
 use seq_io::fasta::{Reader as FastaReader, Record};
+use std::sync::Mutex;
 
 use crate::io::{open_fasta, SpeciesInput};
 use crate::recode::{recode_byte, RecodeScheme, RECODE_BITS_PER_SYMBOL};
@@ -195,7 +196,7 @@ pub(crate) fn build_species_kmer_map(
     recode_scheme: RecodeScheme,
     scan_k: usize,
     kmers_of_interest: &HashSet<u64>,
-    word_interner: &mut WordInterner,
+    word_interner: &Mutex<WordInterner>,
 ) -> Result<SpeciesKmerMap> {
     if scan_k == 0 {
         return Ok(SpeciesKmerMap {
@@ -238,7 +239,12 @@ pub(crate) fn build_species_kmer_map(
                 if word.starts_with('[') {
                     break;
                 }
-                let word_id = word_interner.intern(word);
+                let word_id = {
+                    let mut interner = word_interner
+                        .lock()
+                        .expect("word interner mutex poisoned in build_species_kmer_map");
+                    interner.intern(word)
+                };
                 if !name_words.contains(&word_id) {
                     name_words.push(word_id);
                 }

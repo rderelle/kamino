@@ -76,6 +76,18 @@ fn collect_variant_groups(
     num_threads: usize,
     n_species: usize,
 ) -> VariantGroups {
+    // `keep_len` is measured in traversed edges (`nodes.len() - 1`), while the
+    // user-facing `--length-middle` constraint is expressed on the middle segment
+    // in amino-acid positions. For a path rendered as:
+    //   (k-1) left flank + middle + (k-1) right flank
+    // the rendered AA length is `(k-1) + keep_len`, so enforcing
+    // `middle <= length_middle` is equivalent to:
+    //   keep_len <= (k-1) + length_middle
+    let max_allowed_len = g
+        .k
+        .saturating_sub(1)
+        .saturating_add(length_middle);
+
     // Deterministic order for reproducibility
     let mut starts_sorted: Vec<u64> = start_kmers.iter().copied().collect();
     starts_sorted.sort_unstable();
@@ -112,7 +124,7 @@ fn collect_variant_groups(
                 for key in keys {
                     if let Some(paths) = per_start.remove(&key) {
                         if let Some((k, v)) =
-                            filter_one_group_3steps(g, key, paths, need, n_species, length_middle)
+                            filter_one_group_3steps(g, key, paths, need, n_species, max_allowed_len)
                         {
                             kept_local.insert(k, v);
                         }
@@ -321,7 +333,7 @@ fn filter_one_group_3steps(
     paths: Vec<PathRec>,
     need: usize,
     n_species: usize,
-    length_middle: usize,
+    max_allowed_len: usize,
 ) -> Option<((u64, u64), Vec<PathRec>)> {
     // (i) Choose path length by union species across paths of that length
     let mut unions_by_len: HashMap<usize, BitVec<u32, Lsb0>> = HashMap::new();
@@ -354,9 +366,6 @@ fn filter_one_group_3steps(
     }
     let keep_len = items[0].0;
 
-    let max_allowed_len = 2usize
-        .saturating_mul(g.k.saturating_sub(1))
-        .saturating_add(length_middle);
     if keep_len > max_allowed_len {
         return None;
     }

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
@@ -21,6 +20,18 @@ const LG_PI: [f64; 20] = [
     0.022_355, 0.062_157, 0.099_081, 0.064_600, 0.022_951, 0.042_302, 0.044_040, 0.061_197,
     0.053_287, 0.012_777, 0.027_843, 0.070_200,
 ];
+
+// Pre-computed constant c = 1.0 - Σπᵢ² (hoisted out of the hot loop).
+const C: f64 = {
+    let mut s = 0.0f64;
+    let mut i = 0usize;
+    while i < LG_PI.len() {
+        let pi = LG_PI[i];
+        s += pi * pi;
+        i += 1;
+    }
+    1.0 - s
+};
 
 /// Map an uppercase amino-acid byte to its LG index (A,R,N,...,V).
 /// Returns None for gaps/unknowns so they are ignored in distance estimates.
@@ -50,16 +61,22 @@ fn aa_index(b: u8) -> Option<usize> {
     }
 }
 
+/// Pre-map a sequence to integer indices (0-19 = AA, 20 = gap/unknown).
+/// Done once per sequence (O(n·L) cost, negligible).
+fn map_sequence(seq: &[u8]) -> Vec<u8> {
+    seq.iter()
+        .map(|&b| aa_index(b).map_or(20u8, |x| x as u8))
+        .collect()
+}
+
 /// Compute an LG+F81 corrected distance between two aligned sequences.
-/// Assumes equal-length, uppercase amino-acid bytes; ignores unknowns.
+/// Now operates on pre-mapped integer vectors → no branchy match lookups in the hot loop.
 fn lg_f81_distance(a: &[u8], b: &[u8]) -> f64 {
     let mut valid_sites = 0usize;
     let mut mismatches = 0usize;
 
-    for (&aa, &bb) in a.iter().zip(b.iter()) {
-        let ia = aa_index(aa);
-        let ib = aa_index(bb);
-        if let (Some(ia), Some(ib)) = (ia, ib) {
+    for (&ia, &ib) in a.iter().zip(b.iter()) {
+        if ia < 20 && ib < 20 {
             valid_sites += 1;
             if ia != ib {
                 mismatches += 1;
@@ -72,8 +89,7 @@ fn lg_f81_distance(a: &[u8], b: &[u8]) -> f64 {
     }
 
     let p = (mismatches as f64) / (valid_sites as f64);
-    let c: f64 = 1.0 - LG_PI.iter().map(|pi| pi * pi).sum::<f64>();
-    let mut pc = p / c;
+    let mut pc = p / C;
     if pc >= 1.0 {
         pc = 0.999_999_999;
     }
@@ -84,7 +100,7 @@ fn idx(i: usize, j: usize, dim: usize) -> usize {
     i * dim + j
 }
 
-/// Build the full pairwise distance matrix (size (2n-1)^2) for NJ.
+/// Build the full pairwise distance matrix (size (2n-1)²) for NJ.
 fn compute_distance_matrix(seqs: &[Vec<u8>], num_threads: usize) -> Vec<f64> {
     let n = seqs.len();
     let dim = 2 * n - 1;
@@ -258,7 +274,11 @@ pub fn nj_tree_newick(
         return Err("all sequences must have identical lengths".to_string());
     }
 
-    let mut dist = compute_distance_matrix(seqs, num_threads);
+    // One-time mapping of all sequences to integer indices (0-19 = AA, 20 = gap).
+    // This removes the expensive aa_index match from the O(n²·L) hot loop.
+    let mapped_seqs: Vec<Vec<u8>> = seqs.iter().map(|s| map_sequence(s)).collect();
+
+    let mut dist = compute_distance_matrix(&mapped_seqs, num_threads);
     let (nodes, root) = neighbor_joining(names, &mut dist);
     Ok(to_newick(&nodes, root))
 }

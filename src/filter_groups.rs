@@ -1,8 +1,10 @@
 use anyhow::{bail, Result};
 use hashbrown::{HashMap, HashSet};
+use rayon::{prelude::*, ThreadPoolBuilder};
+use std::sync::Mutex;
 
 use crate::io::SpeciesInput;
-use crate::revert_aminoacid::{self, GroupLayout, KmerNameStats, WordInterner};
+use crate::revert_aminoacid::{self, GroupLayout, KmerNameStats, SpeciesKmerMap, WordInterner};
 use crate::traverse::VariantGroups;
 
 /// Alignment output pieces produced for all variant groups.
@@ -218,7 +220,7 @@ pub(crate) fn build_concatenated_alignment_streaming(
     scan_k: usize,
     num_threads: usize,
 ) -> Result<VariantGroupAlignment> {
-    let _ = num_threads;
+    // Build concatenated alignment blocks from variant-group layouts using bounded parallel batches.
     let n = species.len();
 
     // Per-species buffers for the final concatenated alignment.
@@ -258,101 +260,144 @@ pub(crate) fn build_concatenated_alignment_streaming(
         .collect();
 
     let mut group_name_stats: Vec<KmerNameStats> = vec![KmerNameStats::default(); layouts.len()];
-    let mut word_interner = WordInterner::new();
+    let word_interner = Mutex::new(WordInterner::new());
+    let n_threads = num_threads.max(1);
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .expect("Failed to build Rayon thread pool in build_concatenated_alignment_streaming");
 
-    for input in inputs {
-        let Some(&sid) = name_to_sid.get(&input.name) else {
-            bail!(
-                "Species {:?} from input list not found in graph.",
-                input.name
-            );
-        };
-
-        let species_map = revert_aminoacid::build_species_kmer_map(
-            input,
-            recode_scheme,
-            scan_k,
-            &kmers_of_interest,
-            &mut word_interner,
-        )?;
-
-        let mut seen_kmers: HashSet<u64> = HashSet::new();
-
-        for (gidx, layout) in layouts.iter().enumerate() {
-            if layout.paths.is_empty() || layout.kept_len() == 0 {
-                continue;
-            }
-
-            let matrix = &mut matrices[gidx];
-            let row_start = sid * matrix.k;
-            let row = &mut matrix.data[row_start..row_start + matrix.k];
-
-            seen_kmers.clear();
-
-            let paths = &groups[&layout.key];
-            for (path_layout, &path_idx) in layout.paths.iter().zip(layout.path_indices.iter()) {
-                let path = &paths[path_idx];
-                if !path.species.get(sid).map(|b| *b).unwrap_or(false) {
-                    continue;
-                }
-
-                for (kmer, pos0) in path_layout.kmers.iter().zip(path_layout.pos0.iter()) {
-                    let Some(&idx) = species_map.map.get(kmer) else {
-                        continue;
+    // Build species k-mer maps in parallel, but only for one bounded batch at a time.
+    let batch_size = n_threads.max(1);
+    for batch in inputs.chunks(batch_size) {
+        let batch_results: Vec<Result<(usize, SpeciesKmerMap)>> = pool.install(|| {
+            batch
+                .par_iter()
+                .map(|input| {
+                    let Some(&sid) = name_to_sid.get(&input.name) else {
+                        bail!(
+                            "Species {:?} from input list not found in graph.",
+                            input.name
+                        );
                     };
 
-                    let offset = idx as usize * scan_k;
-                    let window = &species_map.windows[offset..offset + scan_k];
+                    let species_map = revert_aminoacid::build_species_kmer_map(
+                        input,
+                        recode_scheme,
+                        scan_k,
+                        &kmers_of_interest,
+                        &word_interner,
+                    )?;
 
-                    for (t, &newc) in window.iter().enumerate().take(scan_k) {
-                        let pos = *pos0 as usize + t;
-                        if pos >= layout.bl as usize {
-                            break;
-                        }
-                        let Some(kept_idx) = layout.kept_index(pos as u32) else {
-                            continue;
-                        };
+                    Ok((sid, species_map))
+                })
+                .collect()
+        });
 
-                        let cur = row[kept_idx];
-                        if cur == b'-' {
-                            row[kept_idx] = newc;
-                        } else if newc == b'-' {
-                            // keep cur
-                        } else if cur == newc {
-                            // identical call; keep cur
-                        } else {
-                            row[kept_idx] = b'X';
-                        }
+        let mut batch_maps: Vec<(usize, SpeciesKmerMap)> = Vec::with_capacity(batch_results.len());
+        for result in batch_results {
+            batch_maps.push(result?);
+        }
+        batch_maps.sort_unstable_by_key(|(sid, _)| *sid);
+
+        // Project one species batch into all group matrices in parallel over layouts.
+        pool.install(|| {
+            layouts
+                .par_iter()
+                .zip(matrices.par_iter_mut())
+                .zip(group_name_stats.par_iter_mut())
+                .for_each(|((layout, matrix), group_stats)| {
+                    if layout.paths.is_empty() || layout.kept_len() == 0 {
+                        return;
                     }
 
-                    if seen_kmers.insert(*kmer) {
-                        let name_stats = &species_map.name_stats[idx as usize];
-                        if name_stats.total_sets > 0 {
-                            let group_stats = &mut group_name_stats[gidx];
-                            group_stats.total_sets =
-                                group_stats.total_sets.saturating_add(name_stats.total_sets);
-                            for (word_id, count) in &name_stats.word_counts {
-                                if let Some(entry) = group_stats
-                                    .word_counts
-                                    .iter_mut()
-                                    .find(|(existing_id, _)| existing_id == word_id)
-                                {
-                                    entry.1 = entry.1.saturating_add(*count);
-                                } else {
-                                    group_stats.word_counts.push((*word_id, *count));
+                    let mut seen_kmers: HashSet<u64> = HashSet::new();
+                    let paths = &groups[&layout.key];
+                    for (sid, species_map) in &batch_maps {
+                        let row_start = sid * matrix.k;
+                        let row = &mut matrix.data[row_start..row_start + matrix.k];
+                        seen_kmers.clear();
+
+                        for (path_layout, &path_idx) in
+                            layout.paths.iter().zip(layout.path_indices.iter())
+                        {
+                            let path = &paths[path_idx];
+                            if !path.species.get(*sid).map(|b| *b).unwrap_or(false) {
+                                continue;
+                            }
+
+                            for (kmer, pos0) in path_layout.kmers.iter().zip(path_layout.pos0.iter())
+                            {
+                                let Some(&idx) = species_map.map.get(kmer) else {
+                                    continue;
+                                };
+
+                                let offset = idx as usize * scan_k;
+                                let window = &species_map.windows[offset..offset + scan_k];
+
+                                for (t, &newc) in window.iter().enumerate().take(scan_k) {
+                                    let pos = *pos0 as usize + t;
+                                    if pos >= layout.bl as usize {
+                                        break;
+                                    }
+                                    let Some(kept_idx) = layout.kept_index(pos as u32) else {
+                                        continue;
+                                    };
+
+                                    let cur = row[kept_idx];
+                                    if cur == b'-' {
+                                        row[kept_idx] = newc;
+                                    } else if newc == b'-' {
+                                        // keep cur
+                                    } else if cur == newc {
+                                        // identical call; keep cur
+                                    } else {
+                                        row[kept_idx] = b'X';
+                                    }
+                                }
+
+                                if seen_kmers.insert(*kmer) {
+                                    let name_stats = &species_map.name_stats[idx as usize];
+                                    if name_stats.total_sets > 0 {
+                                        group_stats.total_sets = group_stats
+                                            .total_sets
+                                            .saturating_add(name_stats.total_sets);
+                                        for (word_id, count) in &name_stats.word_counts {
+                                            if let Some(entry) = group_stats
+                                                .word_counts
+                                                .iter_mut()
+                                                .find(|(existing_id, _)| existing_id == word_id)
+                                            {
+                                                entry.1 = entry.1.saturating_add(*count);
+                                            } else {
+                                                group_stats.word_counts.push((*word_id, *count));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
-        }
+                });
+        });
     }
 
-    let word_list = word_interner.words;
+    let word_list = word_interner
+        .into_inner()
+        .expect("word interner mutex poisoned while finalizing outputs")
+        .words;
 
-    for (gidx, (layout, matrix)) in layouts.iter().zip(matrices.iter_mut()).enumerate() {
-        match filter_group_kept(matrix, layout, bubble_ratio, mask_m, n) {
+    // Run per-group filtering in parallel, then stitch kept blocks in deterministic order.
+    let outcomes: Vec<FilterOutcome> = pool.install(|| {
+        layouts
+            .par_iter()
+            .zip(matrices.par_iter_mut())
+            .map(|(layout, matrix)| filter_group_kept(matrix, layout, bubble_ratio, mask_m, n))
+            .collect()
+    });
+
+    for (gidx, outcome) in outcomes.into_iter().enumerate() {
+        match outcome {
             FilterOutcome::Kept {
                 filtered_rows,
                 filtered_len,
