@@ -1,6 +1,6 @@
 [package]
 name = "kamino-cli"
-version = "0.9.0"
+version = "1.0.0"
 edition = "2021"
 description = "Build phylogenomic datasets in seconds."
 license = "MIT"
@@ -28,7 +28,7 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 panic = "abort"
-debug = true
+debug = false
 
 [package.metadata.docs.rs]
 all-features = true
