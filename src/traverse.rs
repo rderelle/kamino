@@ -166,6 +166,7 @@ struct Frame {
 /// - Initializes the species reference set from the start node and progressively refines it
 ///   using intersections involving the previous and current node at bifurcations.
 /// - On reaching an end, records the accumulated species set with the path.
+#[allow(clippy::too_many_arguments)]
 fn collect_paths_iterative_species_from_last_bifurcation(
     g: &Graph,
     start: u64,
