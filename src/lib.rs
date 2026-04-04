@@ -30,7 +30,7 @@
 //!   selected recoding scheme).
 //! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position
 //!   (default: 0.85; must be ≥ 0.6).
-//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 8).
+//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 12).
 //! - `-o`, `--output`: output prefix for generated files (default: `kamino`).
 //! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers
 //!   (default: 3; must be ≤ k-1).
@@ -53,9 +53,10 @@
 //! increasing it usually does not substantially increase the number of variant groups. It may,
 //! however, be useful to decrease the k-mer size from 14 to 13 if memory consumption is too high.
 //!
-//! Increasing the depth of the recursive graph traversal (e.g. from 8 to 10) generally increases
+//! Increasing the depth of the recursive graph traversal (e.g. from 12 to 16) generally increases
 //! the size of the final alignment, as kamino detects more variant groups during graph traversal.
-//! This is typically the most effective approach if the alignment is deemed too short.
+//! This is typically the most effective approach if the alignment is deemed too short, but results 
+//! in increased runtimes as the program spends more time traversing the graph.
 //!
 //! Finally, larger alignments can also be produced by decreasing the minimum fraction of samples
 //! required to carry an amino acid (e.g. from 0.85 to 0.8), at the cost of increased missing data
@@ -220,8 +221,8 @@ pub struct Args {
     )]
     pub min_freq: f32,
 
-    /// Maximum traversal depth from each start node [d=8]
-    #[arg(short, long, default_value_t = 8, hide_default_value = true)]
+    /// Maximum traversal depth from each start node [d=12]
+    #[arg(short, long, default_value_t = 12, hide_default_value = true)]
     pub depth: usize,
 
     /// Output prefix [o=kamino]
