@@ -5,6 +5,7 @@ use bitvec::prelude::*;
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::rc::Rc;
 
 /// One path with the species set accumulated through bifurcations
 #[derive(Clone)]
@@ -92,6 +93,7 @@ fn collect_variant_groups(
     let mut starts_sorted: Vec<u64> = start_kmers.iter().copied().collect();
     starts_sorted.sort_unstable();
 
+
     // Build a local Rayon thread pool with the requested number of threads
     let n_threads = num_threads.max(1);
     let pool = ThreadPoolBuilder::new()
@@ -113,6 +115,7 @@ fn collect_variant_groups(
                     max_depth,
                     mask_k1,
                     min_path_edges,
+                    max_allowed_len,
                     &mut per_start,
                 );
 
@@ -124,7 +127,7 @@ fn collect_variant_groups(
                 for key in keys {
                     if let Some(paths) = per_start.remove(&key) {
                         if let Some((k, v)) =
-                            filter_one_group_3steps(g, key, paths, need, n_species, max_allowed_len)
+                            filter_one_group_3steps(g, key, paths, need, n_species)
                         {
                             kept_local.insert(k, v);
                         }
@@ -142,7 +145,7 @@ fn collect_variant_groups(
                 all_kept.insert(k, v);
             }
         }
-
+        
         // Final global selection
         post_select_variant_groups(all_kept, g)
     })
@@ -154,7 +157,7 @@ struct Frame {
     next_mask: u32,                 // unexplored outgoing edges (bitmask)
     total_outdeg: usize,            // total outdegree of this node
     solved: usize,                  // # internal bifurcations crossed (exclude start)
-    ref_species: BitVec<u32, Lsb0>, // cumulative species reference set for the path
+    ref_species: Rc<BitVec<u32, Lsb0>>, // cumulative species reference set for the path (now shared via Rc)
     emitted: bool,                  // whether this path ending was already recorded
 }
 
@@ -170,6 +173,7 @@ fn collect_paths_iterative_species_from_last_bifurcation(
     max_depth: usize,
     mask_k1: u64,
     min_path_edges: usize,
+    max_allowed_len: usize,
     out: &mut VariantGroups,
 ) {
     let start_mask = g.adj.get(start).unwrap_or(0);
@@ -182,12 +186,12 @@ fn collect_paths_iterative_species_from_last_bifurcation(
     let mut on_path: HashSet<u64, RandomState> =
         HashSet::with_capacity_and_hasher(128, RandomState::new());
 
-    let mut species_cache: HashMap<u64, BitVec<u32, Lsb0>, RandomState> =
+    let mut species_cache: HashMap<u64, Rc<BitVec<u32, Lsb0>>, RandomState> =
         HashMap::with_capacity_and_hasher(128, RandomState::new());
 
-    let mut get_species = |node: u64| {
-        if let Some(bits) = species_cache.get(&node) {
-            return bits.clone();
+    let mut get_species = |node: u64| -> Rc<BitVec<u32, Lsb0>> {
+        if let Some(rc) = species_cache.get(&node) {
+            return Rc::clone(rc);
         }
 
         let bits = g
@@ -196,8 +200,9 @@ fn collect_paths_iterative_species_from_last_bifurcation(
             .map(|bs| bs.to_bitvec())
             .unwrap_or_else(|| BitVec::repeat(false, g.n_species));
 
-        species_cache.insert(node, bits.clone());
-        bits
+        let rc = Rc::new(bits);
+        species_cache.insert(node, Rc::clone(&rc));
+        rc
     };
 
     // Start species = species at start node
@@ -220,7 +225,7 @@ fn collect_paths_iterative_species_from_last_bifurcation(
     while let Some(mut fr) = stack.pop() {
         // Reached an end and path long enough: Emit path, materializing the species only now.
         if !fr.emitted && end_kmers.contains(&fr.node) && path.len() > min_path_edges {
-            let species = fr.ref_species.clone();
+            let species = fr.ref_species.as_ref().clone();
 
             // In the node-based graph, the path is already explicit
             let full_nodes = path.clone();
@@ -249,7 +254,12 @@ fn collect_paths_iterative_species_from_last_bifurcation(
             if on_path.contains(&next) {
                 continue;
             }
-
+            
+            // Stop traversal if maximum length reached
+            if path.len() > max_allowed_len {
+                continue;
+            }
+            
             // Depth control: increment when *leaving* an internal bifurcation (not the start)
             let parent = stack.last().unwrap();
             let cur_outdeg = parent.total_outdeg;
@@ -264,37 +274,41 @@ fn collect_paths_iterative_species_from_last_bifurcation(
                 continue;
             }
 
-            // ---------- NEW SPECIES LOGIC ----------
-            let mut next_ref_species = parent.ref_species.clone();
+            // ---------- OPTIMIZED SPECIES LOGIC ----------
+            // Use Rc sharing: linear segments (non-bifurcations) now only clone the Rc pointer.
+            // Intersection (expensive BitVec data clone) only happens at start / real bifurcations.
+            let mut next_ref_species = Rc::clone(&parent.ref_species);
 
             if parent.node == start {
                 // First step: species = S(start) ∩ S(next)
                 let next_species = get_species(next);
-                if next_ref_species.len() < next_species.len() {
-                    next_ref_species.resize(next_species.len(), false);
+                let owned = Rc::make_mut(&mut next_ref_species);
+                if owned.len() < next_species.len() {
+                    owned.resize(next_species.len(), false);
                 }
-                next_ref_species &= next_species.as_bitslice();
+                *owned &= next_species.as_bitslice();
             } else if parent.total_outdeg > 1 {
                 // At a real bifurcation:
                 //   species_new = current_ref ∩ S(parent) ∩ S(next)
                 let parent_species = get_species(parent.node);
-                if next_ref_species.len() < parent_species.len() {
-                    next_ref_species.resize(parent_species.len(), false);
-                }
-                next_ref_species &= parent_species.as_bitslice();
-
                 let next_species = get_species(next);
-                if next_ref_species.len() < next_species.len() {
-                    next_ref_species.resize(next_species.len(), false);
+                let owned = Rc::make_mut(&mut next_ref_species);
+                if owned.len() < parent_species.len() {
+                    owned.resize(parent_species.len(), false);
                 }
-                next_ref_species &= next_species.as_bitslice();
+                *owned &= parent_species.as_bitslice();
+
+                if owned.len() < next_species.len() {
+                    owned.resize(next_species.len(), false);
+                }
+                *owned &= next_species.as_bitslice();
             } else {
                 // Non-branching internal node:
-                // keep current ref_species as-is for now.
+                // Keep the shared Rc (no data clone)
             }
-            // ---------- END NEW SPECIES LOGIC ----------
+            // ---------- END OPTIMIZED SPECIES LOGIC ----------
 
-            if parent.node != start && parent.total_outdeg > 1 && !next_ref_species.any() {
+            if parent.node != start && parent.total_outdeg > 1 && next_ref_species.as_ref().count_ones() == 0 {
                 continue;
             }
 
@@ -333,7 +347,6 @@ fn filter_one_group_3steps(
     paths: Vec<PathRec>,
     need: usize,
     n_species: usize,
-    max_allowed_len: usize,
 ) -> Option<((u64, u64), Vec<PathRec>)> {
     // (i) Choose path length by union species across paths of that length
     let mut unions_by_len: HashMap<usize, BitVec<u32, Lsb0>> = HashMap::new();
@@ -365,10 +378,6 @@ fn filter_one_group_3steps(
         return None; // ambiguous best length
     }
     let keep_len = items[0].0;
-
-    if keep_len > max_allowed_len {
-        return None;
-    }
 
     // Keep only paths of the chosen length
     let kept_paths: Vec<PathRec> = paths
