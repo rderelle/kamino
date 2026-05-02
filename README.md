@@ -65,24 +65,10 @@ kamino -i <input_dir> -t 4 --NJ
 ```
 ---
 
-## examples
-
-All analyses were performed on a MacBook *M4 Pro* using v0.6.1 and 4 threads (other parameters set to default):  
-
-| dataset                     | taxonomic diversity  | runtime (min) | memory (GB) | alignment size (aa) |
-|-----------------------------|----------------------|---------------|-------------|---------------------|
-| 50 *Mycobacterium*          | within-genera        | 0.1           | 0.7         | 24,678              |
-| 400 *Mycobacterium*         | within-genera        | 0.5           | 2.5         | 21,011              |
-| 50 Polyporales (fungi)      | within-order         | 0.3           | 3.8         | 29,483              |
-| 165 Arthropoda              | within-phylum        | 1.1           | 8.5         | 13,002              |
-| 55 Mammalia                 | within-class         | 1.6           | 8.1         | 334,108             |  
-
----
-
 ## FAQ
 
 - **When not to use kamino?**
-    * low diversity datasets (ie, within-species), for which genome-based approaches will be more powerful 
+    * low diversity datasets (ie, within-species), for which genome-based approaches will be more powerful and faster
     * highly divergent datasets (eg, animal kingdom)
     * distant outgroup composed of a few isolates: these might have disproportionately more missing data
     * isolates with a low number of proteins (viruses and prokaryotes with fewer than 1,000 proteins)
