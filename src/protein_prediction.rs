@@ -27,7 +27,6 @@ const ADAPTIVE_TRAIN_MIN_AA: usize = 120;
 const ADAPTIVE_MIN_TRAIN_ORFS: usize = 60;
 const ADAPTIVE_MAX_TRAIN_ORFS: usize = usize::MAX;
 const ADAPTIVE_MAX_TRAIN_NT: usize = usize::MAX;
-const ADAPTIVE_BACKGROUND_NT_PER_STRAND: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StartCodon {
@@ -864,7 +863,7 @@ fn train_adaptive_coding_model(
         return None;
     }
 
-    seed.sort_unstable_by(|a, b| b.total_score.cmp(&a.total_score));
+    seed.sort_unstable_by_key(|orf| std::cmp::Reverse(orf.total_score));
     let keep = (seed.len() / 2)
         .clamp(ADAPTIVE_MIN_TRAIN_ORFS, ADAPTIVE_MAX_TRAIN_ORFS)
         .min(seed.len());
@@ -889,8 +888,8 @@ fn train_adaptive_coding_model(
         }
     }
 
-    let fwd_usable = (fwd.len().min(ADAPTIVE_BACKGROUND_NT_PER_STRAND) / 3) * 3;
-    let rev_usable = (rev.len().min(ADAPTIVE_BACKGROUND_NT_PER_STRAND) / 3) * 3;
+    let fwd_usable = (fwd.len() / 3) * 3;
+    let rev_usable = (rev.len() / 3) * 3;
     if fwd_usable >= 3 {
         accumulate_codon_counts(&fwd[..fwd_usable], &mut background);
     }
