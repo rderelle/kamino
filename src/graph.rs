@@ -119,7 +119,7 @@ impl AdjTable {
         I: IntoIterator<Item = (u64, u32)>,
     {
         let mut entries: Vec<(u64, u32)> = iter.into_iter().collect();
-        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_unstable_by_key(|entry| entry.0);
 
         let mut nodes: Vec<u64> = Vec::with_capacity(entries.len());
         let mut masks_acc: Vec<u32> = Vec::with_capacity(entries.len());
@@ -229,7 +229,7 @@ impl NodeColorTable {
         I: IntoIterator<Item = (u64, SpeciesSet)>,
     {
         let mut entries: Vec<(u64, SpeciesSet)> = iter.into_iter().collect();
-        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_unstable_by_key(|entry| entry.0);
 
         let mut nodes: Vec<u64> = Vec::with_capacity(entries.len());
         let mut offsets: Vec<u32> = Vec::with_capacity(entries.len());
