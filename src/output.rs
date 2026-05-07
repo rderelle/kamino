@@ -136,7 +136,7 @@ pub fn write_outputs_with_head(
     let mut pw = BufWriter::new(ph);
     writeln!(pw, "start_pos\tend_pos\tlength\tconsensus protein name")?;
     for ((start, end, len), consensus_name) in
-        partitions.into_iter().zip(partition_names.into_iter())
+        partitions.into_iter().zip(partition_names)
     {
         writeln!(pw, "{}\t{}\t{}\t{}", start, end, len, consensus_name)?;
     }
