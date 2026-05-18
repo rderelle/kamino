@@ -68,7 +68,7 @@ kamino -i <input_dir> -t 4 --NJ
 ## FAQ
 
 - **When not to use kamino?**
-    * low diversity datasets (ie, within-species), for which genome-based approaches will be more powerful and faster
+    * within-species datasets, for which genome-based approaches will be more powerful and faster
     * distant outgroup composed of a few isolates: these might have disproportionately more missing data
     * isolates with a low number of proteins (viruses and prokaryotes with fewer than 1,000 proteins)
 
