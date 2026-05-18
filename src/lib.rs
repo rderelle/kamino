@@ -212,7 +212,7 @@ pub struct Args {
     #[arg(short, long)]
     pub k: Option<usize>,
 
-    /// Minimal fraction of samples with an amino-acid per position [m=0.85]
+    /// Minimal fraction of samples with an amino-acid per position [f=0.85]
     #[arg(
         short = 'f',
         long = "min-freq",
