@@ -76,7 +76,7 @@ kamino -i <input_dir> -t 4 --NJ
 <p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
 
 - **How to get more phylogenetic positions?**
-<p>Increase the maximum depth of the graph traversal (`-d`) or lower the minimum proportion of isolates with amino acid per position (`-f`) if that is acceptable for downstream analyses.</p>
+<p>Lower the minimum proportion of isolates with amino acid per position (-f parameter; ie, from 0.85 to 0.75).</p>
 
  
 
