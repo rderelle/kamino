@@ -18,8 +18,8 @@
 //!
 //! In the directory mode, files are recognized by their extension (.fas, .fasta, .faa, .fa, .fna; gzipped ot not).
 //!
-//! For **bacterial** isolates, the phylogenomic alignment can also be generated directly from genome assemblies 
-//! by selecting the option `--genomes` (using either `-i` or `-I`). In this case, an ultra-fast but approximate 
+//! For **bacterial** isolates, the phylogenomic alignment can also be generated directly from genome assemblies
+//! by selecting the option `--genomes` (using either `-i` or `-I`). In this case, an ultra-fast but approximate
 //! protein prediction is performed, and the predicted proteomes are written to a temporary directory.
 //!
 //! ## Arguments
@@ -29,7 +29,7 @@
 //! - `-k`, `--k`: k-mer length (default: 14; must be within the valid range for the
 //!   selected recoding scheme).
 //! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position
-//!   (default: 0.85; must be ≥ 0.6).
+//!   (default: 0.85; must be between 0.6 and 1.0, inclusive).
 //! - `-d`, `--depth`: maximum traversal depth from each start node (default: 12).
 //! - `-o`, `--output`: output prefix for generated files (default: `kamino`).
 //! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers
@@ -44,44 +44,56 @@
 //! - `-v`, `--version`: print version information and exit.
 //!
 //!
-//! ## Important things to optimize
-//! The main parameters governing the number of phylogenetic positions in the final alignment are
-//! the k-mer size (-k), the depth of the recursive graph traversal (-d), and the minimum sample
-//! frequency (-f).
+//! ## Optimising alignment size
 //!
-//! The default k-mer size has already been chosen to maximise the final alignment length, and
-//! increasing it usually does not substantially increase the number of variant groups. It may,
-//! however, be useful to decrease the k-mer size from 14 to 13 if memory consumption is too high.
+//! The final alignment size can mainly be increased in two ways:
 //!
-//! Increasing the depth of the recursive graph traversal (e.g. from 12 to 16) generally increases
-//! the size of the final alignment, as kamino detects more variant groups during graph traversal.
-//! This is typically the most effective approach if the alignment is deemed too short, but results 
-//! in increased runtimes as the program spends more time traversing the graph.
+//! 1. Decrease the minimum fraction of samples required to carry an amino acid with
+//!    `--min-freq`, for example from 0.85 to 0.80. This will produce larger
+//!    alignments, but at the cost of increased missing data. Missing data are
+//!    represented by `-` for missing amino acids and `X` for ambiguous or masked
+//!    amino acids.
 //!
-//! Finally, larger alignments can also be produced by decreasing the minimum fraction of samples
-//! required to carry an amino acid (e.g. from 0.85 to 0.8), at the cost of increased missing data
-//! in the final alignment. Missing data are represented by '-' (missing amino acid) and 'X'
-//! (ambiguous or masked amino acid).
+//! 2. Increase the `--length-middle` parameter, which controls the maximum number of
+//!    middle positions in variant groups, for example from 35 to 70. This allows longer
+//!    variant groups to be retained in the final alignment.
+//!
+//! Increasing the maximum recursive depth of the graph traversal may also recover
+//! more variant groups. However, the default is already quite high, and raising it,
+//! for example from 12 to 16, usually only marginally increases alignment size.
+//!
+//! Conversely, if the alignment is too large, you can increase the minimum fraction
+//! of samples, reduce the maximum length of middle positions, or decrease the maximum
+//! recursive depth of the graph traversal.
 //!
 //!
 //! ## Less important parameters
-//! Besides testing/benchmarking, I would not recommend modifying these parameter values.
 //!
-//! The number of constant positions in the final alignment can be adjusted with the --constant parameter. These are
-//! taken from the left flank of the end k-mer in each variant group, next to the middle positions. Because these
-//! positions are recoded, some may become polymorphic once converted back to amino acids. Using the default c=3,
-//! constant positions represent 50 to 60% of the alignment.
+//! Except for testing and benchmarking, I do not recommend changing these parameter
+//! values.
 //!
-//! The `--mask parameter` controls the amino-acid masking performed by kamino to prevent long runs of polymorphism from being
-//! retained in the final alignment. These correspond to genuine but unwanted polymorphisms (e.g., micro-inversions) or,
-//! less frequently, errors made by kamino (“misaligned” paths due to the presence of two consecutive indels). The minimum length
-//! of polymorphism runs to be masked can be decreased using this parameter to be more stringent.
+//! The default k-mer size has been chosen to maximise the final alignment length.
+//! Increasing it usually does not substantially increase the number of variant
+//! groups.
 //!
-//! The `--length-middle` parameter is used to filter out long variant groups. Increase this parameter to allow longer
-//! variant groups to be retained in the final alignment.
+//! The number of constant positions in the final alignment can be adjusted with the
+//! --constant parameter. These positions are taken from the left flank of the end
+//! k-mer in each variant group, next to the middle positions. Because these positions
+//! are recoded, some may become polymorphic once converted back to amino acids. With
+//! the default value of c = 3, constant positions represent about 50–60% of the
+//! alignment.
 //!
-//! Finally, the 6-letter recoding scheme can be modified using the --recode parameter, although the default sr6 recoding
-//! scheme performed the best in most of my tests (sr6 ≥ dayhoff6 ≫ kgb6).
+//! The --mask parameter controls the amino-acid masking performed by kamino to
+//! prevent long runs of polymorphism from being retained in the final alignment.
+//! These runs correspond to genuine but unwanted polymorphisms, such as
+//! micro-inversions, or, less frequently, errors made by kamino, such as misaligned
+//! paths caused by two consecutive indels. The minimum length of polymorphic runs to
+//! be masked can be decreased with this parameter to make the filtering more
+//! stringent.
+//!
+//! Finally, the 6-letter recoding scheme can be modified with the --recode
+//! parameter, although the default sr6 recoding scheme performed best in most of my
+//! tests (sr6 >= dayhoff6 >> kgb6).
 //!
 //!
 //! ## Output files
@@ -270,8 +282,8 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     let default_constant = 3usize;
 
     anyhow::ensure!(
-        args.min_freq >= 0.6,
-        "min_freq ({}) must be ≥ 0.6.",
+        (0.6..=1.0).contains(&args.min_freq),
+        "min_freq ({}) must be between 0.6 and 1.0, inclusive.",
         args.min_freq
     );
     let min_freq = args.min_freq;
