@@ -173,7 +173,7 @@ pub(crate) fn species_name_from_path(p: &std::path::Path) -> String {
     if stem.ends_with(".gz") {
         stem.truncate(stem.len() - 3);
     }
-    for ext in [".fa", ".fasta", ".fas", ".faa"] {
+    for ext in [".fa", ".fasta", ".fas", ".faa", ".fna"] {
         if stem.to_ascii_lowercase().ends_with(ext) {
             let n = stem.len() - ext.len();
             stem.truncate(n);
