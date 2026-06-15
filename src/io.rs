@@ -1,31 +1,21 @@
+//! Input discovery and FASTA opening helpers.
+//!
+//! Inputs can come from a directory of FASTA files or from a two-column TSV table
+//! mapping isolate names to FASTA paths. Files ending in `.gz` are decompressed on
+//! the fly by [`open_fasta`].
 use anyhow::{Context, Result};
-use dashmap::DashMap;
 use flate2::read::MultiGzDecoder;
-use rustc_hash::FxHasher;
-use seq_io::fasta::{Reader as FastaReader, Record};
 use std::fs::File;
-use std::hash::BuildHasherDefault;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-
-use crate::graph::{AdjTable, Graph, NodeColorTable, SpeciesSet};
-use crate::proba_filter::{
-    protein_passes_counts, stream_recoded_edges, stream_recoded_kmers, AtomicCountMinSketch,
-    BloomFilter, BLOOM_BITS, CMS_DEPTH, CMS_WIDTH,
-};
-use crate::recode::RECODE_BITS_PER_SYMBOL;
-
-use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
-
-// Type alias for faster hashing
-type FastDashMap<K, V> = DashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 // ------------------------------
 // File I/O helpers
 // ------------------------------
 
 pub fn collect_fasta_files(input_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    // Accept both plain FASTA-like extensions and gzip-compressed versions such as
+    // `.faa.gz`; sorting by filename keeps directory input deterministic.
     fn is_supported_ext(p: &Path) -> bool {
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext.eq_ignore_ascii_case("gz") {
@@ -59,11 +49,15 @@ pub fn collect_fasta_files(input_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 #[derive(Debug, Clone)]
+/// One named species/proteome input consumed by the analysis pipeline.
 pub struct SpeciesInput {
+    /// Human-readable species or isolate name used in output FASTA headers.
     pub name: String,
+    /// FASTA path for this species; may be gzip-compressed.
     pub path: PathBuf,
 }
 
+/// Build species inputs from all supported FASTA files in a directory.
 pub fn collect_species_inputs_from_dir(input_dir: &Path) -> anyhow::Result<Vec<SpeciesInput>> {
     let files = collect_fasta_files(input_dir)?;
     let mut seen = hashbrown::HashSet::new();
@@ -84,7 +78,10 @@ pub fn collect_species_inputs_from_dir(input_dir: &Path) -> anyhow::Result<Vec<S
     Ok(inputs)
 }
 
+/// Build species inputs from a two-column `name<TAB>path` table.
 pub fn collect_species_inputs_from_table(table_path: &Path) -> anyhow::Result<Vec<SpeciesInput>> {
+    // Relative paths in the table are resolved relative to the table file, not the
+    // process working directory, which makes manifests portable.
     let file = File::open(table_path).with_context(|| format!("open {:?}", table_path))?;
     let reader = BufReader::new(file);
     let base_dir = table_path.parent().unwrap_or_else(|| Path::new("."));
@@ -165,6 +162,8 @@ pub fn collect_species_inputs_from_table(table_path: &Path) -> anyhow::Result<Ve
 }
 
 pub(crate) fn species_name_from_path(p: &std::path::Path) -> String {
+    // Strip compression and FASTA extensions while preserving the rest of the file
+    // name as the default isolate label.
     let mut stem = p
         .file_name()
         .and_then(|x| x.to_str())
@@ -184,6 +183,8 @@ pub(crate) fn species_name_from_path(p: &std::path::Path) -> String {
 }
 
 pub(crate) fn open_fasta(path: &Path) -> Result<Box<dyn Read>> {
+    // Return a boxed reader so callers can treat compressed and uncompressed FASTA
+    // files identically.
     let f = File::open(path).with_context(|| format!("open {:?}", path))?;
     let buffered = BufReader::with_capacity(512 * 1024, f);
     let r: Box<dyn Read> = if let Some(s) = path.to_str() {
@@ -196,206 +197,4 @@ pub(crate) fn open_fasta(path: &Path) -> Result<Box<dyn Read>> {
         Box::new(buffered)
     };
     Ok(r)
-}
-
-// ------------------------------
-// Graph builder
-// ------------------------------
-
-pub fn build_graph_from_inputs(
-    inputs: &[SpeciesInput],
-    k: usize,
-    min_freq: f32,
-    length_middle: usize,
-    main: &mut Graph,
-    num_threads: usize,
-) -> Result<()> {
-    eprintln!("proteome files: {}", inputs.len());
-
-    // Register species with deterministic IDs
-    main.init_species_len(inputs.len());
-    let mut species_ids: Vec<u16> = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let sid = main.register_species(input.name.clone()) as u16;
-        species_ids.push(sid);
-    }
-
-    let sym_bits = RECODE_BITS_PER_SYMBOL;
-    let k1_mask = main.k1_mask;
-    let recode_scheme = main.recode_scheme;
-
-    let k1 = k.saturating_sub(1);
-    let min_needed = (min_freq * inputs.len().max(1) as f32).ceil() as u32;
-    let min_needed_cms = min_needed;
-
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build()
-        .expect("Failed to build local Rayon thread pool");
-
-    // Pass 1: Build Count-Min Sketch (species frequency of each (k-1)-mer)
-    let cms_atomic = AtomicCountMinSketch::new(CMS_WIDTH, CMS_DEPTH);
-    pool.install(|| -> Result<()> {
-        inputs.par_iter().try_for_each(|input| -> Result<()> {
-            let rdr = open_fasta(&input.path)?;
-            let mut reader = FastaReader::new(rdr);
-            let mut species_bloom = BloomFilter::new(BLOOM_BITS);
-
-            while let Some(rec) = reader.next() {
-                let rec = rec?;
-                let seq = rec.seq();
-                stream_recoded_kmers(seq, k1, sym_bits, k1_mask, recode_scheme, |kmer| {
-                    if !species_bloom.test_and_set(kmer) {
-                        cms_atomic.increment(kmer);
-                    }
-                });
-            }
-            Ok(())
-        })
-    })?;
-    let cms = cms_atomic.snapshot();
-
-    // Shared structures for final graph
-    let adj: FastDashMap<u64, u32> = FastDashMap::default();
-    let samples: FastDashMap<u64, SpeciesSet> = FastDashMap::default();
-
-    // Pass 2: Main parallel processing (filter + edges + species tracking)
-    pool.install(|| -> Result<()> {
-        inputs
-            .par_iter()
-            .zip(species_ids.par_iter().copied())
-            .try_for_each(|(input, sid)| -> Result<()> {
-                let rdr = open_fasta(&input.path)?;
-                let mut reader = FastaReader::new(rdr);
-
-                // Collect all candidate edges from passing proteins
-                let mut transitions: Vec<(u64, u32)> = Vec::with_capacity(1_000_000);
-
-                let mut passed = 0usize;
-                let mut filtered = 0usize;
-
-                while let Some(rec) = reader.next() {
-                    let rec = rec?;
-                    let seq = rec.seq();
-
-                    // Filter protein using CMS
-                    if !protein_passes_counts(
-                        seq,
-                        k1,
-                        sym_bits,
-                        k1_mask,
-                        recode_scheme,
-                        min_needed_cms,
-                        length_middle,
-                        |kmer| cms.estimate(kmer),
-                    ) {
-                        filtered += 1;
-                        continue;
-                    }
-
-                    passed += 1;
-                    // Stream edges into temporary vector
-                    stream_recoded_edges(
-                        seq,
-                        k1,
-                        sym_bits,
-                        k1_mask,
-                        recode_scheme,
-                        |u, sym, _v| {
-                            let bit = 1u32 << sym;
-                            transitions.push((u, bit));
-                        },
-                    );
-                }
-
-                // Optimisation 1: Aggregate edges with sort + linear scan
-                let mut kept = 0usize;
-                let mut dropped = 0usize;
-
-                transitions.sort_unstable_by_key(|(u, _)| *u);
-
-                let mut adj_updates: Vec<(u64, u32)> = Vec::with_capacity(1_000_000);
-                let mut node_updates: Vec<u64> = Vec::with_capacity(2_000_000);
-
-                let mut i = 0;
-                while i < transitions.len() {
-                    let u = transitions[i].0;
-                    let mut mask = 0u32;
-                    while i < transitions.len() && transitions[i].0 == u {
-                        mask |= transitions[i].1;
-                        i += 1;
-                    }
-                    if mask == 0 {
-                        continue;
-                    }
-
-                    let od = mask.count_ones();
-                    if od != 1 {
-                        dropped += od as usize;
-                        continue;
-                    }
-
-                    let sym = mask.trailing_zeros();
-                    let bit = 1u32 << sym;
-                    let v = ((u << sym_bits) | (sym as u64)) & k1_mask;
-
-                    adj_updates.push((u, bit));
-                    node_updates.push(u);
-                    node_updates.push(v);
-                    kept += 1;
-                }
-
-                drop(transitions);
-
-                let proteins_total = passed + filtered;
-                let kmers_total = kept + dropped;
-                eprintln!(
-                    "[{}] proteins={}/{} kmers={}/{}",
-                    input.name, passed, proteins_total, kept, kmers_total
-                );
-
-                // Merge edges into shared adjacency table
-                for (node, mask) in adj_updates {
-                    adj.entry(node).and_modify(|m| *m |= mask).or_insert(mask);
-                }
-
-                // Optimisation 2: Collect species per node (push + final sort)
-                node_updates.sort_unstable();
-                node_updates.dedup();
-
-                for node in node_updates {
-                    samples
-                        .entry(node)
-                        .and_modify(|species_set| species_set.push(sid))
-                        .or_insert_with(|| {
-                            let mut set = SpeciesSet::new();
-                            set.push(sid);
-                            set
-                        });
-                }
-
-                Ok(())
-            })
-    })?;
-
-    // Sort all SpeciesSets
-    samples.iter_mut().for_each(|mut entry| {
-        entry.value_mut().sort_unstable();
-    });
-
-    // Build final graph structures
-    main.adj = AdjTable::from_iter(adj);
-    main.samples = NodeColorTable::from_iter(samples, main.n_species);
-
-    Ok(())
-}
-
-pub fn print_graph_size(g: &Graph) {
-    let nodes = g.adj.len();
-    let edges: usize = g
-        .adj
-        .iter()
-        .map(|(_, mask)| mask.count_ones() as usize)
-        .sum();
-    eprintln!("graph size: nodes={} edges={}", nodes, edges);
 }

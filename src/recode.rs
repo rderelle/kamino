@@ -2,13 +2,16 @@
 
 use clap::ValueEnum;
 
-pub const RECODE_ALPHABET_SIZE: usize = 6;
 pub const RECODE_BITS_PER_SYMBOL: u32 = 3;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+/// Supported six-state amino-acid recoding schemes exposed by the CLI.
 pub enum RecodeScheme {
+    /// Classic Dayhoff six-group recoding.
     Dayhoff6,
+    /// Susko-Roger six-group recoding; this is the command-line default.
     SR6,
+    /// Kosiol-Goldman-Buttimore six-group recoding.
     KGB6,
 }
 
@@ -35,6 +38,7 @@ pub fn recode_byte(b: u8, scheme: RecodeScheme) -> u8 {
 
 #[inline]
 fn dayhoff6_code(b: u8) -> u8 {
+    // Each arm maps both upper- and lower-case amino-acid bytes to one class.
     match b {
         b'C' | b'c' => 0,                                                         // C
         b'A' | b'a' | b'G' | b'g' | b'P' | b'p' | b'S' | b's' | b'T' | b't' => 1, // A/G/P/S/T
@@ -48,6 +52,7 @@ fn dayhoff6_code(b: u8) -> u8 {
 
 #[inline]
 fn sr6_code(b: u8) -> u8 {
+    // Unknowns, gaps, and ambiguous residues return 255 so callers can reset rolls.
     match b {
         b'A' | b'a' | b'P' | b'p' | b'S' | b's' | b'T' | b't' => 0, // A/P/S/T
         b'D' | b'd' | b'E' | b'e' | b'N' | b'n' | b'G' | b'g' => 1, // D/E/N/G
@@ -61,6 +66,7 @@ fn sr6_code(b: u8) -> u8 {
 
 #[inline]
 fn kgb6_code(b: u8) -> u8 {
+    // Codes must stay in 0..=5 because k-mers pack one symbol into three bits.
     match b {
         b'A' | b'a' | b'G' | b'g' | b'P' | b'p' | b'S' | b's' => 0, // A/G/P/S
         b'D' | b'd' | b'E' | b'e' | b'N' | b'n' | b'Q' | b'q' | b'H' | b'h' | b'K' | b'k'

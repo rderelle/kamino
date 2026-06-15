@@ -10,76 +10,56 @@
 
 <br><br>
 
-From the Spanish word for *path* (not a Star Wars planet!).  
+Builds an amino acid alignment in a reference-free, alignment-free manner from a set of proteomes. Not ‘better’ than traditional marker-based pipelines, but simpler and much faster to run. Typical usages range from between-strains to within-family (prokaryotes) or within-phylum (eukaryotes) phylogenetic analyses.
 
-Builds an amino-acid alignment in a reference-free, alignment-free manner from a set of proteomes.  
-Not ‘better’ than traditional marker-based pipelines, but simpler and faster to run.  
-  
-Typical usages range from between-species to within-family (bacteria and archaea) or within-phylum (eukaryotes) phylogenetic analyses.
-
-<br>
-
----
-## under the hood
-kamino performs the following successive steps:
-- lists proteome files from the input directory (-i or -I)
-- recodes proteins with a 6-letters recoding scheme (-r)
-- simplifies proteomes by pre-filtering proteins and discarding out-branching k-mers 
-- builds a global assembly graph and identifies variant groups as described <a href="https://academic.oup.com/mbe/article/42/4/msaf077/8103706">here</a> (-d)
-- converts variant group paths back to amino acids using a sliding window
-- mask long polymorphism runs within variant groups (-m)
-- filters variant groups by missing data and middle-length thresholds (-f and -l)
-- extracts middle positions and incorporate 'constant' positions (-c)
-- outputs the final amino acid alignment (-o)
-
----
-
-## installation
+## Installation
 You can either compile the code locally using rustc, or install a precompiled binary from Bioconda:
 
 ```bash
 conda install bioconda::kamino
 ```
 
----
-
-## running kamino
-Input consists of proteome files in FASTA format (gzipped or not), with one file per sample. Files can be placed in a single directory (specified with the `-i` argument), or their paths can be provided in a tab-delimited file using `-I`.
-
-A basic run using four threads can be performed with either of the following commands:
+## Usage
+### input
+Input consists of proteome files in FASTA format (gzipped or not), with one file per sample. Files can be placed in a single directory, specified with the `-i` argument. Files are then recognised by their extension (.fa,, .fas, .fasta, .faa, .fna; gzipped ot not) and filenames minus extensions become isolate names in the final alignment. 
 ```bash
 kamino -i <input_dir> -t 4
+```
+Alternatively , the path of input files can be provided in a headless tab-delimited file using the `-I` argument. This is useful when file names do not encode the sample name or when proteomes are located in multiple directories. 
+```bash
 kamino -I <tabular_file> -t 4
 ```
-In the directory mode, files are recognized by their extension (.fas, .fasta, .faa, .fa, .fna; gzipped ot not).
-
-For **bacterial** isolates, the phylogenomic alignment can also be generated directly from genome assemblies by selecting the option `--genomes` (using either `-i` or `-I`). In this case, an ultra-fast but approximate protein prediction is performed, with predicted proteomes stored in a temporary directory.
+The first column of the tab-delimited file should contain the isolate names in the final alignment and the second column the path of proteome files.
+```bash
+species_soil    new_assemblies/proteins.fas.gz
+ncbi_species_1    ncbi/GCA_00076868/proteome.fa.gz
+ncbi_species_2    ncbi/GCA_01092864/proteome.fa.gz
+```
+For **bacterial** isolates, the phylogenomic alignment can also be generated directly from genome assemblies by selecting the `--genomes` argument, using either `-i` or `-I`. In this case, an ultra-fast but approximate protein prediction is performed, with predicted proteomes stored in a temporary directory.
 
 ```bash
 kamino -i <input_dir> -t 4 --genomes
 ```
-Finally, a Neighbour-joinging tree can be generated in addition to other output files by selecting the option `--NJ`.
+### output
+kamino outputs a FASTA amino acid alignment, a file containing the percentage of missng date per isolate and a file containing variant group coordinates in the FASTA alignment.
+
+Additionally, a Neighbour-joinging tree can be generated in addition to other output files by selecting the `--NJ` optional argument.
 
 ```bash
 kamino -i <input_dir> -t 4 --NJ
 ```
----
 
-## FAQ
+## Documentation
+More information are available at https://docs.rs/kamino-cli/latest/kamino_cli/
 
-- **When not to use kamino?**
-    * within-species datasets, for which genome-based approaches will be more powerful and faster
-    * distant outgroup composed of a few isolates: these might have disproportionately more missing data
-    * isolates with a low number of proteins (viruses and prokaryotes with fewer than 1,000 proteins)
+Please let me know if anything is unclear, and I'll update the doc accordingly.
 
-- **Is the output reproducible?**
-<p>Yes, kamino is fully deterministic so will produce the exact same alignment for a given version, set of parameters and input proteomes.</p>
+## Citation
+If you use kamino, please cite:
 
-- **How to get more phylogenetic positions?**
-<p>Lower the minimum proportion of isolates with amino acid per position (-f parameter; ie, from 0.85 to 0.75).</p>
-
- 
+> Derelle, Romain and Lees, John A. and Chindelevitch, Leonid. 2026
+> kamino: proteome-wide variant calling for amino acid phylogenomics.
+> https://www.biorxiv.org/content/10.64898/2026.05.21.726148v1
 
 ---
-
 This codebase is provided under the MIT License. Some parts of the code were drafted using AI assistance.

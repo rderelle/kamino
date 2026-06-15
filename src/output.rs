@@ -1,18 +1,14 @@
+//! Output writers for the concatenated alignment, missing-data report, partitions,
+//! and optional neighbor-joining tree.
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::filter_groups::build_concatenated_alignment_streaming;
-use crate::io::SpeciesInput;
-use crate::phylo;
-use crate::revert_aminoacid;
-use crate::traverse::VariantGroups;
-use crate::RecodeScheme;
-
 pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-    /// Build an output path next to the base path while keeping the stem.
+    // Derive all output filenames from one prefix so `-o results/foo` writes
+    // `results/foo_alignment.fas`, `results/foo_missing.tsv`, and so on.
     fn build_path(base: &Path, suffix: &str, ext: &str) -> PathBuf {
         let stem = base
             .file_stem()
@@ -20,143 +16,80 @@ pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
             .unwrap_or_else(|| OsStr::new("output"));
         let mut name = stem.to_os_string();
         name.push(suffix);
-
-        let mut path = if let Some(parent) = base.parent() {
-            let p = parent.to_path_buf();
-            if !p.as_os_str().is_empty() {
-                p
-            } else {
-                PathBuf::new()
-            }
-        } else {
-            PathBuf::new()
-        };
+        let mut path = base.parent().map(Path::to_path_buf).unwrap_or_default();
         path.push(name);
         path.set_extension(ext);
         path
     }
-
-    let fas = build_path(out_base, "_alignment", "fas");
-    let tsv = build_path(out_base, "_missing", "tsv");
-    let partitions = build_path(out_base, "_partitions", "tsv");
-    let tree = build_path(out_base, "_NJ", "tree");
-    (fas, tsv, partitions, tree)
+    (
+        build_path(out_base, "_alignment", "fas"),
+        build_path(out_base, "_missing", "tsv"),
+        build_path(out_base, "_partitions", "tsv"),
+        build_path(out_base, "_NJ", "tree"),
+    )
 }
 
-/// Write FASTA and TSV outputs while trimming the head segment.
-///
-/// The function orchestrates variant-group alignment building, applies
-/// leading-position and middle-column quality filters, and emits the three
-/// output files alongside summary stats.
-#[allow(clippy::too_many_arguments)]
-pub fn write_outputs_with_head(
-    inputs: &[SpeciesInput],
+pub fn write_outputs(
     out_base: &Path,
     species: &[String],
-    _n: usize,
-    recode_scheme: RecodeScheme,
-    groups: &VariantGroups,
-    k: usize,
-    head_max: usize,   // user-defined n; must be ≤ k-1
-    bubble_ratio: f32, // proportion of species present required to keep a column
-    mask_m: usize,
-    num_threads: usize,
+    concat: Vec<Vec<u8>>,
+    partitions: Vec<(usize, usize, usize)>,
+    partition_names: Vec<String>,
     generate_nj: bool,
+    threads: usize,
 ) -> Result<(usize, f64)> {
-    let scan_k = revert_aminoacid::scan_k_from_k(k);
-    let layouts = revert_aminoacid::build_group_layouts(groups, k, head_max, scan_k);
-
-    let alignment = build_concatenated_alignment_streaming(
-        inputs,
-        species,
-        recode_scheme,
-        groups,
-        &layouts,
-        bubble_ratio,
-        mask_m,
-        scan_k,
-        num_threads,
-    )?;
-
+    // Calculate overall missingness once before writing the FASTA rows.
     let (fas_path, tsv_path, partitions_path, tree_path) = output_paths(out_base);
-    let (concat, partitions, partition_names, dropped_middle) = (
-        alignment.concat,
-        alignment.partitions,
-        alignment.partition_names,
-        alignment.dropped_blocks_due_to_middle_filter,
-    );
-
-    // FASTA
-    let fh = File::create(&fas_path).with_context(|| format!("create {:?}", fas_path))?;
-    let mut w = BufWriter::new(fh);
-
-    let total_len: usize = concat.first().map(|v| v.len()).unwrap_or(0);
-    let total_positions: usize = total_len.saturating_mul(species.len());
+    let mut w = BufWriter::new(File::create(&fas_path)?);
+    let total_len = concat.first().map(|v| v.len()).unwrap_or(0);
+    let total_pos = total_len * species.len();
     let total_missing: usize = concat
         .iter()
-        .map(|seq| seq.iter().filter(|&&b| b == b'-' || b == b'X').count())
+        .map(|s| s.iter().filter(|&&b| b == b'-' || b == b'X').count())
         .sum();
-    let alignment_missing_pct = if total_positions == 0 {
+    let miss = if total_pos == 0 {
         0.0
     } else {
-        (total_missing as f64) * 100.0 / (total_positions as f64)
+        100.0 * total_missing as f64 / total_pos as f64
     };
-
+    // FASTA output is wrapped at 60 characters for broad tool compatibility.
     for (sid, name) in species.iter().enumerate() {
         writeln!(w, ">{}", name)?;
-        let row = &concat[sid];
-        for chunk in row.chunks(60) {
-            w.write_all(chunk)?;
+        for ch in concat[sid].chunks(60) {
+            w.write_all(ch)?;
             w.write_all(b"\n")?;
         }
     }
     w.flush()?;
-
-    // TSV with % missing per species
-    let th = File::create(&tsv_path).with_context(|| format!("create {:?}", tsv_path))?;
-    let mut tw = BufWriter::new(th);
+    // Per-species missingness helps users identify problematic samples.
+    let mut tw = BufWriter::new(File::create(&tsv_path)?);
     writeln!(tw, "species\tpct_missing")?;
-
     for (sid, name) in species.iter().enumerate() {
-        let seq = &concat[sid];
-        let len = seq.len().max(total_len);
-        let missing = seq.iter().filter(|&&b| b == b'-' || b == b'X').count();
-        let pct = if len == 0 {
-            0.0
-        } else {
-            (missing as f64) * 100.0 / (len as f64)
-        };
-        writeln!(tw, "{}\t{:.1}", name, pct)?;
+        let len = concat[sid].len().max(1);
+        let m = concat[sid]
+            .iter()
+            .filter(|&&b| b == b'-' || b == b'X')
+            .count();
+        writeln!(tw, "{}\t{:.1}", name, 100.0 * m as f64 / len as f64)?;
     }
     tw.flush()?;
-
-    // TSV with partition start/end/length information
-    let ph =
-        File::create(&partitions_path).with_context(|| format!("create {:?}", partitions_path))?;
-    let mut pw = BufWriter::new(ph);
+    // Partitions use the coordinates returned by the extraction pipeline and keep
+    // the chosen consensus protein label next to each block.
+    let mut pw = BufWriter::new(
+        File::create(&partitions_path).with_context(|| format!("create {:?}", partitions_path))?,
+    );
     writeln!(pw, "start_pos\tend_pos\tlength\tconsensus protein name")?;
-    for ((start, end, len), consensus_name) in
-        partitions.into_iter().zip(partition_names)
-    {
-        writeln!(pw, "{}\t{}\t{}\t{}", start, end, len, consensus_name)?;
+    for ((s, e, l), n) in partitions.into_iter().zip(partition_names) {
+        writeln!(pw, "{}\t{}\t{}\t{}", s, e, l, n)?;
     }
     pw.flush()?;
-
-    eprintln!(
-        "dropped due to unique/missing middle filtering: {}",
-        dropped_middle
-    );
-
-    // NJ tree
     if generate_nj {
-        let tree = phylo::nj_tree_newick(species, &concat, num_threads)
-            .map_err(|err| anyhow::anyhow!(err))?;
-        let tree_file =
-            File::create(&tree_path).with_context(|| format!("create {:?}", tree_path))?;
-        let mut tree_writer = BufWriter::new(tree_file);
-        writeln!(tree_writer, "{}", tree)?;
-        tree_writer.flush()?;
+        // Tree generation is optional because it adds an O(n²·L) distance pass.
+        let tree = crate::phylo::nj_tree_newick(species, &concat, threads)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut tw = BufWriter::new(File::create(&tree_path)?);
+        writeln!(tw, "{}", tree)?;
+        tw.flush()?;
     }
-
-    Ok((total_len, alignment_missing_pct))
+    Ok((total_len, miss))
 }

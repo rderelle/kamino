@@ -1,16 +1,25 @@
+//! Lightweight six-frame bacterial-style protein prediction for genome inputs.
+//!
+//! When `--genomes` is enabled, each nucleotide FASTA is scanned on both strands,
+//! open reading frames are scored with a small GC-aware model, and translated ORFs
+//! are written to temporary amino-acid FASTA files for the normal direct pipeline.
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use seq_io::fasta::{Reader, Record};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::io::SpeciesInput;
 
+/// Minimum translated ORF length emitted by the predictor.
 const DEFAULT_MIN_AA: usize = 90;
+/// Maximum nucleotide overlap allowed when greedily de-duplicating ORFs.
 const MAX_ALLOWED_OVERLAP_NT: usize = 30;
 
+/// Limit for the quick GC/content scan at the beginning of each genome file.
 const GC_ESTIMATE_MAX_VALID_BASES: usize = 300_000;
 
 // Additional local suppression among starts inside the same stop-free segment.
@@ -28,7 +37,52 @@ const ADAPTIVE_MIN_TRAIN_ORFS: usize = 60;
 const ADAPTIVE_MAX_TRAIN_ORFS: usize = usize::MAX;
 const ADAPTIVE_MAX_TRAIN_NT: usize = usize::MAX;
 
+struct GenomeProgress {
+    current: Mutex<usize>,
+    total: usize,
+}
+
+impl GenomeProgress {
+    fn new(total: usize) -> Self {
+        Self {
+            current: Mutex::new(0),
+            total,
+        }
+    }
+
+    fn increment(&self) {
+        let mut current = self.current.lock().expect("progress mutex poisoned");
+        *current += 1;
+        self.draw(*current);
+    }
+
+    fn draw(&self, current: usize) {
+        const WIDTH: usize = 45;
+        const BLUE: &str = "\x1b[34m";
+        const RESET: &str = "\x1b[0m";
+
+        let filled = current
+            .saturating_mul(WIDTH)
+            .checked_div(self.total)
+            .unwrap_or(WIDTH);
+        let empty = WIDTH.saturating_sub(filled);
+        eprint!(
+            "\r  {BLUE}[{}{}]{RESET} {}/{} genome files",
+            "=".repeat(filled),
+            " ".repeat(empty),
+            current,
+            self.total
+        );
+        let _ = io::stderr().flush();
+    }
+
+    fn finish(&self) {
+        eprintln!();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Bacterial genetic-code-11 start codons considered by the predictor.
 enum StartCodon {
     Atg,
     Gtg,
@@ -57,7 +111,7 @@ impl StartCodon {
 
 #[derive(Clone, Copy, Debug)]
 struct GcModel {
-    // expected GC proportions at codon positions 1,2,3, scaled by 1000
+    // Expected GC proportions at codon positions 1,2,3, scaled by 1000.
     exp1_pm: u16,
     exp2_pm: u16,
     exp3_pm: u16,
@@ -80,15 +134,25 @@ impl GcModel {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Candidate or emitted open reading frame in nucleotide coordinates.
 struct Orf {
+    /// Inclusive start offset in the scanned strand sequence.
     start: usize,
+    /// Exclusive end offset in the scanned strand sequence.
     end: usize,
+    /// `1` for forward strand, `-1` for reverse-complement strand.
     strand: i8,
+    /// Start of the stop-free segment from which this ORF was derived.
     scan_start: usize,
+    /// End of the stop-free segment from which this ORF was derived.
     scan_end: usize,
+    /// True when the ORF starts at the contig edge rather than an observed start codon.
     partial_5p: bool,
+    /// True when the ORF reaches the contig edge without an observed stop codon.
     partial_3p: bool,
+    /// Whether the ORF has ATG/GTG/TTG at its 5' end.
     has_start_codon: bool,
+    /// Combined start, length, GC-position, and adaptive-coding score.
     total_score: i32,
 }
 
@@ -109,6 +173,7 @@ impl Orf {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Raw start codon candidate before ORF-length scoring.
 struct CandidateStart {
     pos: usize,
     start_codon: StartCodon,
@@ -116,23 +181,27 @@ struct CandidateStart {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Candidate start that produces a long enough ORF in the current segment.
 struct ValidStart {
     cand: CandidateStart,
     len_nt: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Valid start annotated with its total ORF score for sorting/pruning.
 struct RankedStart {
     vs: ValidStart,
     total: i32,
 }
 
 #[derive(Clone, Copy)]
+/// Flags describing whether a stop-free segment touches contig boundaries.
 struct SegmentEdges {
     touches_3p: bool,
 }
 
 #[derive(Clone, Debug)]
+/// Optional genome-specific codon usage model learned from high-confidence ORFs.
 struct AdaptiveCodingModel {
     codon_score_pm: [i16; 64],
 }
@@ -192,6 +261,7 @@ const fn build_stop_lut() -> [bool; 64] {
     lut
 }
 
+/// Predict one temporary amino-acid FASTA for each genome input in parallel.
 pub fn predict_proteomes(
     genomes: &[SpeciesInput],
     temp_dir: &Path,
@@ -201,25 +271,30 @@ pub fn predict_proteomes(
         .num_threads(num_threads)
         .build()
         .context("Failed to build Rayon thread pool for genome prediction")?;
+    let progress = GenomeProgress::new(genomes.len());
+    progress.draw(0);
 
     let predicted = pool.install(|| {
         genomes
             .par_iter()
             .map(|genome| -> Result<SpeciesInput> {
                 let out_path = temp_dir.join(format!("{}.faa", genome.name));
-                predict_one_genome(&genome.path, &out_path)?;
-                Ok(SpeciesInput {
+                let result = predict_one_genome(&genome.path, &out_path).map(|()| SpeciesInput {
                     name: genome.name.clone(),
                     path: out_path,
-                })
+                });
+                progress.increment();
+                result
             })
             .collect::<Vec<Result<SpeciesInput>>>()
     });
+    progress.finish();
 
     predicted.into_iter().collect()
 }
 
 // Main pipeline: parse arguments, scan each sequence, predict ORFs, and write translated proteins.
+/// Scan one nucleotide FASTA, select non-overlapping ORFs, and write proteins.
 fn predict_one_genome(input_path: &Path, output_path: &Path) -> Result<()> {
     let min_orf_nt = DEFAULT_MIN_AA * 3;
 
@@ -286,6 +361,7 @@ fn predict_one_genome(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Open plain or gzip-compressed FASTA for the genome predictor.
 fn open_fasta_reader(path: &Path) -> Result<Reader<Box<dyn Read>>> {
     let file = File::open(path).with_context(|| format!("Failed to open input file: {path:?}"))?;
     let buffered = BufReader::new(file);
@@ -303,6 +379,7 @@ fn open_fasta_reader(path: &Path) -> Result<Reader<Box<dyn Read>>> {
 }
 
 #[inline]
+/// Write one translated protein record using stable synthetic identifiers.
 fn write_one_protein_fasta<W: Write>(writer: &mut W, idx: usize, protein: &str) -> Result<()> {
     writeln!(writer, ">protein_{idx}")
         .with_context(|| format!("Failed to write FASTA header for record {idx}"))?;
@@ -320,6 +397,7 @@ fn write_one_protein_fasta<W: Write>(writer: &mut W, idx: usize, protein: &str) 
 }
 
 // Estimate genome-wide GC content from the first valid bases of the input FASTA.
+/// Estimate overall GC and the ATGC fraction to reject non-DNA inputs early.
 fn estimate_input_genome_gc(path: &Path) -> Result<(f32, f32)> {
     let mut reader = open_fasta_reader(path)?;
 
@@ -336,7 +414,7 @@ fn estimate_input_genome_gc(path: &Path) -> Result<(f32, f32)> {
 
         let mut seq = record.seq().to_vec();
         seq.retain(|b| !b.is_ascii_whitespace());
-        
+
         for b in seq {
             if total >= GC_ESTIMATE_MAX_VALID_BASES {
                 break;
@@ -373,6 +451,7 @@ fn estimate_input_genome_gc(path: &Path) -> Result<(f32, f32)> {
 }
 
 #[inline]
+/// Return the overlap length between two half-open nucleotide intervals.
 fn overlap_len(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> usize {
     let s = a_start.max(b_start);
     let e = a_end.min(b_end);
@@ -381,6 +460,7 @@ fn overlap_len(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> us
 
 // Keep the best-scoring ORFs while removing predictions that overlap too much.
 #[inline]
+/// Keep high-scoring ORFs while suppressing near-duplicate overlapping predictions.
 fn greedy_non_overlapping(orfs: &mut [Orf]) -> Vec<Orf> {
     orfs.sort_unstable_by(|a, b| {
         a.partial_class()
@@ -408,6 +488,7 @@ fn greedy_non_overlapping(orfs: &mut [Orf]) -> Vec<Orf> {
 }
 
 // Scan one strand in all three frames, split it into stop-free segments, and collect ORF candidates.
+/// Find complete and edge-partial ORFs on one strand sequence.
 fn find_orfs_on_strand(
     seq: &[u8],
     strand: i8,
@@ -500,6 +581,7 @@ fn find_orfs_on_strand(
 // Evaluate one stop-free segment and emit the best ORF predictions from it.
 #[inline]
 #[allow(clippy::too_many_arguments)]
+/// Score all valid starts in one stop-free segment and emit representative ORFs.
 fn emit_segment_orfs(
     seq: &[u8],
     strand: i8,
@@ -534,6 +616,7 @@ fn emit_segment_orfs(
 }
 
 #[inline]
+/// Collect start codons that produce ORFs meeting the minimum nucleotide length.
 fn collect_valid_starts(
     starts: &[CandidateStart],
     segment_end: usize,
@@ -558,6 +641,7 @@ fn collect_valid_starts(
 // Rank valid starts in a segment and keep only the best complete ORFs.
 #[inline]
 #[allow(clippy::too_many_arguments)]
+/// Rank complete ORFs from candidate starts and append the retained alternatives.
 fn emit_complete_orfs(
     seq: &[u8],
     strand: i8,
@@ -628,6 +712,7 @@ fn emit_complete_orfs(
 }
 
 #[inline]
+/// Remove lower-scoring start codons that are nearly adjacent to a kept start.
 fn suppress_nearby_starts(starts: &[CandidateStart], kept: &mut Vec<CandidateStart>) {
     kept.clear();
     kept.reserve(starts.len());
@@ -652,6 +737,7 @@ fn suppress_nearby_starts(starts: &[CandidateStart], kept: &mut Vec<CandidateSta
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
+/// Append an ORF with all coordinate and partial-boundary metadata populated.
 fn push_orf_with_total(
     strand: i8,
     seq_len: usize,
@@ -683,11 +769,13 @@ fn push_orf_with_total(
 }
 
 #[inline]
+/// Score a start codon using codon identity plus upstream Shine-Dalgarno signal.
 fn start_score(seq: &[u8], start: usize, sc: StartCodon) -> i32 {
     sc.bonus() + sd_score(seq, start)
 }
 
 #[inline]
+/// Search upstream of a start for a purine-rich Shine-Dalgarno-like motif.
 fn sd_score(seq: &[u8], start: usize) -> i32 {
     if start < SD_SCAN_UPSTREAM_MIN + 4 {
         return 0;
@@ -746,6 +834,7 @@ fn sd_score(seq: &[u8], start: usize) -> i32 {
 }
 
 #[inline]
+/// Combine start, length, GC-position, and adaptive scores for ORF ranking.
 fn total_orf_score(
     nt_len: usize,
     has_start_codon: bool,
@@ -776,6 +865,7 @@ fn total_orf_score(
 }
 
 #[inline]
+/// Downweight weak alternative starts more strongly on short ORFs.
 fn calibrated_start_term(start_score: i32, nt_len: usize) -> i32 {
     if nt_len >= 600 {
         (start_score / 2).clamp(-6, 7)
@@ -787,6 +877,7 @@ fn calibrated_start_term(start_score: i32, nt_len: usize) -> i32 {
 }
 
 #[inline]
+/// Reward longer ORFs with a saturating score contribution.
 fn length_score(nt_len: usize) -> i32 {
     let aa_len = nt_len / 3;
 
@@ -799,6 +890,7 @@ fn length_score(nt_len: usize) -> i32 {
 }
 
 #[inline]
+/// Score how well codon-position GC content matches the genome-level model.
 fn gcpos_score_pm(seq: &[u8], gc_model: &GcModel) -> i32 {
     let codons = seq.len() / 3;
     if codons < 20 {
@@ -844,6 +936,7 @@ fn gcpos_score_pm(seq: &[u8], gc_model: &GcModel) -> i32 {
 
 // Build a simple codon-usage model from high-confidence ORFs in the current sequence.
 #[inline]
+/// Learn a codon-usage model from high-confidence preliminary ORFs.
 fn train_adaptive_coding_model(
     orfs: &[Orf],
     fwd: &[u8],
@@ -913,6 +1006,7 @@ fn train_adaptive_coding_model(
 
 // Add the adaptive codon-usage score to each predicted ORF.
 #[inline]
+/// Re-score ORFs with the learned coding model before final overlap pruning.
 fn apply_adaptive_coding_scores(
     orfs: &mut [Orf],
     fwd: &[u8],
@@ -928,6 +1022,7 @@ fn apply_adaptive_coding_scores(
 }
 
 #[inline]
+/// Score a nucleotide ORF by summing genome-specific codon preferences.
 fn adaptive_coding_score(nt: &[u8], model: &AdaptiveCodingModel) -> i32 {
     let codons = nt.len() / 3;
     if codons < 35 {
@@ -949,6 +1044,7 @@ fn adaptive_coding_score(nt: &[u8], model: &AdaptiveCodingModel) -> i32 {
 }
 
 #[inline]
+/// Add valid in-frame codons from a sequence to a 64-bin count table.
 fn accumulate_codon_counts(seq: &[u8], counts: &mut [usize; 64]) {
     let usable = (seq.len() / 3) * 3;
     let mut i = 0usize;
@@ -961,6 +1057,7 @@ fn accumulate_codon_counts(seq: &[u8], counts: &mut [usize; 64]) {
 }
 
 #[inline]
+/// Convert three nucleotide bytes into a compact 0..64 codon index.
 fn codon_index_fast(a: u8, b: u8, c: u8) -> Option<usize> {
     let x = NT2_LUT[a as usize];
     let y = NT2_LUT[b as usize];
@@ -972,6 +1069,7 @@ fn codon_index_fast(a: u8, b: u8, c: u8) -> Option<usize> {
 }
 
 // Build the reverse-complemented version of the input sequence for scanning the opposite strand.
+/// Fill `rc` with the reverse complement of `seq` without reallocating each call.
 fn reverse_complement_into(seq: &[u8], rc: &mut Vec<u8>) {
     rc.clear();
     rc.resize(seq.len(), b'N');
@@ -983,11 +1081,13 @@ fn reverse_complement_into(seq: &[u8], rc: &mut Vec<u8>) {
 }
 
 #[inline]
+/// Detect ambiguous codons that should break stop/start/coding logic.
 fn has_n_triplet(a: u8, b: u8, c: u8) -> bool {
     a == b'N' || b == b'N' || c == b'N'
 }
 
 #[inline]
+/// Test whether a triplet is a table-11 stop codon.
 fn is_stop_triplet(a: u8, b: u8, c: u8) -> bool {
     if let Some(idx) = codon_index_fast(a, b, c) {
         IS_STOP_LUT[idx]
@@ -997,6 +1097,7 @@ fn is_stop_triplet(a: u8, b: u8, c: u8) -> bool {
 }
 
 #[inline]
+/// Test whether a triplet is an accepted table-11 start codon.
 fn start_codon_triplet(a: u8, b: u8, c: u8) -> Option<StartCodon> {
     if let Some(idx) = codon_index_fast(a, b, c) {
         START_CODON_LUT[idx]
@@ -1006,16 +1107,19 @@ fn start_codon_triplet(a: u8, b: u8, c: u8) -> Option<StartCodon> {
 }
 
 #[inline]
+/// Return true for A/G bases used by the Shine-Dalgarno heuristic.
 fn is_purine(b: u8) -> bool {
     b == b'A' || b == b'G'
 }
 
 #[inline]
+/// Return true for G/C bases used by GC-position scoring.
 fn is_gc(b: u8) -> bool {
     b == b'G' || b == b'C'
 }
 
 // Translate a nucleotide ORF into a protein sequence using bacterial translation table 11.
+/// Translate nucleotide sequence using genetic code 11, optionally forcing initial M.
 fn translate_table11(nt: &[u8], force_initial_m: bool) -> String {
     let aa_len = nt.len() / 3;
     let mut protein = String::with_capacity(aa_len);
@@ -1036,6 +1140,7 @@ fn translate_table11(nt: &[u8], force_initial_m: bool) -> String {
 }
 
 #[inline]
+/// Map one table-11 codon to an amino-acid character, or X for ambiguity.
 fn codon_to_aa_table11(a: u8, b: u8, c: u8) -> char {
     if let Some(idx) = codon_index_fast(a, b, c) {
         CODON_TO_AA_LUT[idx]
