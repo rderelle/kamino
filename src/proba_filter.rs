@@ -1,21 +1,22 @@
 //! Probabilistic prefilter for proteins using:
-//! - per-proteome Bloom filter to count each (k-1)-mer once per species.
-//! - global Count-Min Sketch (CMS) to estimate how many species contain each (k-1)-mer.
+//! - per-proteome Bloom filter to count each k-mer once per species.
+//! - global Count-Min Sketch (CMS) to estimate how many species contain each k-mer.
 //!
 //! False positives tradeoffs:
-//! - Bloom false positives cause undercounting ((k-1)-mers may look already seen),
+//! - Bloom false positives cause undercounting (k-mers may look already seen),
 //!   which can drop some proteins that should pass (conservative).
 //! - CMS overestimates counts, which can let extra proteins through (permissive).
 //!   The combination keeps sensitivity while bounding memory and runtime.
 
-use crate::recode::{recode_byte, RecodeScheme};
 use std::sync::atomic::{AtomicU16, Ordering};
 
-pub const BLOOM_BITS: usize = 1 << 23;
+pub const BLOOM_BITS: usize = 1 << 25;
+/// Number of independent probes used by each per-species Bloom filter.
 pub const BLOOM_HASHES: usize = 2;
-pub const CMS_WIDTH: usize = 1 << 24;
+/// Number of counters per count-min-sketch row; must stay a power-of-two size.
+pub const CMS_WIDTH: usize = 1 << 26;
+/// Number of hash rows in the count-min sketch.
 pub const CMS_DEPTH: usize = 4;
-pub const MIN_GOOD_KMERS: u32 = 2;
 
 const SEEDS: [u64; 6] = [
     0x9e3779b97f4a7c15,
@@ -27,6 +28,7 @@ const SEEDS: [u64; 6] = [
 ];
 
 fn mix64(mut x: u64) -> u64 {
+    // SplitMix64 finalizer: cheap avalanche hash for already-encoded k-mer keys.
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58476d1ce4e5b9);
     x ^= x >> 27;
@@ -36,12 +38,15 @@ fn mix64(mut x: u64) -> u64 {
 
 #[derive(Clone)]
 pub struct BloomFilter {
+    /// Packed bitset for the filter.
     bits: Vec<u64>,
+    /// Power-of-two mask used instead of modulo when mapping hashes to bit indexes.
     mask: u64,
 }
 
 impl BloomFilter {
     pub fn new(bits: usize) -> Self {
+        // Round up to a power of two so indexing can use `hash & mask`.
         let size = bits.max(64).next_power_of_two();
         let words = size.div_ceil(64);
         BloomFilter {
@@ -71,13 +76,17 @@ impl BloomFilter {
 
 #[derive(Clone)]
 pub struct CountMinSketch {
+    /// Counters per row.
     width: usize,
+    /// Row-major counter table.
     table: Vec<u16>,
+    /// Per-row seeds that produce independent hash locations.
     seeds: Vec<u64>,
 }
 
 impl CountMinSketch {
     pub fn new(width: usize, depth: usize) -> Self {
+        // Use at least one row/counter even if a caller accidentally passes zero.
         let w = width.max(1).next_power_of_two();
         let d = depth.max(1);
         let mut seeds = Vec::with_capacity(d);
@@ -92,6 +101,7 @@ impl CountMinSketch {
     }
 
     pub fn estimate(&self, key: u64) -> u32 {
+        // CMS query returns the minimum row counter, which bounds overestimation.
         let mut min = u16::MAX;
         for (row, seed) in self.seeds.iter().enumerate() {
             let idx = (mix64(key ^ seed) & (self.width as u64 - 1)) as usize;
@@ -104,11 +114,14 @@ impl CountMinSketch {
 
 /// Thread-safe CMS used during parallel ingestion.
 ///
-/// Each (k-1)-mer is incremented at most once per species by guarding with a
+/// Each k-mer is incremented at most once per species by guarding with a
 /// per-species Bloom filter, so the counts represent species occurrences.
 pub struct AtomicCountMinSketch {
+    /// Counters per row.
     width: usize,
+    /// Atomic row-major table for parallel counting.
     table: Vec<AtomicU16>,
+    /// Per-row seeds matching the read-only snapshot representation.
     seeds: Vec<u64>,
 }
 
@@ -162,126 +175,4 @@ impl AtomicCountMinSketch {
         }
         cms
     }
-}
-
-pub fn stream_recoded_kmers(
-    seq: &[u8],
-    k: usize,
-    sym_bits: u32,
-    k_mask: u64,
-    scheme: RecodeScheme,
-    mut on_kmer: impl FnMut(u64),
-) {
-    let mut roll: u64 = 0;
-    let mut have: usize = 0;
-    for &b in seq {
-        if b.is_ascii_whitespace() {
-            continue;
-        }
-        let a = recode_byte(b, scheme);
-        if a == 255 {
-            roll = 0;
-            have = 0;
-            continue;
-        }
-        roll = ((roll << sym_bits) | (a as u64)) & k_mask;
-        if have < k {
-            have += 1;
-        }
-        if have == k {
-            on_kmer(roll);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn stream_recoded_edges(
-    seq: &[u8],
-    k1: usize,
-    sym_bits: u32,
-    k1_mask: u64,
-    scheme: RecodeScheme,
-    mut on_edge: impl FnMut(u64, u32, u64),
-) {
-    let mut roll: u64 = 0;
-    let mut have: usize = 0;
-    let mut prev: Option<u64> = None;
-    for &b in seq {
-        if b.is_ascii_whitespace() {
-            continue;
-        }
-        let a = recode_byte(b, scheme);
-        if a == 255 {
-            roll = 0;
-            have = 0;
-            prev = None;
-            continue;
-        }
-        roll = ((roll << sym_bits) | (a as u64)) & k1_mask;
-        if have < k1 {
-            have += 1;
-        }
-        if have == k1 {
-            if let Some(u) = prev {
-                let sym = a as u32;
-                on_edge(u, sym, roll);
-            }
-            prev = Some(roll);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn protein_passes_counts(
-    seq: &[u8],
-    k: usize,
-    sym_bits: u32,
-    k_mask: u64,
-    scheme: RecodeScheme,
-    min_needed: u32,
-    length_middle: usize,
-    mut count: impl FnMut(u64) -> u32,
-) -> bool {
-    let mut roll: u64 = 0;
-    let mut have: usize = 0;
-    let mut pos: usize = 0;
-    let mut last_hit_start: Option<usize> = None;
-    let mut good_hits = 0u32;
-    for &b in seq {
-        if b.is_ascii_whitespace() {
-            continue;
-        }
-        pos += 1;
-        let a = recode_byte(b, scheme);
-        if a == 255 {
-            roll = 0;
-            have = 0;
-            continue;
-        }
-        roll = ((roll << sym_bits) | (a as u64)) & k_mask;
-        if have < k {
-            have += 1;
-        }
-        if have == k && count(roll) >= min_needed {
-            let start = pos - k;
-            if let Some(prev_start) = last_hit_start {
-                if start >= prev_start + k {
-                    let gap = start - (prev_start + k);
-                    if gap <= length_middle {
-                        good_hits += 1;
-                        if good_hits >= MIN_GOOD_KMERS {
-                            return true;
-                        }
-                    } else {
-                        good_hits = 1;
-                    }
-                    last_hit_start = Some(start);
-                }
-            } else {
-                good_hits = 1;
-                last_hit_start = Some(start);
-            }
-        }
-    }
-    false
 }

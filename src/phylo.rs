@@ -1,16 +1,25 @@
-use std::collections::HashSet;
+//! Minimal neighbor-joining implementation used for the optional `--nj` tree.
+//!
+//! Distances are computed from pairwise amino-acid differences while ignoring gaps
+//! and unknown residues; the resulting matrix is converted to Newick with the
+//! classic neighbor-joining reduction loop.
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct Edge {
+    /// Child node index in the shared node arena.
     pub child: usize,
+    /// Branch length from parent to child.
     pub len: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct Node {
+    /// Leaf name; internal nodes use `None`.
     pub name: Option<String>,
+    /// Outgoing edges from this rooted representation.
     pub children: Vec<Edge>,
 }
 
@@ -97,6 +106,7 @@ fn lg_f81_distance(a: &[u8], b: &[u8]) -> f64 {
 }
 
 fn idx(i: usize, j: usize, dim: usize) -> usize {
+    // Flat row-major indexing avoids Vec<Vec<_>> allocation overhead.
     i * dim + j
 }
 
@@ -133,6 +143,8 @@ fn compute_distance_matrix(seqs: &[Vec<u8>], num_threads: usize) -> Vec<f64> {
 /// Perform neighbor-joining using the precomputed distances.
 /// Returns the full node list and the root index.
 fn neighbor_joining(names: &[String], dist: &mut [f64]) -> (Vec<Node>, usize) {
+    // Nodes are stored in an arena: initial leaves first, then inferred internal
+    // nodes. `active` contains the current NJ frontier within that arena.
     let n = names.len();
     let dim = 2 * n - 1;
     let mut nodes = Vec::with_capacity(dim);
@@ -157,6 +169,7 @@ fn neighbor_joining(names: &[String], dist: &mut [f64]) -> (Vec<Node>, usize) {
             r[i] = sum;
         }
 
+        // Select the pair minimizing the NJ Q criterion.
         let mut best_pair = (active[0], active[1]);
         let mut best_q = f64::INFINITY;
         for (pos_i, &i) in active.iter().enumerate() {
@@ -181,6 +194,8 @@ fn neighbor_joining(names: &[String], dist: &mut [f64]) -> (Vec<Node>, usize) {
             lj = 0.0;
         }
 
+        // Create a new internal node joining the chosen pair and update distances
+        // from that node to every remaining active node.
         let u = nodes.len();
         nodes.push(Node {
             name: None,
@@ -200,6 +215,7 @@ fn neighbor_joining(names: &[String], dist: &mut [f64]) -> (Vec<Node>, usize) {
         active.push(u);
     }
 
+    // The final two active nodes are connected under a synthetic root.
     let a = active[0];
     let b = active[1];
     let mut len = dist[idx(a, b, dim)] * 0.5;
@@ -260,6 +276,7 @@ pub fn nj_tree_newick(
     seqs: &[Vec<u8>],
     num_threads: usize,
 ) -> Result<String, String> {
+    // Validate the rectangular alignment contract before doing any expensive work.
     if names.len() != seqs.len() {
         return Err("names and sequences length mismatch".to_string());
     }

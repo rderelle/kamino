@@ -23,23 +23,17 @@
 //! protein prediction is performed, and the predicted proteomes are written to a temporary directory.
 //!
 //! ## Arguments
-//! - `-i`, --input-directory <INPUT>: input directory with FASTA proteomes (plain or .gz)
-//! - `-I`, --input-file <INPUT_FILE>: tab-delimited file mapping species name to proteome path
+//! - `-i`, --input-directory: input directory with FASTA proteomes (plain or .gz)
+//! - `-I`, --input-file: tab-delimited file mapping species name to proteome path
 //! - `--genomes`: treat input files as bacterial genomes and predict proteomes before analysis
-//! - `-k`, `--k`: k-mer length (default: 14; must be within the valid range for the
-//!   selected recoding scheme).
-//! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position
-//!   (default: 0.85; must be between 0.6 and 1.0, inclusive).
-//! - `-d`, `--depth`: maximum traversal depth from each start node (default: 12).
-//! - `-o`, `--output`: output prefix for generated files (default: `kamino`).
-//! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers
-//!   (default: 3; must be ≤ k-1).
-//! - `-l`, `--length-middle`: maximum number of middle positions per variant group
-//!   (default: 35; must be ≥ 1).
-//! - `-m`, `--mask`: mask middle segments with long mismatch runs (default: 5).
-//! - `-t`, `--threads`: number of threads used for graph construction and analysis
-//!   (default: 1).
-//! - `-r`, `--recode`: amino-acid recoding scheme (default: `sr6`).
+//! - `-k`, `--k`: k-mer length [k=13]
+//! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position [f=0.85]
+//! - `-o`, `--output`: output prefix for generated files [o=`kamino`]
+//! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers [c=3]
+//! - `-l`, `--length-middle`: maximum number of middle positions per variant group [l=35]
+//! - `-m`, `--mask`: mask middle segments with long mismatch runs [m=5]
+//! - `-t`, `--threads`: number of threads [t=1]
+//! - `-r`, `--recode`: amino-acid recoding scheme [r=`sr6`]
 //! - `--nj`: generate a NJ tree from kamino alignment [nj=false]
 //! - `-v`, `--version`: print version information and exit.
 //!
@@ -58,13 +52,8 @@
 //!    middle positions in variant groups, for example from 35 to 70. This allows longer
 //!    variant groups to be retained in the final alignment.
 //!
-//! Increasing the maximum recursive depth of the graph traversal may also recover
-//! more variant groups. However, the default is already quite high, and raising it,
-//! for example from 12 to 16, usually only marginally increases alignment size.
-//!
 //! Conversely, if the alignment is too large, you can increase the minimum fraction
-//! of samples, reduce the maximum length of middle positions, or decrease the maximum
-//! recursive depth of the graph traversal.
+//! of samples and/or reduce the maximum length of middle positions.
 //!
 //!
 //! ## Less important parameters
@@ -72,15 +61,15 @@
 //! Except for testing and benchmarking, I do not recommend changing these parameter
 //! values.
 //!
-//! The default k-mer size has been chosen to maximise the final alignment length.
-//! Increasing it usually does not substantially increase the number of variant
+//! The default k-mer size has been chosen to maximise the final alignment length in most
+//! conditions. Increasing it usually does not substantially increase the number of variant
 //! groups.
 //!
 //! The number of constant positions in the final alignment can be adjusted with the
 //! --constant parameter. These positions are taken from the left flank of the end
 //! k-mer in each variant group, next to the middle positions. Because these positions
 //! are recoded, some may become polymorphic once converted back to amino acids. With
-//! the default value of c = 3, constant positions represent about 50–60% of the
+//! the default value of c = 3, constant positions represent about 50% of the
 //! alignment.
 //!
 //! The --mask parameter controls the amino-acid masking performed by kamino to
@@ -113,118 +102,38 @@
 //! overview of isolate relationships and is not intended for detailed phylogenetic inference.
 //!
 use anyhow::Context;
-use clap::{ArgAction, Parser};
+use clap::Parser;
 
-mod bubbles;
-mod filter_groups;
-mod graph;
+mod group_extraction;
+mod group_filtering;
+mod group_sorting;
 mod io;
 mod output;
 mod phylo;
 mod proba_filter;
 mod protein_prediction;
 mod recode;
-mod revert_aminoacid;
-mod traverse;
-//mod util;
 
 pub use recode::RecodeScheme;
 
-struct TraversalArtifacts {
-    groups: traverse::VariantGroups,
-    species_names: Vec<String>,
-    n_species: usize,
-    recode_scheme: RecodeScheme,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_traverse(
-    species_inputs: &[io::SpeciesInput],
-    k: usize,
-    min_freq: f32,
-    depth: usize,
-    length_middle: usize,
-    num_threads: usize,
-    recode_scheme: RecodeScheme,
-) -> anyhow::Result<TraversalArtifacts> {
-    // Build global graph
-    let mut g = graph::Graph::new(k, recode_scheme);
-    io::build_graph_from_inputs(
-        species_inputs,
-        k,
-        min_freq,
-        length_middle,
-        &mut g,
-        num_threads,
-    )?;
-
-    // Basic stats
-    io::print_graph_size(&g);
-    //io::print_outdegree_histogram(&g);
-
-    // Bubble endpoints
-    let (start_kmers, end_kmers) = bubbles::find_bubble_endpoints(&g, min_freq, num_threads);
-    eprintln!(
-        "bubble endpoints: start={} end={}",
-        start_kmers.len(),
-        end_kmers.len()
-    );
-
-    // Traverse VGs
-    let groups = traverse::find_variant_groups(
-        &g,
-        &start_kmers,
-        &end_kmers,
-        depth,
-        min_freq,
-        length_middle,
-        num_threads,
-    );
-    let total_paths: usize = groups.values().map(|v| v.len()).sum();
-    eprintln!(
-        "variant groups: groups={} paths={}",
-        groups.len(),
-        total_paths
-    );
-
-    // Emit amino-acid sequences per path for each variant group (call disabled, keep for debugging)
-    // traverse::print_variant_group_sequences(&g, &groups);
-
-    Ok(TraversalArtifacts {
-        groups,
-        species_names: g.species_names.clone(),
-        n_species: g.n_species,
-        recode_scheme: g.recode_scheme,
-    })
-}
-
-/// Build a node-based, colored de Bruijn graph from amino-acid proteomes and analyze bubbles.
 #[derive(Parser, Debug)]
-#[command(name = "kamino", author, version, about, disable_version_flag = true)]
-#[command(
-    group = clap::ArgGroup::new("input_source")
-        .required(true)
-        .multiple(true)
-        .args(["input", "input_file"])
-)]
+#[command(name = "kamino", author, version, about)]
+#[command(group = clap::ArgGroup::new("input_source").required(true).multiple(true).args(["input", "input_file"]))]
+/// Parsed command-line options shared by the binary and integration tests.
 pub struct Args {
-    /// Input directory with FASTA proteomes (plain or .gz)
+    /// Directory containing one proteome FASTA per species.
     #[arg(short, long = "input-directory")]
     pub input: Option<std::path::PathBuf>,
-
-    /// Tab-delimited file mapping species name to proteome path
+    /// TSV table with `species_name<TAB>path_to_fasta` rows.
     #[arg(short = 'I', long = "input-file")]
     pub input_file: Option<std::path::PathBuf>,
-
-    /// Treat input files as bacterial genomes and predict proteomes before analysis
-    #[arg(long = "genomes", default_value_t = false, hide_default_value = true)]
+    /// Treat inputs as nucleotide genomes and predict proteins first.
+    #[arg(long = "genomes")]
     pub genomes: bool,
-
-    /// K-mer length [k=14]
+    /// k-mer size used for anchor extraction [k=13].
     #[arg(short, long)]
     pub k: Option<usize>,
-
-    /// Minimal fraction of samples with an amino-acid per position [f=0.85]
+    /// Minimum fraction of species required to support an anchor or output column [f=0.85].
     #[arg(
         short = 'f',
         long = "min-freq",
@@ -232,24 +141,21 @@ pub struct Args {
         hide_default_value = true
     )]
     pub min_freq: f32,
-
-    /// Maximum traversal depth from each start node [d=12]
-    #[arg(short, long, default_value_t = 12, hide_default_value = true)]
-    pub depth: usize,
-
-    /// Output prefix [o=kamino]
+    /// Output prefix used to derive alignment, missing-data, partition, and tree paths.
     #[arg(short, long, default_value = "kamino")]
     pub output: std::path::PathBuf,
-
-    /// Number of constant positions to keep from the in-bubble k-mer [c=3]
+    /// Number of constant right-anchor columns to append after each variable block [c=3].
     #[arg(short, long)]
     pub constant: Option<usize>,
-
-    /// Maximum number of middle positions per variant group [l=35]
-    #[arg(short = 'l', long = "length-middle", default_value_t = 35, hide_default_value = true)]
+    /// Maximum amino-acid length allowed between two adjacent shared anchors [l=35].
+    #[arg(
+        short = 'l',
+        long = "length-middle",
+        default_value_t = 35,
+        hide_default_value = true
+    )]
     pub length_middle: usize,
-
-    /// Mask middle segments with long mismatch runs [m=5]
+    /// Consecutive amino-acid differences from the group consensus required to mask a row [m=5]; 0 disables.
     #[arg(
         short = 'm',
         long = "mask",
@@ -257,178 +163,136 @@ pub struct Args {
         hide_default_value = true
     )]
     pub mask: usize,
-
-    /// Number of threads [t=1]
+    /// Number of worker threads used by parallel stages [t=1].
     #[arg(short = 't', long, default_value_t = 1, hide_default_value = true)]
     pub threads: usize,
-
-    /// Recoding scheme [r=sr6]
-    #[arg(short = 'r', long = "recode", value_enum, default_value_t = RecodeScheme::SR6, hide_default_value = true)]
+    /// Six-state amino-acid recoding scheme used before k-mer encoding [r=sr6].
+    #[arg(short='r', long="recode", value_enum, default_value_t=RecodeScheme::SR6, hide_default_value=true)]
     pub recode: RecodeScheme,
-
-    /// Generate a NJ tree from kamino alignment [nj=false]
-    #[arg(long = "nj", default_value_t = false, hide_default_value = true)]
+    /// Also write a neighbor-joining tree inferred from the concatenated alignment.
+    #[arg(long = "nj")]
     pub nj: bool,
-
-    /// Display version information.
-    #[arg(short = 'v', long = "version", action = ArgAction::Version)]
-    pub version: (),
 }
 
-pub fn run_with_args(args: Args) -> anyhow::Result<()> {
-    // k defaults and limits for SR6
-    let default_k = 14usize;
-    let max_k = 21usize;
-    let default_constant = 3usize;
+fn print_startup_banner(args: &Args, k: usize, constant: usize) {
+    let mut parameters = Vec::new();
 
+    if let Some(input) = args.input.as_ref() {
+        parameters.push(format!("input-directory={}", input.display()));
+    }
+    if let Some(input_file) = args.input_file.as_ref() {
+        parameters.push(format!("input-file={}", input_file.display()));
+    }
+    if args.genomes {
+        parameters.push("genomes=true".to_string());
+    }
+    parameters.push(format!("k={k}"));
+    parameters.push(format!("min-freq={}", args.min_freq));
+    parameters.push(format!("output={}", args.output.display()));
+    parameters.push(format!("constant={constant}"));
+    parameters.push(format!("length-middle={}", args.length_middle));
+    parameters.push(format!("mask={}", args.mask));
+    parameters.push(format!("threads={}", args.threads));
+    parameters.push(format!("recode={}", args.recode));
+    if args.nj {
+        parameters.push("nj=true".to_string());
+    }
+
+    eprintln!("kamino {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("parameters: {}", parameters.join(" "));
+}
+
+/// Validate arguments, collect inputs, run the analysis, and write output files.
+pub fn run_with_args(args: Args) -> anyhow::Result<()> {
+    // Defaults and bounds are kept here so tests and the CLI share identical behavior.
+    let default_k = 13usize;
+    let max_k = 21usize;
+    let k = args.k.unwrap_or(default_k);
+    let constant = args.constant.unwrap_or(3usize.min(k));
+    print_startup_banner(&args, k, constant);
     anyhow::ensure!(
         (0.6..=1.0).contains(&args.min_freq),
-        "min_freq ({}) must be between 0.6 and 1.0, inclusive.",
-        args.min_freq
+        "min_freq must be between 0.6 and 1.0"
     );
-    let min_freq = args.min_freq;
-
-    let k = args.k.unwrap_or(default_k);
-    anyhow::ensure!(
-        (2..=max_k).contains(&k),
-        "k={} is invalid for {}: allowed range is 2..={} (default {})",
-        k,
-        args.recode,
-        max_k,
-        default_k
-    );
-
-    // Validate constant against k-1
-    let k1 = k - 1;
-    let constant = args.constant.unwrap_or_else(|| default_constant.min(k1));
-    anyhow::ensure!(
-        constant <= k1,
-        "constant ({}) must be ≤ k-1 ({}).",
-        constant,
-        k1
-    );
-
-    anyhow::ensure!(
-        args.length_middle >= 1,
-        "length_middle ({}) must be ≥ 1.",
-        args.length_middle
-    );
-
-    // Decide how many threads to use (default: 1)
-    anyhow::ensure!(args.threads >= 1, "threads must be ≥ 1");
-
-    eprintln!("kamino v{}", env!("CARGO_PKG_VERSION"));
+    anyhow::ensure!(args.threads > 0, "threads must be >=1");
+    anyhow::ensure!((1..=max_k).contains(&k), "invalid k");
+    anyhow::ensure!(constant <= k, "constant <= k");
+    // Merge the optional input sources into one sorted list of species inputs.
     let mut species_inputs = Vec::new();
-    let mut input_labels: Vec<String> = Vec::new();
-
-    if let Some(table) = args.input_file.as_ref() {
-        input_labels.push(format!("input_file={}", table.display()));
-        species_inputs.extend(io::collect_species_inputs_from_table(table)?);
+    if let Some(t) = args.input_file.as_ref() {
+        species_inputs.extend(io::collect_species_inputs_from_table(t)?);
     }
-
-    if let Some(dir) = args.input.as_ref() {
-        input_labels.push(format!("input={}", dir.display()));
-        species_inputs.extend(io::collect_species_inputs_from_dir(dir)?);
+    if let Some(d) = args.input.as_ref() {
+        species_inputs.extend(io::collect_species_inputs_from_dir(d)?);
     }
-
     let output_dir = args
         .output
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    eprintln!("# process input files");
+    // Genome mode creates temporary predicted proteomes next to the output prefix;
+    // keeping the TempDir alive until the end guarantees those files remain readable.
     let mut genomes_tmpdir = None;
-
-    let input_label = input_labels.join(" ");
-
-    eprintln!(
-        "parameters: k={} constant={} min_freq={} depth={} length_middle={} mask={} threads={} recode={} {} output={}",
-        k,
-        constant,
-        min_freq,
-        args.depth,
-        args.length_middle,
-        args.mask,
-        args.threads,
-        args.recode,
-        input_label,
-        args.output.display()
-    );
-
     if args.genomes {
-        eprintln!("genome files: {}", species_inputs.len());
-
+        eprintln!(" . predict proteins from bacterial genomes");
         let tmpdir = tempfile::Builder::new()
             .prefix("tmp_kamino_")
             .rand_bytes(6)
             .tempdir_in(&output_dir)
-            .with_context(|| {
-                format!(
-                    "create temporary directory for predicted proteomes in {}",
-                    output_dir.display()
-                )
-            })?;
-
-        let predicted =
+            .with_context(|| format!("create temporary directory in {}", output_dir.display()))?;
+        species_inputs =
             protein_prediction::predict_proteomes(&species_inputs, tmpdir.path(), args.threads)?;
-        species_inputs = predicted;
-        input_labels.push("genomes=true".to_string());
         genomes_tmpdir = Some(tmpdir);
     }
-
     anyhow::ensure!(
         !species_inputs.is_empty(),
         "At least one input source with files must be provided."
     );
-
-    let traversal = run_traverse(
+    // The extraction, sorting, and filtering stages return in-memory rows and partition metadata;
+    // the output module owns all filesystem side effects after this point.
+    let raw_groups = group_extraction::extract_groups(
         &species_inputs,
         k,
-        min_freq,
-        args.depth,
+        args.min_freq,
         args.length_middle,
-        args.threads,
         args.recode,
-    )?;
-
-    let (alignment_len, alignment_missing_pct) = output::write_outputs_with_head(
-        &species_inputs,
-        &args.output,
-        &traversal.species_names,
-        traversal.n_species,
-        traversal.recode_scheme,
-        &traversal.groups,
-        k,
-        constant,
-        min_freq,
-        args.mask,
         args.threads,
-        args.nj,
     )?;
+    eprintln!("# analyse variant groups");
+    eprintln!(" . raw variant groups: {}", raw_groups.groups.len());
 
-    let (fas_path, tsv_path, partitions_path, tree_path) = output::output_paths(&args.output);
+    let sorted_groups = group_sorting::sort_and_deduplicate_groups(raw_groups, args.recode)?;
     eprintln!(
-        "alignment: length={} missing={:.1}%",
-        alignment_len, alignment_missing_pct
+        " . sorted variant groups: {}",
+        sorted_groups.raw_candidates.len()
     );
 
+    let res = group_filtering::filter_groups(
+        sorted_groups,
+        args.min_freq,
+        constant,
+        args.mask,
+        args.threads,
+    )?;
+    eprintln!(" . filtered variant groups: {}", res.partitions.len());
+
+    let (alen, amiss) = output::write_outputs(
+        &args.output,
+        &res.species_names,
+        res.concat,
+        res.partitions,
+        res.partition_names,
+        args.nj,
+        args.threads,
+    )?;
+
+    eprintln!("# output files");
+    eprintln!(" . alignment: length={} missing={:.1}%", alen, amiss);
     if args.nj {
-        eprintln!(
-            "output files:  {}, {}, {}, and {}",
-            fas_path.display(),
-            tsv_path.display(),
-            partitions_path.display(),
-            tree_path.display()
-        );
-    } else {
-        eprintln!(
-            "output files:  {}, {}, and {}",
-            fas_path.display(),
-            tsv_path.display(),
-            partitions_path.display()
-        );
+        eprintln!(" . NJ tree");
     }
-
     drop(genomes_tmpdir);
-
     Ok(())
 }
