@@ -220,6 +220,7 @@ fn consensus_protein_name(observations: &[BlockObs], protein_names: &[String]) -
         .join(" ")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_candidate_group(
     raw: RawDirectCandidate,
     arena: &BlockArena,
