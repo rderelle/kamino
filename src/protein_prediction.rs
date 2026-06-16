@@ -1148,3 +1148,140 @@ fn codon_to_aa_table11(a: u8, b: u8, c: u8) -> char {
         'X'
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_orf(scan_start: usize, scan_end: usize, strand: i8, total_score: i32) -> Orf {
+        Orf {
+            start: scan_start,
+            end: scan_end,
+            strand,
+            scan_start,
+            scan_end,
+            partial_5p: false,
+            partial_3p: false,
+            has_start_codon: true,
+            total_score,
+        }
+    }
+
+    #[test]
+    fn lookup_tables_encode_bases_complements_starts_and_stops() {
+        let nt2 = build_nt2_lut();
+        assert_eq!(nt2[b'A' as usize], 0);
+        assert_eq!(nt2[b'C' as usize], 1);
+        assert_eq!(nt2[b'G' as usize], 2);
+        assert_eq!(nt2[b'T' as usize], 3);
+        assert_eq!(nt2[b'N' as usize], INVALID_NT2);
+        assert_eq!(nt2[b'a' as usize], INVALID_NT2);
+
+        let complements = build_complement_lut();
+        assert_eq!(complements[b'A' as usize], b'T');
+        assert_eq!(complements[b'T' as usize], b'A');
+        assert_eq!(complements[b'C' as usize], b'G');
+        assert_eq!(complements[b'G' as usize], b'C');
+        assert_eq!(complements[b'a' as usize], b't');
+        assert_eq!(complements[b'n' as usize], b'N');
+
+        let starts = build_start_codon_lut();
+        assert_eq!(
+            starts[codon_index_fast(b'A', b'T', b'G').unwrap()],
+            Some(StartCodon::Atg)
+        );
+        assert_eq!(
+            starts[codon_index_fast(b'G', b'T', b'G').unwrap()],
+            Some(StartCodon::Gtg)
+        );
+        assert_eq!(
+            starts[codon_index_fast(b'T', b'T', b'G').unwrap()],
+            Some(StartCodon::Ttg)
+        );
+        assert_eq!(starts[codon_index_fast(b'A', b'C', b'G').unwrap()], None);
+
+        let stops = build_stop_lut();
+        assert!(stops[codon_index_fast(b'T', b'A', b'A').unwrap()]);
+        assert!(stops[codon_index_fast(b'T', b'A', b'G').unwrap()]);
+        assert!(stops[codon_index_fast(b'T', b'G', b'A').unwrap()]);
+        assert!(!stops[codon_index_fast(b'T', b'G', b'G').unwrap()]);
+    }
+
+    #[test]
+    fn adaptive_model_training_uses_high_scoring_complete_orfs_and_background() {
+        let rich = b"GCT".repeat(130);
+        let poor = b"AAA".repeat(130);
+        let mut fwd = Vec::with_capacity((rich.len() + poor.len()) * ADAPTIVE_MIN_TRAIN_ORFS);
+        let mut orfs = Vec::with_capacity(ADAPTIVE_MIN_TRAIN_ORFS * 2);
+
+        for i in 0..ADAPTIVE_MIN_TRAIN_ORFS {
+            let start = fwd.len();
+            fwd.extend_from_slice(&rich);
+            orfs.push(complete_orf(start, fwd.len(), 1, 10_000 - i as i32));
+        }
+        for i in 0..ADAPTIVE_MIN_TRAIN_ORFS {
+            let start = fwd.len();
+            fwd.extend_from_slice(&poor);
+            orfs.push(complete_orf(start, fwd.len(), 1, i as i32));
+        }
+
+        let rev = b"CCC".repeat(ADAPTIVE_MIN_TRAIN_ORFS * 130);
+        let model = train_adaptive_coding_model(&orfs, &fwd, &rev).expect("enough seed ORFs");
+
+        let gct = codon_index_fast(b'G', b'C', b'T').unwrap();
+        let aaa = codon_index_fast(b'A', b'A', b'A').unwrap();
+        assert!(model.codon_score_pm[gct] > 0);
+        assert!(model.codon_score_pm[aaa] < 0);
+    }
+
+    #[test]
+    fn adaptive_model_training_rejects_insufficient_or_partial_seed_orfs() {
+        let fwd = b"ATG".repeat(ADAPTIVE_MIN_TRAIN_ORFS * ADAPTIVE_TRAIN_MIN_AA);
+        let rev = b"CAT".repeat(ADAPTIVE_MIN_TRAIN_ORFS * ADAPTIVE_TRAIN_MIN_AA);
+        let too_few =
+            vec![complete_orf(0, ADAPTIVE_TRAIN_MIN_AA * 3, 1, 0); ADAPTIVE_MIN_TRAIN_ORFS - 1];
+        assert!(train_adaptive_coding_model(&too_few, &fwd, &rev).is_none());
+
+        let mut partial =
+            vec![complete_orf(0, ADAPTIVE_TRAIN_MIN_AA * 3, 1, 0); ADAPTIVE_MIN_TRAIN_ORFS];
+        for orf in &mut partial {
+            orf.partial_5p = true;
+        }
+        assert!(train_adaptive_coding_model(&partial, &fwd, &rev).is_none());
+    }
+
+    #[test]
+    fn adaptive_scores_are_clamped_and_added_per_strand() {
+        let gct = codon_index_fast(b'G', b'C', b'T').unwrap();
+        let aaa = codon_index_fast(b'A', b'A', b'A').unwrap();
+        let mut model = AdaptiveCodingModel {
+            codon_score_pm: [0; 64],
+        };
+        model.codon_score_pm[gct] = 2200;
+        model.codon_score_pm[aaa] = -2200;
+
+        assert_eq!(adaptive_coding_score(&b"GCT".repeat(34), &model), 0);
+        assert_eq!(adaptive_coding_score(&b"GCT".repeat(35), &model), 18);
+        assert_eq!(adaptive_coding_score(&b"AAA".repeat(35), &model), -18);
+
+        let fwd = b"GCT".repeat(35);
+        let rev = b"AAA".repeat(35);
+        let mut orfs = vec![
+            complete_orf(0, fwd.len(), 1, 5),
+            complete_orf(0, rev.len(), -1, 5),
+        ];
+        apply_adaptive_coding_scores(&mut orfs, &fwd, &rev, &model);
+        assert_eq!(orfs[0].total_score, 23);
+        assert_eq!(orfs[1].total_score, -13);
+    }
+
+    #[test]
+    fn accumulate_codon_counts_counts_only_complete_valid_codons() {
+        let mut counts = [0usize; 64];
+        accumulate_codon_counts(b"ATGGCTNNNT", &mut counts);
+
+        assert_eq!(counts[codon_index_fast(b'A', b'T', b'G').unwrap()], 1);
+        assert_eq!(counts[codon_index_fast(b'G', b'C', b'T').unwrap()], 1);
+        assert_eq!(counts.iter().sum::<usize>(), 2);
+    }
+}
