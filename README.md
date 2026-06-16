@@ -21,7 +21,7 @@ conda install bioconda::kamino
 
 ## Usage
 ### input
-Input consists of proteome files in FASTA format (gzipped or not), with one file per sample. Files can be placed in a single directory, specified with the `-i` argument. Files are then recognised by their extension (.fa,, .fas, .fasta, .faa, .fna; gzipped ot not) and filenames minus extensions become isolate names in the final alignment. 
+Input consists of proteome files in FASTA format (gzipped or not), with one file per sample. Files can be placed in a single directory, specified with the `-i` argument. Files are then recognised by their extension (.fa, .fas, .fasta, .faa, .fna; gzipped ot not) and filenames minus extensions become isolate names in the final alignment. 
 ```bash
 kamino -i <input_dir> -t 4
 ```
@@ -41,9 +41,9 @@ For **bacterial** isolates, the phylogenomic alignment can also be generated dir
 kamino -i <input_dir> -t 4 --genomes
 ```
 ### output
-kamino outputs a FASTA amino acid alignment, a file containing the percentage of missng date per isolate and a file containing variant group coordinates in the FASTA alignment.
+kamino outputs a FASTA amino acid alignment, a file containing the percentage of missing data per isolate, and a file containing variant group coordinates in the FASTA alignment. By default, these output files use the prefix 'kamino_', but this can be changed with the `-o` argument.
 
-Additionally, a Neighbour-joinging tree can be generated in addition to other output files by selecting the `--NJ` optional argument.
+Additionally, a Neighbour-joinging tree can be generated together with other output files by selecting the `--NJ` optional argument.
 
 ```bash
 kamino -i <input_dir> -t 4 --NJ
@@ -52,7 +52,7 @@ kamino -i <input_dir> -t 4 --NJ
 ## Documentation
 More information are available at https://docs.rs/kamino-cli/latest/kamino_cli/
 
-Please let me know if anything is unclear, and I'll update the doc accordingly.
+Please let me know if anything is unclear or missing, and I'll update the doc accordingly.
 
 ## Citation
 If you use kamino, please cite:
