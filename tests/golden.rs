@@ -12,7 +12,8 @@ mod common;
 
 struct GoldenCase {
     name: &'static str,
-    input_dir: &'static str,
+    input_dir: Option<&'static str>,
+    input_file: Option<&'static str>,
     expected_dir: &'static str,
     work_dir: &'static str,
     genomes: bool,
@@ -22,11 +23,19 @@ struct GoldenCase {
 }
 
 fn run_golden_case(case: GoldenCase) {
-    let input_dir = Path::new(case.input_dir);
     let expected_dir = Path::new(case.expected_dir);
     let work_dir = Path::new(case.work_dir);
 
-    common::assert_fixture_dirs(input_dir, expected_dir);
+    if let Some(input_dir) = case.input_dir {
+        common::assert_fixture_dirs(Path::new(input_dir), expected_dir);
+    }
+    if let Some(input_file) = case.input_file {
+        assert!(
+            Path::new(input_file).exists(),
+            "Input file {:?} does not exist",
+            input_file
+        );
+    }
 
     if work_dir.exists() {
         fs::remove_dir_all(work_dir).unwrap_or_else(|e| {
@@ -43,18 +52,28 @@ fn run_golden_case(case: GoldenCase) {
         );
     });
 
-    // Use an absolute path for input, but write outputs in work_dir.
-    let input_abs = input_dir.canonicalize().unwrap_or_else(|e| {
-        panic!(
-            "Failed to canonicalize input dir {:?} for golden case {}: {}",
-            input_dir, case.name, e
-        );
+    // Use absolute paths for inputs, but write outputs in work_dir.
+    let input_abs = case.input_dir.map(|input_dir| {
+        Path::new(input_dir).canonicalize().unwrap_or_else(|e| {
+            panic!(
+                "Failed to canonicalize input dir {:?} for golden case {}: {}",
+                input_dir, case.name, e
+            );
+        })
+    });
+    let input_file_abs = case.input_file.map(|input_file| {
+        Path::new(input_file).canonicalize().unwrap_or_else(|e| {
+            panic!(
+                "Failed to canonicalize input file {:?} for golden case {}: {}",
+                input_file, case.name, e
+            );
+        })
     });
     let output_prefix = work_dir.join("kamino");
 
     let args = Args {
-        input: Some(input_abs),
-        input_file: None,
+        input: input_abs,
+        input_file: input_file_abs,
         genomes: case.genomes,
         k: None,
         min_freq: 0.85,
@@ -78,7 +97,8 @@ fn run_golden_case(case: GoldenCase) {
 fn golden_3diff() {
     run_golden_case(GoldenCase {
         name: "3diff",
-        input_dir: "tests/data/test_3diff/input",
+        input_dir: Some("tests/data/test_3diff/input"),
+        input_file: None,
         expected_dir: "tests/data/test_3diff/expected",
         work_dir: "target/test_3diff_rs",
         genomes: false,
@@ -89,10 +109,26 @@ fn golden_3diff() {
 }
 
 #[test]
+fn golden_3diff_input_file_kgb6() {
+    run_golden_case(GoldenCase {
+        name: "3diff_input_file_kgb6",
+        input_dir: None,
+        input_file: Some("tests/data/test_3diff/input.tsv"),
+        expected_dir: "tests/data/test_3diff/expected",
+        work_dir: "target/test_3diff_input_file_kgb6_rs",
+        genomes: false,
+        length_middle: 35,
+        recode: RecodeScheme::KGB6,
+        nj: true,
+    });
+}
+
+#[test]
 fn golden_genomes() {
     run_golden_case(GoldenCase {
         name: "genomes",
-        input_dir: "tests/data/test_genomes/input",
+        input_dir: Some("tests/data/test_genomes/input"),
+        input_file: None,
         expected_dir: "tests/data/test_genomes/expected",
         work_dir: "target/test_genomes_rs",
         genomes: true,
