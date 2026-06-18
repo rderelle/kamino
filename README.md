@@ -57,7 +57,7 @@ Please let me know if anything is unclear or missing, and I'll update the doc ac
 ## Citation
 If you use kamino, please cite:
 
-> Derelle, Romain and Lees, John A. and Chindelevitch, Leonid. 2026
+> Romain Derelle, John A. Lees and Leonid Chindelevitch. 2026.
 > kamino: proteome-wide variant calling for amino acid phylogenomics.
 > https://www.biorxiv.org/content/10.64898/2026.05.21.726148v1
 
