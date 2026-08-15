@@ -257,6 +257,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         k,
         args.min_freq,
         args.length_middle,
+        constant,
         args.recode,
         args.threads,
     )?;
