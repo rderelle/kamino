@@ -3,7 +3,7 @@ use anyhow::Result;
 use hashbrown::{HashMap, HashSet};
 use rayon::{prelude::*, ThreadPoolBuilder};
 
-use crate::group_extraction::{BlockArena, BlockObs};
+use crate::group_extraction::{BlockArena, RawGroup};
 use crate::group_sorting::{consensus_rows_by_isolate, RawDirectCandidate, SortedGroups};
 use crate::recode::recode_byte;
 use crate::RecodeScheme;
@@ -140,15 +140,16 @@ fn missing_fraction(rows: &[Vec<u8>], col: usize, n_species: usize) -> f32 {
     (miss as f32) / (n_species as f32)
 }
 
-fn consensus_protein_name(observations: &[BlockObs], protein_names: &[String]) -> String {
+fn consensus_protein_name(group: &RawGroup, protein_names: &[String]) -> String {
     // Build a majority-rule label from all non-empty protein names supporting this
     // variant group. A word is retained when it occurs in at least 50% of names.
     // Retained words are then ordered by their average position across the original
     // names in which they occur, so prefixes/suffixes keep their natural location
     // even when the first observed protein name has a different wording.
-    let names: Vec<&str> = observations
+    let names: Vec<&str> = group
+        .occurrences
         .iter()
-        .filter_map(|obs| protein_names.get(obs.protein_id as usize))
+        .filter_map(|occurrence| protein_names.get(occurrence.protein_id as usize))
         .filter_map(|name| {
             name.trim()
                 .split_once(char::is_whitespace)
@@ -226,21 +227,22 @@ fn build_candidate_group(
     arena: &BlockArena,
     protein_names: &[String],
     n: usize,
-    k: usize,
+    _k: usize,
     constant: usize,
     min_freq: f32,
     mask: usize,
     recode_scheme: RecodeScheme,
 ) -> Option<CandidateGroup> {
-    let name = consensus_protein_name(&raw.selected, protein_names);
-    let mut rows = consensus_rows_by_isolate(&raw.selected, arena, n, raw.raw_len);
-    let mid_start = k;
-    let mid_end = raw.raw_len - k;
+    let name = consensus_protein_name(&raw.group, protein_names);
+    let stored_len = raw.middle_len + constant;
+    let mut rows = consensus_rows_by_isolate(&raw.group, arena, n, stored_len);
+    let mid_start = 0;
+    let mid_end = raw.middle_len;
     if mid_end <= mid_start {
         return None;
     }
     if mask > 0 {
-        let consensus = majority_recoded_consensus(&rows, raw.raw_len, recode_scheme);
+        let consensus = majority_recoded_consensus(&rows, stored_len, recode_scheme);
         mask_rows_with_long_divergence(&mut rows, &consensus, mask, recode_scheme);
     }
 
@@ -268,14 +270,13 @@ fn build_candidate_group(
         return None;
     };
     let mut keep_cols: Vec<usize> = retained_middle[first_poly_idx..=last_poly_idx].to_vec();
-    
-    let tail_keep = constant.min(k);
-    for c in mid_end..(mid_end + tail_keep).min(raw.raw_len) {
+
+    for c in mid_end..stored_len {
         if missing_fraction(&rows, c, n) <= 1.0 - min_freq {
             keep_cols.push(c);
         }
     }
-    
+
     let kept_len = keep_cols.len();
     let mut kept_rows = Vec::with_capacity(n * kept_len);
     for row in &rows {
@@ -302,10 +303,12 @@ pub(crate) fn filter_groups(
         raw_candidates,
         protein_names,
         k,
+        constant: stored_constant,
         min_needed: _min_needed,
         n_species: n,
         recode_scheme,
     } = sorted;
+    debug_assert_eq!(constant, stored_constant);
     let mut partitions = Vec::new();
     let mut names = Vec::new();
     let mut pos = 0usize;
@@ -365,37 +368,45 @@ pub(crate) fn filter_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::group_extraction::BlockArena;
+    use crate::group_extraction::{BlockArena, BlockOccurrence};
     use crate::group_sorting::RawDirectCandidate;
 
-    fn obs(arena: &mut BlockArena, sid: u16, aa: &[u8]) -> BlockObs {
-        BlockObs {
-            sid,
-            protein_id: sid as u32,
-            aa: arena.push(aa).unwrap(),
+    fn candidate(rows: &[&[u8]], arena: &mut BlockArena, constant: usize) -> RawDirectCandidate {
+        let mut group = RawGroup::default();
+        for (sid, &aa) in rows.iter().enumerate() {
+            let sequence_id = group
+                .sequences
+                .iter()
+                .position(|&block| arena.get(block) == aa)
+                .unwrap_or_else(|| {
+                    group.sequences.push(arena.push(aa).unwrap());
+                    group.sequences.len() - 1
+                }) as u32;
+            group.occurrences.push(BlockOccurrence {
+                sid: sid as u16,
+                protein_id: sid as u32,
+                sequence_id,
+            });
         }
-    }
-
-    fn candidate(rows: &[&[u8]], arena: &mut BlockArena) -> RawDirectCandidate {
         RawDirectCandidate {
             key: (1, 2),
             coverage: rows.len(),
-            raw_len: rows[0].len(),
-            selected: rows
-                .iter()
-                .enumerate()
-                .map(|(sid, aa)| obs(arena, sid as u16, aa))
-                .collect(),
+            middle_len: rows[0].len() - constant,
+            group,
         }
     }
 
     fn sorted(rows: &[&[u8]]) -> SortedGroups {
-        sorted_with_k(rows, 1)
+        sorted_with_layout(rows, 1, 0)
     }
 
     fn sorted_with_k(rows: &[&[u8]], k: usize) -> SortedGroups {
+        sorted_with_layout(rows, k, k)
+    }
+
+    fn sorted_with_layout(rows: &[&[u8]], k: usize, constant: usize) -> SortedGroups {
         let mut arena = BlockArena::new();
-        let raw_candidates = vec![candidate(rows, &mut arena)];
+        let raw_candidates = vec![candidate(rows, &mut arena, constant)];
         SortedGroups {
             arena,
             species_names: (0..rows.len())
@@ -404,6 +415,7 @@ mod tests {
             raw_candidates,
             protein_names: vec!["protein".to_string(); rows.len()],
             k,
+            constant,
             min_needed: 1,
             n_species: rows.len(),
             recode_scheme: RecodeScheme::SR6,
@@ -418,6 +430,40 @@ mod tests {
             majority_recoded_consensus(&rows, 3, RecodeScheme::SR6),
             vec![Some(1), Some(0), None]
         );
+    }
+
+    #[test]
+    fn protein_name_consensus_uses_original_interleaved_occurrence_order() {
+        let group = RawGroup {
+            sequences: Vec::new(),
+            occurrences: vec![
+                BlockOccurrence {
+                    sid: 0,
+                    protein_id: 0,
+                    sequence_id: 0,
+                },
+                BlockOccurrence {
+                    sid: 1,
+                    protein_id: 1,
+                    sequence_id: 1,
+                },
+                BlockOccurrence {
+                    sid: 2,
+                    protein_id: 2,
+                    sequence_id: 0,
+                },
+                BlockOccurrence {
+                    sid: 3,
+                    protein_id: 3,
+                    sequence_id: 1,
+                },
+            ],
+        };
+        let names = vec!["p0 alpha", "p1 beta", "p2 beta", "p3 alpha"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(consensus_protein_name(&group, &names), "alpha beta");
     }
 
     #[test]
@@ -528,7 +574,7 @@ mod tests {
     #[test]
     fn right_anchor_tail_is_appended_after_polymorphic_middle() {
         let rows = &[b"ACEFT".as_slice(), b"ACHFT", b"ACEFT", b"ACHFT"];
-        let result = filter_groups(sorted(rows), 1.0, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 1.0, 1, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 1, 2)]);
         assert_eq!(result.concat[0], b"ET".to_vec());
@@ -540,7 +586,7 @@ mod tests {
     #[test]
     fn polymorphic_right_anchor_tail_cannot_rescue_conserved_middle() {
         let rows = &[b"ACCD".as_slice(), b"ACCE", b"ACCD", b"ACCE"];
-        let result = filter_groups(sorted(rows), 1.0, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 1.0, 1, 0, 1).unwrap();
 
         assert!(result.partitions.is_empty());
         assert!(result.concat.iter().all(Vec::is_empty));
@@ -558,7 +604,7 @@ mod tests {
     #[test]
     fn retains_group_with_retained_polymorphic_middle_column() {
         let rows = &[b"ACGT".as_slice(), b"ADGT", b"ACGT", b"ADGT"];
-        let result = filter_groups(sorted(rows), 0.75, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 1, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 1, 2)]);
         assert_eq!(result.concat[0], b"CT".to_vec());
@@ -570,7 +616,7 @@ mod tests {
     #[test]
     fn constant_tail_cannot_rescue_without_retained_polymorphic_middle() {
         let rows = &[b"AC-T".as_slice(), b"AD-T", b"A--T", b"A--T"];
-        let result = filter_groups(sorted(rows), 0.75, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 1, 0, 1).unwrap();
 
         assert!(result.partitions.is_empty());
         assert!(result.concat.iter().all(Vec::is_empty));
@@ -578,7 +624,7 @@ mod tests {
 
     #[test]
     fn middle_is_trimmed_on_both_sides_before_appending_constants() {
-        let rows = &[b"AAAQFCPQRRR".as_slice(), b"AAAQDCDQRRR"];
+        let rows = &[b"QFCPQRRR".as_slice(), b"QDCDQRRR"];
         let result = filter_groups(sorted_with_k(rows, 3), 1.0, 3, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 5, 6)]);
@@ -588,7 +634,7 @@ mod tests {
 
     #[test]
     fn final_middle_column_before_constants_is_polymorphic() {
-        let rows = &[b"AAAQFCPQRRR".as_slice(), b"AAAQDCDQRRR"];
+        let rows = &[b"QFCPQRRR".as_slice(), b"QDCDQRRR"];
         let result = filter_groups(sorted_with_k(rows, 3), 1.0, 3, 0, 1).unwrap();
         let tail_keep = 3;
         let middle_len = result.partitions[0].2 - tail_keep;
@@ -642,8 +688,8 @@ mod tests {
 
     #[test]
     fn constant_zero_emits_only_trimmed_polymorphic_middle_region() {
-        let rows = &[b"AAAQFCPQRRR".as_slice(), b"AAAQDCDQRRR"];
-        let result = filter_groups(sorted_with_k(rows, 3), 1.0, 0, 0, 1).unwrap();
+        let rows = &[b"QFCPQRRR".as_slice(), b"QDCDQRRR"];
+        let result = filter_groups(sorted_with_layout(rows, 3, 0), 1.0, 0, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 2, 3)]);
         assert_eq!(result.concat[0], b"FCP".to_vec());
@@ -683,7 +729,7 @@ mod tests {
     #[test]
     fn constant_tail_columns_failing_missingness_are_not_appended() {
         let rows = &[b"ACT".as_slice(), b"AD-", b"AC-", b"AD-"];
-        let result = filter_groups(sorted(rows), 0.75, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 1, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 0, 1)]);
         assert_eq!(result.concat[0], b"C".to_vec());

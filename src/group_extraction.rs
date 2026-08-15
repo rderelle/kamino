@@ -99,12 +99,6 @@ impl BlockArena {
         })
     }
 
-    pub(crate) fn append(&mut self, other: &BlockArena) -> usize {
-        let offset = self.data.len();
-        self.data.extend_from_slice(&other.data);
-        offset
-    }
-
     #[inline]
     pub(crate) fn get(&self, block: BlockAa) -> &[u8] {
         let start = block.start;
@@ -115,18 +109,28 @@ impl BlockArena {
 
 /// Pair of left/right recoded anchors that brackets one candidate variable block.
 pub(crate) type AnchorPair = (u64, u64);
-#[derive(Clone, Copy, Debug)]
-/// One observed amino-acid block between the same anchor pair in one species.
-pub(crate) struct BlockObs {
-    /// Zero-based species index; kept compact because it is stored for every hit.
-    pub sid: u16,
-    /// Compact index into the global protein-name table.
-    pub protein_id: u32,
-    /// Original amino-acid characters spanning left anchor, middle, and right anchor.
-    pub aa: BlockAa,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockOccurrence {
+    pub(crate) sid: u16,
+    pub(crate) protein_id: u32,
+    pub(crate) sequence_id: u32,
 }
-/// All raw observations grouped by their bracketing anchor pair.
-pub(crate) type RawDirectGroups = HashMap<AnchorPair, Vec<BlockObs>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct RawGroup {
+    /// Unique middle + right-anchor-prefix sequences, in first-occurrence order.
+    pub(crate) sequences: Vec<BlockAa>,
+    /// Every occurrence in its original deterministic order.
+    pub(crate) occurrences: Vec<BlockOccurrence>,
+}
+pub(crate) type RawDirectGroups = HashMap<AnchorPair, RawGroup>;
+
+#[derive(Clone, Copy, Debug)]
+struct LocalBlockObs {
+    protein_id: u32,
+    aa: BlockAa,
+}
+type LocalRawDirectGroups = HashMap<AnchorPair, Vec<LocalBlockObs>>;
 
 #[derive(Clone, Copy, Debug)]
 /// One rolling `k`-mer hit and the sequence interval it covers.
@@ -180,9 +184,10 @@ fn extract_bubble_pairs(
     start_anchors: &[KmerHit],
     end_anchors: &[KmerHit],
     length_middle: usize,
-    sid: u16,
+    constant: usize,
+    _sid: u16,
     protein_id: u32,
-    groups: &mut RawDirectGroups,
+    groups: &mut LocalRawDirectGroups,
     arena: &mut BlockArena,
 ) -> Result<()> {
     let mut first_end = 0usize;
@@ -231,10 +236,9 @@ fn extract_bubble_pairs(
         groups
             .entry((left.kmer, right.kmer))
             .or_default()
-            .push(BlockObs {
-                sid,
+            .push(LocalBlockObs {
                 protein_id,
-                aa: arena.push(&aa[left.start..right.end])?,
+                aa: arena.push(&aa[left.end..right.start + constant])?,
             });
     }
 
@@ -250,9 +254,10 @@ fn extract_from_valid_segment(
     cms: &CountMinSketch,
     min_needed: u32,
     length_middle: usize,
+    constant: usize,
     sid: u16,
     protein_id: u32,
-    groups: &mut RawDirectGroups,
+    groups: &mut LocalRawDirectGroups,
     arena: &mut BlockArena,
 ) -> Result<()> {
     // This function works only on already-valid amino-acid stretches. Unknown or
@@ -314,6 +319,7 @@ fn extract_from_valid_segment(
         &start_anchors,
         &end_anchors,
         length_middle,
+        constant,
         sid,
         protein_id,
         groups,
@@ -327,7 +333,7 @@ struct SpeciesExtraction {
     /// Raw amino-acid bytes referenced by this species' block observations.
     arena: BlockArena,
     /// Raw block observations produced by this species.
-    groups: RawDirectGroups,
+    groups: LocalRawDirectGroups,
     /// Protein descriptions indexed by per-observation protein IDs.
     protein_names: Vec<String>,
 }
@@ -343,17 +349,34 @@ fn merge_species_extraction(
         bail!("too many protein records across all species to index with u32");
     }
     protein_names.extend(extraction.protein_names);
-    let arena_offset = arena.append(&extraction.arena);
     for (key, observations) in extraction.groups {
-        let mut merged_observations = Vec::with_capacity(observations.len());
-        for mut obs in observations {
-            obs.protein_id += protein_offset as u32;
-            obs.aa.start += arena_offset;
-            merged_observations.push(obs);
+        let group = groups.entry(key).or_default();
+        for obs in observations {
+            let sequence = extraction.arena.get(obs.aa);
+            let sequence_id = if let Some(id) = find_sequence_id(group, sequence, arena) {
+                id
+            } else {
+                let id = u32::try_from(group.sequences.len())
+                    .map_err(|_| anyhow!("too many unique sequences for one anchor pair"))?;
+                group.sequences.push(arena.push(sequence)?);
+                id
+            };
+            group.occurrences.push(BlockOccurrence {
+                sid: extraction.sid as u16,
+                protein_id: obs.protein_id + protein_offset as u32,
+                sequence_id,
+            });
         }
-        groups.entry(key).or_default().extend(merged_observations);
     }
     Ok(())
+}
+
+fn find_sequence_id(group: &RawGroup, sequence: &[u8], arena: &BlockArena) -> Option<u32> {
+    group
+        .sequences
+        .iter()
+        .position(|&block| arena.get(block) == sequence)
+        .and_then(|id| u32::try_from(id).ok())
 }
 
 fn count_species_kmers(
@@ -412,13 +435,14 @@ fn extract_species_blocks(
     cms: &CountMinSketch,
     min_needed: u32,
     length_middle: usize,
+    constant: usize,
     recode_scheme: RecodeScheme,
 ) -> Result<SpeciesExtraction> {
     // Split each protein at ambiguous residues. Valid stretches are independently
     // scanned for adjacent shared-anchor runs.
     let rdr = open_fasta(&input.path)?;
     let mut r = FastaReader::new(rdr);
-    let mut groups: RawDirectGroups = HashMap::new();
+    let mut groups: LocalRawDirectGroups = HashMap::new();
     let mut arena = BlockArena::new();
     let mut protein_names = Vec::new();
     let min_block_len = 2 * k + 1;
@@ -468,6 +492,7 @@ fn extract_species_blocks(
                         cms,
                         min_needed,
                         length_middle,
+                        constant,
                         sid as u16,
                         protein_id,
                         &mut groups,
@@ -490,6 +515,7 @@ fn extract_species_blocks(
                 cms,
                 min_needed,
                 length_middle,
+                constant,
                 sid as u16,
                 protein_id,
                 &mut groups,
@@ -510,14 +536,16 @@ fn extract_species_blocks(
 pub(crate) struct RawExtractedGroups {
     /// Species names in deterministic row order.
     pub(crate) species_names: Vec<String>,
-    /// Global amino-acid bytes referenced by raw observations.
+    /// Stored middle amino acids and right-anchor prefixes referenced by observations.
     pub(crate) arena: BlockArena,
     /// Raw block observations grouped by original bracketing anchor pairs.
     pub(crate) groups: RawDirectGroups,
     /// Global protein-name table referenced by raw observations.
     pub(crate) protein_names: Vec<String>,
-    /// Anchor length used to split left/right anchors from middle columns.
+    /// Length of each complete recoded anchor in the logical full path.
     pub(crate) k: usize,
+    /// Number of original right-anchor amino acids stored after each middle.
+    pub(crate) constant: usize,
     /// Minimum species support threshold used during extraction.
     pub(crate) min_needed: usize,
     /// Number of species represented by `species_names`.
@@ -529,6 +557,7 @@ pub(crate) fn extract_groups(
     k: usize,
     min_freq: f32,
     length_middle: usize,
+    constant: usize,
     recode_scheme: RecodeScheme,
     num_threads: usize,
 ) -> Result<RawExtractedGroups> {
@@ -599,6 +628,7 @@ pub(crate) fn extract_groups(
                             &cms,
                             min_needed,
                             length_middle,
+                            constant,
                             recode_scheme,
                         )
                         .map(|extraction| (extraction.sid, extraction));
@@ -654,6 +684,7 @@ pub(crate) fn extract_groups(
         groups,
         protein_names,
         k,
+        constant,
         min_needed: min_needed as usize,
         n_species: n,
     })
@@ -687,14 +718,49 @@ mod tests {
         assert_eq!(arena.get(second), b"EFGH");
     }
 
+    #[test]
+    fn bubble_extraction_stores_middle_and_only_requested_right_prefix() {
+        let aa = b"AAABBCCCD";
+        let left = KmerHit {
+            kmer: 1,
+            start: 0,
+            end: 3,
+            occupancy: 2,
+            shared: true,
+        };
+        let right = KmerHit {
+            kmer: 2,
+            start: 5,
+            end: 8,
+            occupancy: 2,
+            shared: true,
+        };
+        for (constant, expected) in [(2, b"BBCC".as_slice()), (0, b"BB".as_slice())] {
+            let mut groups = LocalRawDirectGroups::new();
+            let mut arena = BlockArena::new();
+            extract_bubble_pairs(
+                aa,
+                &[left],
+                &[right],
+                10,
+                constant,
+                0,
+                0,
+                &mut groups,
+                &mut arena,
+            )
+            .unwrap();
+            assert_eq!(arena.get(groups[&(1, 2)][0].aa), expected);
+        }
+    }
+
     fn extraction(sid: usize, protein: &str, key: AnchorPair, aa: &[u8]) -> SpeciesExtraction {
         let mut arena = BlockArena::new();
         let block = arena.push(aa).unwrap();
-        let mut groups = RawDirectGroups::new();
+        let mut groups = LocalRawDirectGroups::new();
         groups.insert(
             key,
-            vec![BlockObs {
-                sid: sid as u16,
+            vec![LocalBlockObs {
                 protein_id: 0,
                 aa: block,
             }],
@@ -705,6 +771,95 @@ mod tests {
             groups,
             protein_names: vec![protein.to_string()],
         }
+    }
+
+    fn extraction_many(sid: usize, key: AnchorPair, rows: &[(&str, &[u8])]) -> SpeciesExtraction {
+        let mut arena = BlockArena::new();
+        let observations = rows
+            .iter()
+            .enumerate()
+            .map(|(protein_id, &(_, aa))| LocalBlockObs {
+                protein_id: protein_id as u32,
+                aa: arena.push(aa).unwrap(),
+            })
+            .collect();
+        SpeciesExtraction {
+            sid,
+            arena,
+            groups: [(key, observations)].into_iter().collect(),
+            protein_names: rows.iter().map(|(name, _)| (*name).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn deterministic_merge_interns_exact_sequences_and_keeps_every_occurrence() {
+        let key = (3, 5);
+        let mut groups = RawDirectGroups::new();
+        let mut arena = BlockArena::new();
+        let mut names = Vec::new();
+        for extraction in [
+            extraction_many(0, key, &[("p0", b"ABC"), ("p1", b"ABC")]),
+            extraction_many(1, key, &[("p2", b"ABD")]),
+            extraction_many(2, key, &[("p3", b"ABC")]),
+        ] {
+            merge_species_extraction(extraction, &mut groups, &mut arena, &mut names).unwrap();
+        }
+        let group = &groups[&key];
+        assert_eq!(group.sequences.len(), 2);
+        assert_eq!(group.occurrences.len(), 4);
+        assert_eq!(
+            group
+                .occurrences
+                .iter()
+                .map(|o| o.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 0]
+        );
+        assert_eq!(
+            group
+                .occurrences
+                .iter()
+                .map(|o| o.protein_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(arena.data.len(), 6);
+        assert_eq!(arena.get(group.sequences[0]), b"ABC");
+        assert_eq!(arena.get(group.sequences[1]), b"ABD");
+    }
+
+    #[test]
+    fn repeated_occurrences_store_one_block_per_distinct_sequence() {
+        let key = (7, 9);
+        let variants: [&[u8]; 4] = [
+            b"ABCDEFGHIJKLMNOPQRST",
+            b"ABCDEFGHIJKLMNOPQRSU",
+            b"ABCDEFGHIJKLMNOPQRSV",
+            b"ABCDEFGHIJKLMNOPQRSW",
+        ];
+        let rows: Vec<(&str, &[u8])> = (0..100)
+            .map(|i| ("protein", variants[i % variants.len()]))
+            .collect();
+        let extraction = extraction_many(0, key, &rows);
+        let mut groups = RawDirectGroups::new();
+        let mut arena = BlockArena::new();
+        merge_species_extraction(extraction, &mut groups, &mut arena, &mut Vec::new()).unwrap();
+        assert_eq!(groups[&key].sequences.len(), 4);
+        assert_eq!(groups[&key].occurrences.len(), 100);
+        assert_eq!(arena.data.len(), 80);
+    }
+
+    #[test]
+    fn one_hundred_identical_occurrences_store_one_sequence_copy() {
+        let key = (11, 13);
+        let rows = vec![("protein", b"ABCDEFGHIJKLMNOPQRST".as_slice()); 100];
+        let extraction = extraction_many(0, key, &rows);
+        let mut groups = RawDirectGroups::new();
+        let mut arena = BlockArena::new();
+        merge_species_extraction(extraction, &mut groups, &mut arena, &mut Vec::new()).unwrap();
+        assert_eq!(groups[&key].sequences.len(), 1);
+        assert_eq!(groups[&key].occurrences.len(), 100);
+        assert_eq!(arena.data.len(), 20);
     }
 
     #[test]
@@ -730,20 +885,25 @@ mod tests {
         }
 
         assert_eq!(protein_names, vec!["protein_0", "protein_1", "protein_2"]);
-        let observations = groups.get(&key).unwrap();
+        let group = groups.get(&key).unwrap();
         assert_eq!(
-            observations.iter().map(|obs| obs.sid).collect::<Vec<_>>(),
+            group
+                .occurrences
+                .iter()
+                .map(|obs| obs.sid)
+                .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
         assert_eq!(
-            observations
+            group
+                .occurrences
                 .iter()
                 .map(|obs| obs.protein_id)
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        assert_eq!(arena.get(observations[0].aa), b"AAAA");
-        assert_eq!(arena.get(observations[1].aa), b"BBBB");
-        assert_eq!(arena.get(observations[2].aa), b"CCCC");
+        assert_eq!(arena.get(group.sequences[0]), b"AAAA");
+        assert_eq!(arena.get(group.sequences[1]), b"BBBB");
+        assert_eq!(arena.get(group.sequences[2]), b"CCCC");
     }
 }

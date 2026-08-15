@@ -3,7 +3,7 @@ use hashbrown::HashSet;
 
 use anyhow::Result;
 
-use crate::group_extraction::{AnchorPair, BlockArena, BlockObs, RawExtractedGroups};
+use crate::group_extraction::{AnchorPair, BlockArena, RawExtractedGroups, RawGroup};
 use crate::recode::{recode_byte, RECODE_BITS_PER_SYMBOL};
 use crate::RecodeScheme;
 
@@ -65,8 +65,8 @@ struct LengthSupport {
 
 struct LengthFilteredGroup {
     key: AnchorPair,
-    selected: Vec<BlockObs>,
-    len: usize,
+    group: RawGroup,
+    middle_len: usize,
     coverage: usize,
 }
 
@@ -81,27 +81,31 @@ pub(crate) struct RawDirectCandidate {
     pub(crate) key: AnchorPair,
     /// Number of species supporting the selected block length.
     pub(crate) coverage: usize,
-    /// Full raw block length before consensus collapse and column filtering.
-    pub(crate) raw_len: usize,
-    /// Raw observations with the selected best-supported block length.
-    pub(crate) selected: Vec<BlockObs>,
+    /// Length of the variable middle between the two anchors.
+    pub(crate) middle_len: usize,
+    /// Deduplicated sequences and ordered occurrences for the selected middle length.
+    pub(crate) group: RawGroup,
 }
 
 fn select_unique_best_supported_length(
     key: AnchorPair,
-    obs: &[BlockObs],
+    mut group: RawGroup,
     n_species: usize,
     min_needed: usize,
-    k: usize,
+    constant: usize,
 ) -> Result<LengthFilteredGroup, LengthSupportReject> {
     let mut by_len: Vec<LengthSupport> = Vec::with_capacity(4);
-    for o in obs {
-        let len = o.aa.len();
+    for occurrence in &group.occurrences {
+        let block = group.sequences[occurrence.sequence_id as usize];
+        let len = block
+            .len()
+            .checked_sub(constant)
+            .ok_or(LengthSupportReject::ShortBlock)?;
         if let Some(bucket) = by_len.iter_mut().find(|bucket| bucket.len == len) {
-            bucket.species.insert(o.sid as usize);
+            bucket.species.insert(occurrence.sid as usize);
         } else {
             let mut species = SpeciesMask::new(n_species);
-            species.insert(o.sid as usize);
+            species.insert(occurrence.sid as usize);
             by_len.push(LengthSupport { len, species });
         }
     }
@@ -124,20 +128,34 @@ fn select_unique_best_supported_length(
     if best.1 < min_needed {
         return Err(LengthSupportReject::LowSupport);
     }
-    if best.0 < 2 * k + 1 {
+    if best.0 < 1 {
         return Err(LengthSupportReject::ShortBlock);
     }
 
-    let selected = obs
-        .iter()
-        .filter(|o| o.aa.len() == best.0)
-        .cloned()
-        .collect();
+    let mut remap = vec![u32::MAX; group.sequences.len()];
+    let mut sequences = Vec::with_capacity(group.sequences.len());
+    for (old_id, block) in group.sequences.into_iter().enumerate() {
+        if block.len().checked_sub(constant) == Some(best.0) {
+            let new_id = sequences.len() as u32;
+            remap[old_id] = new_id;
+            sequences.push(block);
+        }
+    }
+    group.sequences = sequences;
+    group.occurrences.retain_mut(|occurrence| {
+        let new_id = remap[occurrence.sequence_id as usize];
+        if new_id == u32::MAX {
+            false
+        } else {
+            occurrence.sequence_id = new_id;
+            true
+        }
+    });
 
     Ok(LengthFilteredGroup {
         key,
-        selected,
-        len: best.0,
+        group,
+        middle_len: best.0,
         coverage: best.1,
     })
 }
@@ -152,10 +170,14 @@ fn kmer_mask(k: usize) -> u64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn path_has_used_kmer(
-    observations: &[BlockObs],
+    sequences: &[crate::group_extraction::BlockAa],
+    key: AnchorPair,
     arena: &BlockArena,
     k: usize,
+    anchor_k: usize,
+    middle_len: usize,
     recode_scheme: RecodeScheme,
     used_global: &HashSet<u64>,
 ) -> bool {
@@ -165,32 +187,33 @@ fn path_has_used_kmer(
     // allocating, sorting, or deduplicating a per-candidate k-mer vector.
     let mask = kmer_mask(k);
 
-    for obs in observations {
-        let aa = arena.get(obs.aa);
-
-        if aa.len() < k {
-            continue;
-        }
-
+    for &block in sequences {
         let mut val = 0u64;
         let mut have = 0usize;
-
-        for &b in aa {
-            let c = recode_byte(b, recode_scheme);
-
+        let mut feed = |c: u8| {
             if c == 255 {
                 val = 0;
                 have = 0;
-                continue;
+                return false;
             }
-
             val = ((val << RECODE_BITS_PER_SYMBOL) | c as u64) & mask;
-
             if have < k {
                 have += 1;
             }
-
-            if have == k && used_global.contains(&val) {
+            have == k && used_global.contains(&val)
+        };
+        for i in 0..anchor_k {
+            if feed(((key.0 >> ((anchor_k - 1 - i) * RECODE_BITS_PER_SYMBOL as usize)) & 7) as u8) {
+                return true;
+            }
+        }
+        for &b in &arena.get(block)[..middle_len] {
+            if feed(recode_byte(b, recode_scheme)) {
+                return true;
+            }
+        }
+        for i in 0..anchor_k {
+            if feed(((key.1 >> ((anchor_k - 1 - i) * RECODE_BITS_PER_SYMBOL as usize)) & 7) as u8) {
                 return true;
             }
         }
@@ -199,10 +222,14 @@ fn path_has_used_kmer(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_path_kmers(
-    observations: &[BlockObs],
+    sequences: &[crate::group_extraction::BlockAa],
+    key: AnchorPair,
     arena: &BlockArena,
     k: usize,
+    anchor_k: usize,
+    middle_len: usize,
     recode_scheme: RecodeScheme,
     used_global: &mut HashSet<u64>,
 ) {
@@ -211,34 +238,31 @@ fn insert_path_kmers(
     // candidates avoid the old temporary Vec sort/dedup hot path.
     let mask = kmer_mask(k);
 
-    for obs in observations {
-        let aa = arena.get(obs.aa);
-
-        if aa.len() < k {
-            continue;
-        }
-
+    for &block in sequences {
         let mut val = 0u64;
         let mut have = 0usize;
-
-        for &b in aa {
-            let c = recode_byte(b, recode_scheme);
-
+        let mut feed = |c: u8| {
             if c == 255 {
                 val = 0;
                 have = 0;
-                continue;
+                return;
             }
-
             val = ((val << RECODE_BITS_PER_SYMBOL) | c as u64) & mask;
-
             if have < k {
                 have += 1;
             }
-
             if have == k {
                 used_global.insert(val);
             }
+        };
+        for i in 0..anchor_k {
+            feed(((key.0 >> ((anchor_k - 1 - i) * RECODE_BITS_PER_SYMBOL as usize)) & 7) as u8);
+        }
+        for &b in &arena.get(block)[..middle_len] {
+            feed(recode_byte(b, recode_scheme));
+        }
+        for i in 0..anchor_k {
+            feed(((key.1 >> ((anchor_k - 1 - i) * RECODE_BITS_PER_SYMBOL as usize)) & 7) as u8);
         }
     }
 }
@@ -247,12 +271,13 @@ fn retain_nonoverlapping_raw_candidates(
     mut raw_candidates: Vec<RawDirectCandidate>,
     arena: &BlockArena,
     overlap_k: usize,
+    anchor_k: usize,
     recode_scheme: RecodeScheme,
 ) -> Vec<RawDirectCandidate> {
     raw_candidates.sort_unstable_by(|a, b| {
         b.coverage
             .cmp(&a.coverage)
-            .then_with(|| b.raw_len.cmp(&a.raw_len))
+            .then_with(|| b.middle_len.cmp(&a.middle_len))
             .then_with(|| a.key.0.cmp(&b.key.0))
             .then_with(|| a.key.1.cmp(&b.key.1))
     });
@@ -262,9 +287,12 @@ fn retain_nonoverlapping_raw_candidates(
 
     for cand in raw_candidates {
         if path_has_used_kmer(
-            &cand.selected,
+            &cand.group.sequences,
+            cand.key,
             arena,
             overlap_k,
+            anchor_k,
+            cand.middle_len,
             recode_scheme,
             &used_global,
         ) {
@@ -272,9 +300,12 @@ fn retain_nonoverlapping_raw_candidates(
         }
 
         insert_path_kmers(
-            &cand.selected,
+            &cand.group.sequences,
+            cand.key,
             arena,
             overlap_k,
+            anchor_k,
+            cand.middle_len,
             recode_scheme,
             &mut used_global,
         );
@@ -286,7 +317,7 @@ fn retain_nonoverlapping_raw_candidates(
 }
 
 pub(crate) fn consensus_rows_by_isolate(
-    observations: &[BlockObs],
+    group: &RawGroup,
     arena: &BlockArena,
     n_species: usize,
     len: usize,
@@ -294,9 +325,10 @@ pub(crate) fn consensus_rows_by_isolate(
     // Merge duplicate observations from the same species. Agreement keeps the amino
     // acid; disagreement becomes `X` for downstream consensus-row filters.
     let mut rows = vec![vec![b'-'; len]; n_species];
-    for obs in observations {
-        let sid = obs.sid as usize;
-        for (cell, &aa) in rows[sid].iter_mut().zip(arena.get(obs.aa)).take(len) {
+    for occurrence in &group.occurrences {
+        let sid = occurrence.sid as usize;
+        let block = group.sequences[occurrence.sequence_id as usize];
+        for (cell, &aa) in rows[sid].iter_mut().zip(arena.get(block)).take(len) {
             match *cell {
                 b'-' => *cell = aa,
                 old if old == aa => {}
@@ -316,8 +348,10 @@ pub(crate) struct SortedGroups {
     pub(crate) raw_candidates: Vec<RawDirectCandidate>,
     /// Global protein-name table referenced by raw observations.
     pub(crate) protein_names: Vec<String>,
-    /// Anchor length used to split left/right anchors from middle columns.
+    /// Length of each complete recoded anchor in the logical full path.
     pub(crate) k: usize,
+    /// Stored right-anchor prefix length.
+    pub(crate) constant: usize,
     /// Minimum species support threshold used during extraction.
     pub(crate) min_needed: usize,
     /// Number of species represented by `species_names`.
@@ -336,6 +370,7 @@ pub(crate) fn sort_and_deduplicate_groups(
         groups,
         protein_names,
         k,
+        constant,
         min_needed,
         n_species: n,
     } = raw;
@@ -344,13 +379,14 @@ pub(crate) fn sort_and_deduplicate_groups(
     // Stage 5: for each original anchor pair, keep one unambiguous raw block
     // length present in enough species. These raw candidates are sorted by
     // strength inside recoded k-mer non-overlap filtering.
-    for (key, obs) in groups {
-        if let Ok(group) = select_unique_best_supported_length(key, &obs, n, min_needed, k) {
+    for (key, group) in groups {
+        if let Ok(group) = select_unique_best_supported_length(key, group, n, min_needed, constant)
+        {
             raw_candidates.push(RawDirectCandidate {
                 key: group.key,
                 coverage: group.coverage,
-                raw_len: group.len,
-                selected: group.selected,
+                middle_len: group.middle_len,
+                group: group.group,
             });
         }
     }
@@ -365,6 +401,7 @@ pub(crate) fn sort_and_deduplicate_groups(
         raw_candidates,
         &arena,
         direct_overlap_k(k),
+        k,
         recode_scheme,
     );
     Ok(SortedGroups {
@@ -373,6 +410,7 @@ pub(crate) fn sort_and_deduplicate_groups(
         raw_candidates: nonoverlap_raw_candidates,
         protein_names,
         k,
+        constant,
         min_needed,
         n_species: n,
         recode_scheme,
@@ -382,14 +420,26 @@ pub(crate) fn sort_and_deduplicate_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::group_extraction::RawDirectGroups;
+    use crate::group_extraction::{BlockOccurrence, RawDirectGroups};
 
-    fn obs(arena: &mut BlockArena, sid: u16, aa: &[u8]) -> BlockObs {
-        BlockObs {
-            sid,
-            protein_id: sid as u32,
-            aa: arena.push(aa).unwrap(),
+    fn group(arena: &mut BlockArena, rows: &[(u16, &[u8])]) -> RawGroup {
+        let mut group = RawGroup::default();
+        for &(sid, aa) in rows {
+            let sequence_id = group
+                .sequences
+                .iter()
+                .position(|&block| arena.get(block) == aa)
+                .unwrap_or_else(|| {
+                    group.sequences.push(arena.push(aa).unwrap());
+                    group.sequences.len() - 1
+                }) as u32;
+            group.occurrences.push(BlockOccurrence {
+                sid,
+                protein_id: sid as u32,
+                sequence_id,
+            });
         }
+        group
     }
 
     fn raw_extracted(rows: &[&[u8]], k: usize, key: AnchorPair) -> RawExtractedGroups {
@@ -397,10 +447,14 @@ mod tests {
         let mut arena = BlockArena::new();
         groups.insert(
             key,
-            rows.iter()
-                .enumerate()
-                .map(|(sid, aa)| obs(&mut arena, sid as u16, aa))
-                .collect(),
+            group(
+                &mut arena,
+                &rows
+                    .iter()
+                    .enumerate()
+                    .map(|(sid, &aa)| (sid as u16, aa))
+                    .collect::<Vec<_>>(),
+            ),
         );
 
         RawExtractedGroups {
@@ -411,6 +465,7 @@ mod tests {
             groups,
             protein_names: vec!["protein".to_string(); rows.len()],
             k,
+            constant: 0,
             min_needed: rows.len(),
             n_species: rows.len(),
         }
@@ -420,18 +475,21 @@ mod tests {
         arena: &mut BlockArena,
         key: AnchorPair,
         coverage: usize,
-        raw_len: usize,
+        middle_len: usize,
         rows: &[&[u8]],
     ) -> RawDirectCandidate {
         RawDirectCandidate {
             key,
             coverage,
-            raw_len,
-            selected: rows
-                .iter()
-                .enumerate()
-                .map(|(sid, aa)| obs(arena, sid as u16, aa))
-                .collect(),
+            middle_len,
+            group: group(
+                arena,
+                &rows
+                    .iter()
+                    .enumerate()
+                    .map(|(sid, &aa)| (sid as u16, aa))
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -491,17 +549,11 @@ mod tests {
         let shared_min_block = b"ACDEFGHIKLMNPQRSTVW";
         groups.insert(
             (10, 20),
-            vec![
-                obs(&mut arena, 0, shared_min_block),
-                obs(&mut arena, 1, shared_min_block),
-            ],
+            group(&mut arena, &[(0, shared_min_block), (1, shared_min_block)]),
         );
         groups.insert(
             (30, 40),
-            vec![
-                obs(&mut arena, 0, shared_min_block),
-                obs(&mut arena, 1, shared_min_block),
-            ],
+            group(&mut arena, &[(0, shared_min_block), (1, shared_min_block)]),
         );
 
         let sorted = sort_and_deduplicate_groups(
@@ -511,6 +563,7 @@ mod tests {
                 groups,
                 protein_names: vec!["protein_0".to_string(), "protein_1".to_string()],
                 k: 9,
+                constant: 0,
                 min_needed: 2,
                 n_species: 2,
             },
@@ -525,15 +578,30 @@ mod tests {
     #[test]
     fn consensus_rows_by_isolate_uses_arena_backed_observations() {
         let mut arena = BlockArena::new();
-        let observations = vec![
-            obs(&mut arena, 0, b"ACD"),
-            obs(&mut arena, 0, b"ACD"),
-            obs(&mut arena, 1, b"ACE"),
-        ];
+        let observations = group(
+            &mut arena,
+            &[
+                (0, b"ACD"),
+                (1, b"ACD"),
+                (1, b"ACD"),
+                (2, b"ACD"),
+                (2, b"AQD"),
+            ],
+        );
 
-        let rows = consensus_rows_by_isolate(&observations, &arena, 2, 3);
+        let rows = consensus_rows_by_isolate(&observations, &arena, 4, 3);
 
-        assert_eq!(rows, vec![b"ACD".to_vec(), b"ACE".to_vec()]);
+        assert_eq!(observations.sequences.len(), 2);
+        assert_eq!(observations.occurrences.len(), 5);
+        assert_eq!(
+            rows,
+            vec![
+                b"ACD".to_vec(),
+                b"ACD".to_vec(),
+                b"AXD".to_vec(),
+                b"---".to_vec()
+            ]
+        );
     }
 
     #[test]
@@ -550,11 +618,44 @@ mod tests {
             raw_candidates,
             &arena,
             DEFAULT_DIRECT_OVERLAP_K,
+            0,
             RecodeScheme::SR6,
         );
         let retained_keys: Vec<_> = retained.into_iter().map(|cand| cand.key).collect();
 
         assert_eq!(retained_keys, vec![(10, 11), (30, 31)]);
+    }
+
+    #[test]
+    fn nonoverlap_scans_one_unique_path_for_ten_identical_occurrences() {
+        let mut arena = BlockArena::new();
+        let sequence = b"ACDEFGHIKLMNPQRSTVWYA".as_slice();
+        let rows = vec![sequence; 10];
+        let candidate = raw_candidate(&mut arena, (1, 2), 10, sequence.len(), &rows);
+        assert_eq!(candidate.group.sequences.len(), 1);
+        assert_eq!(candidate.group.occurrences.len(), 10);
+        let mut used = HashSet::new();
+        insert_path_kmers(
+            &candidate.group.sequences,
+            candidate.key,
+            &arena,
+            DEFAULT_DIRECT_OVERLAP_K,
+            0,
+            candidate.middle_len,
+            RecodeScheme::SR6,
+            &mut used,
+        );
+        assert_eq!(used.len(), 1);
+        assert!(path_has_used_kmer(
+            &candidate.group.sequences,
+            candidate.key,
+            &arena,
+            DEFAULT_DIRECT_OVERLAP_K,
+            0,
+            candidate.middle_len,
+            RecodeScheme::SR6,
+            &used,
+        ));
     }
 
     #[test]
@@ -569,36 +670,90 @@ mod tests {
         ];
 
         let retained =
-            retain_nonoverlapping_raw_candidates(raw_candidates, &arena, 5, RecodeScheme::SR6);
+            retain_nonoverlapping_raw_candidates(raw_candidates, &arena, 5, 0, RecodeScheme::SR6);
         let retained_keys: Vec<_> = retained.into_iter().map(|cand| cand.key).collect();
 
         assert_eq!(retained_keys, vec![(10, 11), (30, 31), (40, 41)]);
     }
 
     #[test]
+    fn compact_path_reconstruction_matches_historical_full_path_kmers() {
+        fn encode(aa: &[u8]) -> u64 {
+            aa.iter().fold(0, |v, &b| {
+                (v << RECODE_BITS_PER_SYMBOL) | recode_byte(b, RecodeScheme::SR6) as u64
+            })
+        }
+        let left = b"ACD";
+        let middle = b"EF";
+        let right = b"GHI";
+        let key = (encode(left), encode(right));
+        let mut arena = BlockArena::new();
+        // The stored I is right-anchor context and must not be streamed twice.
+        let observations = group(&mut arena, &[(0, b"EFI")]);
+        let mut reconstructed = HashSet::new();
+        insert_path_kmers(
+            &observations.sequences,
+            key,
+            &arena,
+            3,
+            3,
+            middle.len(),
+            RecodeScheme::SR6,
+            &mut reconstructed,
+        );
+
+        let full = [left.as_slice(), middle.as_slice(), right.as_slice()].concat();
+        let expected: HashSet<u64> = full.windows(3).map(encode).collect();
+        assert_eq!(reconstructed, expected);
+        // These include an anchor-only window and both anchor/middle boundaries.
+        assert!(reconstructed.contains(&encode(left)));
+        assert!(reconstructed.contains(&encode(b"DEF")));
+        assert!(reconstructed.contains(&encode(b"FGH")));
+        assert!(reconstructed.contains(&encode(right)));
+    }
+
+    #[test]
     fn length_filter_rejects_ties_low_support_and_short_blocks() {
         let mut arena = BlockArena::new();
-        let tie_obs = vec![
-            obs(&mut arena, 0, b"ACDEF"),
-            obs(&mut arena, 1, b"ACDEF"),
-            obs(&mut arena, 2, b"ACDEFG"),
-            obs(&mut arena, 3, b"ACDEFG"),
-        ];
+        let tie_obs = group(
+            &mut arena,
+            &[(0, b"ACDEF"), (1, b"ACDEF"), (2, b"ACDEFG"), (3, b"ACDEFG")],
+        );
         assert!(matches!(
-            select_unique_best_supported_length((1, 2), &tie_obs, 4, 2, 2),
+            select_unique_best_supported_length((1, 2), tie_obs, 4, 2, 2),
             Err(LengthSupportReject::Tie)
         ));
 
-        let low_support_obs = vec![obs(&mut arena, 0, b"ACDEF")];
+        let low_support_obs = group(&mut arena, &[(0, b"ACDEF")]);
         assert!(matches!(
-            select_unique_best_supported_length((1, 2), &low_support_obs, 4, 2, 2),
+            select_unique_best_supported_length((1, 2), low_support_obs, 4, 2, 2),
             Err(LengthSupportReject::LowSupport)
         ));
 
-        let short_obs = vec![obs(&mut arena, 0, b"ACD"), obs(&mut arena, 1, b"ACD")];
+        let short_obs = group(&mut arena, &[(0, b""), (1, b"")]);
         assert!(matches!(
-            select_unique_best_supported_length((1, 2), &short_obs, 2, 2, 2),
+            select_unique_best_supported_length((1, 2), short_obs, 2, 2, 0),
             Err(LengthSupportReject::ShortBlock)
+        ));
+    }
+
+    #[test]
+    fn length_support_counts_distinct_species_not_occurrences_or_sequences() {
+        let mut arena = BlockArena::new();
+        let observations = group(
+            &mut arena,
+            &[
+                (0, b"AAAA"),
+                (0, b"BBBB"),
+                (0, b"AAAA"),
+                (1, b"CCCC"),
+                (2, b"DDDDD"),
+                (3, b"EEEEE"),
+            ],
+        );
+        assert!(matches!(
+            select_unique_best_supported_length((1, 2), observations, 4, 2, 0),
+            Err(LengthSupportReject::Tie)
         ));
     }
 
@@ -611,7 +766,7 @@ mod tests {
 
         assert_eq!(sorted.raw_candidates.len(), 1);
         assert_eq!(sorted.raw_candidates[0].key, (31, 37));
-        assert_eq!(sorted.raw_candidates[0].raw_len, rows[0].len());
+        assert_eq!(sorted.raw_candidates[0].middle_len, rows[0].len());
     }
 
     #[test]
@@ -629,6 +784,7 @@ mod tests {
             raw_candidates,
             &arena,
             DEFAULT_DIRECT_OVERLAP_K,
+            0,
             RecodeScheme::SR6,
         );
         let retained_keys: Vec<_> = retained.into_iter().map(|cand| cand.key).collect();
@@ -640,21 +796,11 @@ mod tests {
     fn raw_direct_groups_already_group_exact_anchor_pairs() {
         let mut groups = RawDirectGroups::new();
         let mut arena = BlockArena::new();
-        groups
-            .entry((1, 2))
-            .or_default()
-            .push(obs(&mut arena, 0, b"ACDEF"));
-        groups
-            .entry((1, 2))
-            .or_default()
-            .push(obs(&mut arena, 1, b"ACDEF"));
-        groups
-            .entry((1, 3))
-            .or_default()
-            .push(obs(&mut arena, 2, b"ACDEF"));
+        groups.insert((1, 2), group(&mut arena, &[(0, b"ACDEF"), (1, b"ACDEF")]));
+        groups.insert((1, 3), group(&mut arena, &[(2, b"ACDEF")]));
 
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups.get(&(1, 2)).unwrap().len(), 2);
-        assert_eq!(groups.get(&(1, 3)).unwrap().len(), 1);
+        assert_eq!(groups.get(&(1, 2)).unwrap().occurrences.len(), 2);
+        assert_eq!(groups.get(&(1, 3)).unwrap().occurrences.len(), 1);
     }
 }
