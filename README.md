@@ -58,8 +58,8 @@ Please let me know if anything is unclear or missing, and I'll update the doc ac
 If you use kamino, please cite:
 
 > Romain Derelle, John A. Lees and Leonid Chindelevitch. 2026.
-> kamino: proteome-wide variant calling for amino acid phylogenomics.
-> https://www.biorxiv.org/content/10.64898/2026.05.21.726148v1
+> kamino: fast proteome-wide variant calling for amino acid phylogenomics.
+> https://www.biorxiv.org/content/10.64898/2026.05.21.726148v2
 
 ---
 This codebase is provided under the MIT License. Some parts of the code were drafted using AI assistance.
