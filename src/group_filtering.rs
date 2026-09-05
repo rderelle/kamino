@@ -140,16 +140,21 @@ fn missing_fraction(rows: &[Vec<u8>], col: usize, n_species: usize) -> f32 {
     (miss as f32) / (n_species as f32)
 }
 
-fn consensus_protein_name(group: &RawGroup, protein_names: &[String]) -> String {
+fn consensus_protein_name(group: &RawGroup, protein_names: &[Vec<String>]) -> String {
     // Build a majority-rule label from all non-empty protein names supporting this
     // variant group. A word is retained when it occurs in at least 50% of names.
     // Retained words are then ordered by their average position across the original
     // names in which they occur, so prefixes/suffixes keep their natural location
     // even when the first observed protein name has a different wording.
-    let names: Vec<&str> = group
-        .occurrences
-        .iter()
-        .filter_map(|occurrence| protein_names.get(occurrence.protein_id as usize))
+    let mut occurrences: Vec<_> = group.occurrences.iter().collect();
+    occurrences.sort_by_key(|occurrence| (occurrence.sid, occurrence.protein_id));
+    let names: Vec<&str> = occurrences
+        .into_iter()
+        .filter_map(|occurrence| {
+            protein_names
+                .get(occurrence.sid as usize)
+                .and_then(|names| names.get(occurrence.protein_id as usize))
+        })
         .filter_map(|name| {
             name.trim()
                 .split_once(char::is_whitespace)
@@ -225,7 +230,7 @@ fn consensus_protein_name(group: &RawGroup, protein_names: &[String]) -> String 
 fn build_candidate_group(
     raw: RawDirectCandidate,
     arena: &BlockArena,
-    protein_names: &[String],
+    protein_names: &[Vec<String>],
     n: usize,
     _k: usize,
     constant: usize,
@@ -413,7 +418,7 @@ mod tests {
                 .map(|sid| format!("species_{sid}"))
                 .collect(),
             raw_candidates,
-            protein_names: vec!["protein".to_string(); rows.len()],
+            protein_names: vec![vec!["protein".to_string()]; rows.len()],
             k,
             constant,
             min_needed: 1,
@@ -433,37 +438,46 @@ mod tests {
     }
 
     #[test]
-    fn protein_name_consensus_uses_original_interleaved_occurrence_order() {
+    fn protein_name_consensus_is_independent_of_merge_order() {
+        let occurrences = vec![
+            BlockOccurrence {
+                sid: 0,
+                protein_id: 0,
+                sequence_id: 0,
+            },
+            BlockOccurrence {
+                sid: 1,
+                protein_id: 0,
+                sequence_id: 1,
+            },
+            BlockOccurrence {
+                sid: 2,
+                protein_id: 0,
+                sequence_id: 0,
+            },
+            BlockOccurrence {
+                sid: 3,
+                protein_id: 0,
+                sequence_id: 1,
+            },
+        ];
         let group = RawGroup {
             sequences: Vec::new(),
-            occurrences: vec![
-                BlockOccurrence {
-                    sid: 0,
-                    protein_id: 0,
-                    sequence_id: 0,
-                },
-                BlockOccurrence {
-                    sid: 1,
-                    protein_id: 1,
-                    sequence_id: 1,
-                },
-                BlockOccurrence {
-                    sid: 2,
-                    protein_id: 2,
-                    sequence_id: 0,
-                },
-                BlockOccurrence {
-                    sid: 3,
-                    protein_id: 3,
-                    sequence_id: 1,
-                },
-            ],
+            occurrences: occurrences.clone(),
+        };
+        let reversed = RawGroup {
+            sequences: Vec::new(),
+            occurrences: occurrences.into_iter().rev().collect(),
         };
         let names = vec!["p0 alpha", "p1 beta", "p2 beta", "p3 alpha"]
             .into_iter()
-            .map(str::to_string)
+            .map(|name| vec![name.to_string()])
             .collect::<Vec<_>>();
         assert_eq!(consensus_protein_name(&group, &names), "alpha beta");
+        assert_eq!(
+            consensus_protein_name(&group, &names),
+            consensus_protein_name(&reversed, &names)
+        );
     }
 
     #[test]
