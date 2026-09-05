@@ -137,3 +137,49 @@ fn golden_genomes() {
         nj: false,
     });
 }
+
+#[test]
+fn proteome_output_is_identical_across_thread_counts_and_repeated_runs() {
+    let input = Path::new("tests/data/test_3diff/input")
+        .canonicalize()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let output_files = [
+        "kamino_alignment.fas",
+        "kamino_missing.tsv",
+        "kamino_partitions.tsv",
+    ];
+    let mut outputs = Vec::new();
+
+    for (run, threads) in [1, 4, 4].into_iter().enumerate() {
+        let output_dir = temp.path().join(format!("run_{run}"));
+        fs::create_dir(&output_dir).unwrap();
+        run_with_args(Args {
+            input: Some(input.clone()),
+            input_file: None,
+            genomes: false,
+            k: None,
+            min_freq: 0.85,
+            output: output_dir.join("kamino"),
+            constant: None,
+            length_middle: 35,
+            mask: 5,
+            threads,
+            recode: RecodeScheme::Dayhoff6,
+            nj: false,
+        })
+        .unwrap();
+        outputs.push(
+            output_files
+                .iter()
+                .map(|name| fs::read(output_dir.join(name)).unwrap())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    assert_eq!(
+        outputs[0], outputs[1],
+        "1-thread and 4-thread output differs"
+    );
+    assert_eq!(outputs[1], outputs[2], "repeated 4-thread output differs");
+}

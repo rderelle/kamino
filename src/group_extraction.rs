@@ -7,7 +7,6 @@ use anyhow::{anyhow, bail, Result};
 use hashbrown::HashMap;
 use rayon::{prelude::*, ThreadPoolBuilder};
 use seq_io::fasta::{Reader as FastaReader, Record};
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::{mpsc, Mutex};
 
@@ -328,7 +327,7 @@ fn extract_from_valid_segment(
 }
 
 struct SpeciesExtraction {
-    /// Species index that lets parallel results be merged deterministically.
+    /// Species index used to place species-local metadata in global storage.
     sid: usize,
     /// Raw amino-acid bytes referenced by this species' block observations.
     arena: BlockArena,
@@ -342,13 +341,10 @@ fn merge_species_extraction(
     extraction: SpeciesExtraction,
     groups: &mut RawDirectGroups,
     arena: &mut BlockArena,
-    protein_names: &mut Vec<String>,
+    protein_names: &mut [Vec<String>],
 ) -> Result<()> {
-    let protein_offset = protein_names.len();
-    if protein_offset + extraction.protein_names.len() > u32::MAX as usize {
-        bail!("too many protein records across all species to index with u32");
-    }
-    protein_names.extend(extraction.protein_names);
+    let sid = extraction.sid;
+    protein_names[sid] = extraction.protein_names;
     for (key, observations) in extraction.groups {
         let group = groups.entry(key).or_default();
         for obs in observations {
@@ -362,8 +358,8 @@ fn merge_species_extraction(
                 id
             };
             group.occurrences.push(BlockOccurrence {
-                sid: extraction.sid as u16,
-                protein_id: obs.protein_id + protein_offset as u32,
+                sid: sid as u16,
+                protein_id: obs.protein_id,
                 sequence_id,
             });
         }
@@ -540,8 +536,8 @@ pub(crate) struct RawExtractedGroups {
     pub(crate) arena: BlockArena,
     /// Raw block observations grouped by original bracketing anchor pairs.
     pub(crate) groups: RawDirectGroups,
-    /// Global protein-name table referenced by raw observations.
-    pub(crate) protein_names: Vec<String>,
+    /// Per-species protein-name tables referenced by species-local protein IDs.
+    pub(crate) protein_names: Vec<Vec<String>>,
     /// Length of each complete recoded anchor in the logical full path.
     pub(crate) k: usize,
     /// Number of original right-anchor amino acids stored after each middle.
@@ -604,16 +600,16 @@ pub(crate) fn extract_groups(
     // remain separate passes so anchors are evaluated against all species.
     let cms = cmsa.snapshot();
 
-    // Stage 4: stream completed species extractions into one deterministic global
-    // merge. Out-of-order species are buffered only until all lower sids are ready.
+    // Stage 4: stream completed species extractions into the global structures,
+    // merging each result immediately regardless of species completion order.
     eprintln!(" . pass 2: extract sequences");
     let extraction_progress = ProteomeProgress::new(n);
     extraction_progress.draw(0);
     let mut groups: RawDirectGroups = HashMap::new();
     let mut arena = BlockArena::new();
-    let mut protein_names = Vec::new();
+    let mut protein_names = vec![Vec::new(); n];
     std::thread::scope(|thread_scope| {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(n_threads);
         let extraction_thread = thread_scope.spawn(|| {
             pool.install(|| {
                 inputs
@@ -630,35 +626,27 @@ pub(crate) fn extract_groups(
                             length_middle,
                             constant,
                             recode_scheme,
-                        )
-                        .map(|extraction| (extraction.sid, extraction));
+                        );
                         extraction_progress.increment();
                         let _ = tx.send(result);
                     });
             });
         });
 
-        let mut pending = BTreeMap::new();
-        let mut next_sid_to_merge = 0usize;
         let mut first_error = None;
         for result in rx {
             match result {
-                Ok((sid, extraction)) if first_error.is_none() => {
-                    pending.insert(sid, extraction);
-                    while let Some(extraction) = pending.remove(&next_sid_to_merge) {
-                        if let Err(err) = merge_species_extraction(
-                            extraction,
-                            &mut groups,
-                            &mut arena,
-                            &mut protein_names,
-                        ) {
-                            first_error.get_or_insert(err);
-                            break;
-                        }
-                        next_sid_to_merge += 1;
+                Ok(extraction) if first_error.is_none() => {
+                    if let Err(err) = merge_species_extraction(
+                        extraction,
+                        &mut groups,
+                        &mut arena,
+                        &mut protein_names,
+                    ) {
+                        first_error.get_or_insert(err);
                     }
                 }
-                Ok((_sid, _extraction)) => {}
+                Ok(_extraction) => {}
                 Err(err) => {
                     first_error.get_or_insert(err);
                 }
@@ -670,10 +658,6 @@ pub(crate) fn extract_groups(
         extraction_progress.finish();
         if let Some(err) = first_error {
             Err(err)
-        } else if next_sid_to_merge != n {
-            Err(anyhow!(
-                "species extraction ended before all species were merged ({next_sid_to_merge}/{n})"
-            ))
         } else {
             Ok(())
         }
@@ -792,11 +776,11 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_merge_interns_exact_sequences_and_keeps_every_occurrence() {
+    fn merge_interns_exact_sequences_and_keeps_species_local_protein_ids() {
         let key = (3, 5);
         let mut groups = RawDirectGroups::new();
         let mut arena = BlockArena::new();
-        let mut names = Vec::new();
+        let mut names = vec![Vec::new(); 3];
         for extraction in [
             extraction_many(0, key, &[("p0", b"ABC"), ("p1", b"ABC")]),
             extraction_many(1, key, &[("p2", b"ABD")]),
@@ -821,8 +805,11 @@ mod tests {
                 .iter()
                 .map(|o| o.protein_id)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3]
+            vec![0, 1, 0, 0]
         );
+        assert_eq!(names[0], ["p0", "p1"]);
+        assert_eq!(names[1], ["p2"]);
+        assert_eq!(names[2], ["p3"]);
         assert_eq!(arena.data.len(), 6);
         assert_eq!(arena.get(group.sequences[0]), b"ABC");
         assert_eq!(arena.get(group.sequences[1]), b"ABD");
@@ -843,7 +830,7 @@ mod tests {
         let extraction = extraction_many(0, key, &rows);
         let mut groups = RawDirectGroups::new();
         let mut arena = BlockArena::new();
-        merge_species_extraction(extraction, &mut groups, &mut arena, &mut Vec::new()).unwrap();
+        merge_species_extraction(extraction, &mut groups, &mut arena, &mut [Vec::new()]).unwrap();
         assert_eq!(groups[&key].sequences.len(), 4);
         assert_eq!(groups[&key].occurrences.len(), 100);
         assert_eq!(arena.data.len(), 80);
@@ -856,54 +843,53 @@ mod tests {
         let extraction = extraction_many(0, key, &rows);
         let mut groups = RawDirectGroups::new();
         let mut arena = BlockArena::new();
-        merge_species_extraction(extraction, &mut groups, &mut arena, &mut Vec::new()).unwrap();
+        merge_species_extraction(extraction, &mut groups, &mut arena, &mut [Vec::new()]).unwrap();
         assert_eq!(groups[&key].sequences.len(), 1);
         assert_eq!(groups[&key].occurrences.len(), 100);
         assert_eq!(arena.data.len(), 20);
     }
 
     #[test]
-    fn pending_species_merge_is_deterministic_when_results_arrive_out_of_order() {
+    fn species_merge_order_preserves_effective_raw_data() {
         let key = (7, 11);
-        let mut groups = RawDirectGroups::new();
-        let mut arena = BlockArena::new();
-        let mut protein_names = Vec::new();
-        let mut pending = BTreeMap::new();
-        let mut next_sid_to_merge = 0usize;
-
-        for extraction in [
-            extraction(1, "protein_1", key, b"BBBB"),
-            extraction(0, "protein_0", key, b"AAAA"),
-            extraction(2, "protein_2", key, b"CCCC"),
-        ] {
-            pending.insert(extraction.sid, extraction);
-            while let Some(extraction) = pending.remove(&next_sid_to_merge) {
-                merge_species_extraction(extraction, &mut groups, &mut arena, &mut protein_names)
-                    .unwrap();
-                next_sid_to_merge += 1;
+        let merge = |order: &[usize]| {
+            let mut groups = RawDirectGroups::new();
+            let mut arena = BlockArena::new();
+            let mut protein_names = vec![Vec::new(); 3];
+            for &sid in order {
+                let (name, aa): (&str, &[u8]) = match sid {
+                    0 => ("protein_0", b"AAAA"),
+                    1 => ("protein_1", b"BBBB"),
+                    2 => ("protein_2", b"CCCC"),
+                    _ => unreachable!(),
+                };
+                merge_species_extraction(
+                    extraction(sid, name, key, aa),
+                    &mut groups,
+                    &mut arena,
+                    &mut protein_names,
+                )
+                .unwrap();
             }
-        }
+            let group = groups.get(&key).unwrap();
+            let mut effective: Vec<_> = group
+                .occurrences
+                .iter()
+                .map(|obs| {
+                    (
+                        obs.sid,
+                        obs.protein_id,
+                        protein_names[obs.sid as usize][obs.protein_id as usize].clone(),
+                        arena
+                            .get(group.sequences[obs.sequence_id as usize])
+                            .to_vec(),
+                    )
+                })
+                .collect();
+            effective.sort();
+            (protein_names, effective)
+        };
 
-        assert_eq!(protein_names, vec!["protein_0", "protein_1", "protein_2"]);
-        let group = groups.get(&key).unwrap();
-        assert_eq!(
-            group
-                .occurrences
-                .iter()
-                .map(|obs| obs.sid)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert_eq!(
-            group
-                .occurrences
-                .iter()
-                .map(|obs| obs.protein_id)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert_eq!(arena.get(group.sequences[0]), b"AAAA");
-        assert_eq!(arena.get(group.sequences[1]), b"BBBB");
-        assert_eq!(arena.get(group.sequences[2]), b"CCCC");
+        assert_eq!(merge(&[0, 1, 2]), merge(&[2, 0, 1]));
     }
 }

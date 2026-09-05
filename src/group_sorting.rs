@@ -346,8 +346,8 @@ pub(crate) struct SortedGroups {
     pub(crate) arena: BlockArena,
     /// Deduplicated raw candidates retained after recoded k-mer non-overlap filtering.
     pub(crate) raw_candidates: Vec<RawDirectCandidate>,
-    /// Global protein-name table referenced by raw observations.
-    pub(crate) protein_names: Vec<String>,
+    /// Per-species protein-name tables referenced by species-local protein IDs.
+    pub(crate) protein_names: Vec<Vec<String>>,
     /// Length of each complete recoded anchor in the logical full path.
     pub(crate) k: usize,
     /// Stored right-anchor prefix length.
@@ -463,7 +463,7 @@ mod tests {
                 .map(|sid| format!("species_{sid}"))
                 .collect(),
             groups,
-            protein_names: vec!["protein".to_string(); rows.len()],
+            protein_names: vec![vec!["protein".to_string()]; rows.len()],
             k,
             constant: 0,
             min_needed: rows.len(),
@@ -561,7 +561,7 @@ mod tests {
                 arena,
                 species_names: vec!["species_0".to_string(), "species_1".to_string()],
                 groups,
-                protein_names: vec!["protein_0".to_string(), "protein_1".to_string()],
+                protein_names: vec![vec!["protein_0".to_string()], vec!["protein_1".to_string()]],
                 k: 9,
                 constant: 0,
                 min_needed: 2,
