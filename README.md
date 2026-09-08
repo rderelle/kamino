@@ -43,10 +43,10 @@ kamino -i <input_dir> -t 4 --genomes
 ### output
 kamino outputs a FASTA amino acid alignment, a file containing the percentage of missing data per isolate, and a file containing variant group coordinates in the FASTA alignment. By default, these output files use the prefix 'kamino_', but this can be changed with the `-o` argument.
 
-Additionally, a Neighbour-joinging tree can be generated together with other output files by selecting the `--NJ` optional argument.
+Additionally, a Neighbour-joinging tree can be generated together with other output files by selecting the `--nj` optional argument.
 
 ```bash
-kamino -i <input_dir> -t 4 --NJ
+kamino -i <input_dir> -t 4 --nj
 ```
 
 ## Documentation
