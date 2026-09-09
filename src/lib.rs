@@ -23,20 +23,25 @@
 //! protein prediction is performed, and the predicted proteomes are written to a temporary directory.
 //!
 //! ## Arguments
-//! - `-i`, --input-directory: input directory with FASTA proteomes (plain or .gz)
-//! - `-I`, --input-file: tab-delimited file mapping species name to proteome path
-//! - `--genomes`: treat input files as bacterial genomes and predict proteomes before analysis
-//! - `-k`, `--k`: k-mer length [k=13]
-//! - `-f`, `--min-freq`: minimum fraction of samples with an amino-acid per position [f=0.85]
-//! - `-o`, `--output`: output prefix for generated files [o=`kamino`]
-//! - `-c`, `--constant`: number of constant positions retained from in-bubble k-mers [c=3]
-//! - `-l`, `--length-middle`: maximum number of middle positions per variant group [l=35]
-//! - `-m`, `--mask`: mask middle segments with long mismatch runs [m=5]
-//! - `-t`, `--threads`: number of threads [t=1]
-//! - `-r`, `--recode`: amino-acid recoding scheme [r=`sr6`]
-//! - `--nj`: generate a NJ tree from kamino alignment [nj=false]
-//! - `-b`, `--bootstrap`: number of bootstrap replicates for the NJ tree (requires `--nj`)
-//! - `-v`, `--version`: print version information and exit.
+//!
+//! Main parameters:
+//!   -i, --input-directory <INPUT>        Directory containing proteome FASTA files
+//!   -I, --input-file <INPUT_FILE>        TSV table with `species_name<TAB>path_to_fasta` rows
+//!   -o, --output <OUTPUT>                Prefix for output files [default: kamino]
+//!   -k, --k <K>                          k-mer size used for anchor extraction [k=13]
+//!   -r, --recode <RECODE>                Six-state amino-acid k-mer recoding scheme [r=sr6] [possible values: dayhoff6, sr6, kgb6]
+//!   -f, --min-freq <MIN_FREQ>            Minimum fraction of species present per alignment position [f=0.85]
+//!   -c, --constant <CONSTANT>            Number of 'constant' positions added to each partition [c=3]
+//!   -l, --length-middle <LENGTH_MIDDLE>  Maximum amino-acid length between two adjacent shared anchors [l=35]
+//!   -m, --mask <MASK>                    Consecutive amino-acid differences required for masking [m=5]; 0 disables
+//!   -t, --threads <THREADS>              Number of threads [t=1]
+//! 
+//! Optional input:
+//!       --genomes  Treat inputs as bacterial genomes and predict proteins first
+//! 
+//! Optional output:
+//!       --nj                     Build a neighbor-joining tree
+//!   -b, --bootstrap <BOOTSTRAP>  Number of bootstrap replicates; requires --nj
 //!
 //!
 //! ## Optimising alignment size
@@ -81,7 +86,7 @@
 //! be masked can be decreased with this parameter to make the filtering more
 //! stringent.
 //!
-//! Finally, the 6-letter recoding scheme can be modified with the --recode
+//! Finally, the six-letter recoding scheme can be modified with the --recode
 //! parameter, although the default sr6 recoding scheme performed best in most of my
 //! tests (sr6 >= dayhoff6 >> kgb6).
 //!
@@ -101,8 +106,11 @@
 //! when the `--nj` argument is specified. Pairwise distances are computed using an F81
 //! correction with LG stationary amino-acid frequencies. The resulting tree provides an
 //! overview of isolate relationships and is not intended for detailed phylogenetic inference.
+//!
 //! When `-b/--bootstrap` is supplied together with `--nj`, alignment columns are resampled
 //! with replacement and bootstrap percentages are written as internal-node labels in the NJ tree.
+//! Please note that bootstrap analyses on large datasets (e.g. >1,000 samples) can be 
+//! computationally intensive.
 //!
 use anyhow::Context;
 use clap::Parser;
@@ -124,59 +132,92 @@ pub use recode::RecodeScheme;
 #[command(group = clap::ArgGroup::new("input_source").required(true).multiple(true).args(["input", "input_file"]))]
 /// Parsed command-line options shared by the binary and integration tests.
 pub struct Args {
-    /// Directory containing one proteome FASTA per species.
-    #[arg(short, long = "input-directory")]
+    /// Directory containing proteome FASTA files.
+    #[arg(short, long = "input-directory", help_heading = "Main parameters")]
     pub input: Option<std::path::PathBuf>,
+
     /// TSV table with `species_name<TAB>path_to_fasta` rows.
-    #[arg(short = 'I', long = "input-file")]
+    #[arg(short = 'I', long = "input-file", help_heading = "Main parameters")]
     pub input_file: Option<std::path::PathBuf>,
-    /// Treat inputs as nucleotide genomes and predict proteins first.
-    #[arg(long = "genomes")]
-    pub genomes: bool,
+
+    /// Prefix for output files
+    #[arg(short, long, default_value = "kamino", help_heading = "Main parameters")]
+    pub output: std::path::PathBuf,
+
     /// k-mer size used for anchor extraction [k=13].
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = "Main parameters")]
     pub k: Option<usize>,
-    /// Minimum fraction of species required to support an anchor or output column [f=0.85].
+
+    /// Six-state amino-acid k-mer recoding scheme [r=sr6].
+    #[arg(
+        short = 'r',
+        long = "recode",
+        value_enum,
+        default_value_t = RecodeScheme::SR6,
+        hide_default_value = true,
+        help_heading = "Main parameters"
+    )]
+    pub recode: RecodeScheme,
+    
+    /// Minimum fraction of species present per alignment position [f=0.85].
     #[arg(
         short = 'f',
         long = "min-freq",
         default_value_t = 0.85,
-        hide_default_value = true
+        hide_default_value = true,
+        help_heading = "Main parameters"
     )]
     pub min_freq: f32,
-    /// Output prefix used to derive alignment, missing-data, partition, and tree paths.
-    #[arg(short, long, default_value = "kamino")]
-    pub output: std::path::PathBuf,
-    /// Number of constant right-anchor columns to append after each variable block [c=3].
-    #[arg(short, long)]
+
+    /// Number of 'constant' positions added to each partition [c=3].
+    #[arg(short, long, help_heading = "Main parameters")]
     pub constant: Option<usize>,
-    /// Maximum amino-acid length allowed between two adjacent shared anchors [l=35].
+
+    /// Maximum amino-acid length between two adjacent shared anchors [l=35].
     #[arg(
         short = 'l',
         long = "length-middle",
         default_value_t = 35,
-        hide_default_value = true
+        hide_default_value = true,
+        help_heading = "Main parameters"
     )]
     pub length_middle: usize,
-    /// Consecutive amino-acid differences from the group consensus required to mask a row [m=5]; 0 disables.
+
+    /// Consecutive amino-acid differences required for masking [m=5]; 0 disables.
     #[arg(
         short = 'm',
         long = "mask",
         default_value_t = 5,
-        hide_default_value = true
+        hide_default_value = true,
+        help_heading = "Main parameters"
     )]
     pub mask: usize,
-    /// Number of worker threads used by parallel stages [t=1].
-    #[arg(short = 't', long, default_value_t = 1, hide_default_value = true)]
+
+    /// Number of threads [t=1].
+    #[arg(
+        short = 't',
+        long,
+        default_value_t = 1,
+        hide_default_value = true,
+        help_heading = "Main parameters"
+    )]
     pub threads: usize,
-    /// Six-state amino-acid recoding scheme used before k-mer encoding [r=sr6].
-    #[arg(short='r', long="recode", value_enum, default_value_t=RecodeScheme::SR6, hide_default_value=true)]
-    pub recode: RecodeScheme,
-    /// Also write a neighbor-joining tree inferred from the concatenated alignment.
-    #[arg(long = "nj")]
+
+    /// Treat inputs as bacterial genomes and predict proteins first.
+    #[arg(long = "genomes", help_heading = "Optional input")]
+    pub genomes: bool,
+
+    /// Build a neighbor-joining tree.
+    #[arg(long = "nj", help_heading = "Optional output")]
     pub nj: bool,
-    /// Number of bootstrap replicates used to support the NJ tree; requires --nj.
-    #[arg(short = 'b', long = "bootstrap", requires = "nj")]
+
+    /// Number of bootstrap replicates; requires --nj.
+    #[arg(
+        short = 'b',
+        long = "bootstrap",
+        requires = "nj",
+        help_heading = "Optional output"
+    )]
     pub bootstrap: Option<usize>,
 }
 
