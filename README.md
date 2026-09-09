@@ -48,11 +48,6 @@ Additionally, a Neighbour-joinging tree can be generated together with other out
 ```bash
 kamino -i <input_dir> -t 4 --nj
 ```
-And bootstrap support values can be added to the NJ tree using `-b` (number of bootstrap replicates):
-
-```bash
-kamino -i <input_dir> -t 4 --nj -b 200
-```
 
 ## Documentation
 More information are available at https://docs.rs/kamino-cli/latest/kamino_cli/
