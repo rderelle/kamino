@@ -36,6 +36,7 @@ pub fn write_outputs(
     partitions: Vec<(usize, usize, usize)>,
     partition_names: Vec<String>,
     generate_nj: bool,
+    bootstrap: Option<usize>,
     threads: usize,
 ) -> Result<(usize, f64)> {
     // Calculate overall missingness once before writing the FASTA rows.
@@ -84,9 +85,15 @@ pub fn write_outputs(
     }
     pw.flush()?;
     if generate_nj {
-        // Tree generation is optional because it adds an O(n²·L) distance pass.
-        let tree = crate::phylo::nj_tree_newick(species, &concat, threads)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        // Tree generation is optional because it adds an O(n²·L) distance pass;
+        // bootstrap support repeats that calculation on column-resampled alignments.
+        let tree = match bootstrap {
+            Some(replicates) => {
+                crate::phylo::nj_tree_newick_bootstrap(species, &concat, threads, replicates)
+            }
+            None => crate::phylo::nj_tree_newick(species, &concat, threads),
+        }
+        .map_err(|e| anyhow::anyhow!(e))?;
         let mut tw = BufWriter::new(File::create(&tree_path)?);
         writeln!(tw, "{}", tree)?;
         tw.flush()?;

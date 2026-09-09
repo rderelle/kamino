@@ -35,6 +35,7 @@
 //! - `-t`, `--threads`: number of threads [t=1]
 //! - `-r`, `--recode`: amino-acid recoding scheme [r=`sr6`]
 //! - `--nj`: generate a NJ tree from kamino alignment [nj=false]
+//! - `-b`, `--bootstrap`: number of bootstrap replicates for the NJ tree (requires `--nj`)
 //! - `-v`, `--version`: print version information and exit.
 //!
 //!
@@ -100,6 +101,8 @@
 //! when the `--nj` argument is specified. Pairwise distances are computed using an F81
 //! correction with LG stationary amino-acid frequencies. The resulting tree provides an
 //! overview of isolate relationships and is not intended for detailed phylogenetic inference.
+//! When `-b/--bootstrap` is supplied together with `--nj`, alignment columns are resampled
+//! with replacement and bootstrap percentages are written as internal-node labels in the NJ tree.
 //!
 use anyhow::Context;
 use clap::Parser;
@@ -172,6 +175,9 @@ pub struct Args {
     /// Also write a neighbor-joining tree inferred from the concatenated alignment.
     #[arg(long = "nj")]
     pub nj: bool,
+    /// Number of bootstrap replicates used to support the NJ tree; requires --nj.
+    #[arg(short = 'b', long = "bootstrap", requires = "nj")]
+    pub bootstrap: Option<usize>,
 }
 
 fn print_startup_banner(args: &Args, k: usize, constant: usize) {
@@ -197,6 +203,9 @@ fn print_startup_banner(args: &Args, k: usize, constant: usize) {
     if args.nj {
         parameters.push("nj=true".to_string());
     }
+    if let Some(bootstrap) = args.bootstrap {
+        parameters.push(format!("bootstrap={bootstrap}"));
+    }
 
     eprintln!("kamino {}", env!("CARGO_PKG_VERSION"));
     eprintln!("parameters: {}", parameters.join(" "));
@@ -215,6 +224,10 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         "min_freq must be between 0.6 and 1.0"
     );
     anyhow::ensure!(args.threads > 0, "threads must be >=1");
+    if let Some(bootstrap) = args.bootstrap {
+        anyhow::ensure!(args.nj, "--bootstrap requires --nj");
+        anyhow::ensure!(bootstrap > 0, "bootstrap replicates must be >=1");
+    }
     anyhow::ensure!((1..=max_k).contains(&k), "invalid k");
     anyhow::ensure!(constant <= k, "constant <= k");
     // Merge the optional input sources into one sorted list of species inputs.
@@ -286,13 +299,18 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         res.partitions,
         res.partition_names,
         args.nj,
+        args.bootstrap,
         args.threads,
     )?;
 
     eprintln!("# output files");
     eprintln!(" . alignment: length={} missing={:.1}%", alen, amiss);
     if args.nj {
-        eprintln!(" . NJ tree");
+        if let Some(bootstrap) = args.bootstrap {
+            eprintln!(" . NJ tree + {bootstrap} bootstrap replicates");
+        } else {
+            eprintln!(" . NJ tree");
+        }
     }
     drop(genomes_tmpdir);
     Ok(())
