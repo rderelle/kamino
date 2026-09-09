@@ -85,6 +85,7 @@ pub fn write_outputs(
     }
     pw.flush()?;
     if generate_nj {
+        eprintln!("# build NJ tree");
         // Tree generation is optional because it adds an O(n²·L) distance pass;
         // bootstrap support repeats that calculation on column-resampled alignments.
         let tree = match bootstrap {
