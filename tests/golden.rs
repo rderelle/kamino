@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use kamino_cli::{run_with_args, Args, RecodeScheme};
+use kamino_cli::{run_with_args, Args};
 
 mod common;
 
@@ -18,7 +18,6 @@ struct GoldenCase {
     work_dir: &'static str,
     genomes: bool,
     length_middle: usize,
-    recode: RecodeScheme,
     nj: bool,
 }
 
@@ -82,8 +81,8 @@ fn run_golden_case(case: GoldenCase) {
         length_middle: case.length_middle,
         mask: 5,
         threads: 1,
-        recode: case.recode,
         nj: case.nj,
+        bootstrap: None,
     };
 
     run_with_args(args)
@@ -103,22 +102,20 @@ fn golden_3diff() {
         work_dir: "target/test_3diff_rs",
         genomes: false,
         length_middle: 35,
-        recode: RecodeScheme::Dayhoff6,
         nj: true,
     });
 }
 
 #[test]
-fn golden_3diff_input_file_kgb6() {
+fn golden_3diff_input_file() {
     run_golden_case(GoldenCase {
-        name: "3diff_input_file_kgb6",
+        name: "3diff_input_file",
         input_dir: None,
         input_file: Some("tests/data/test_3diff/input.tsv"),
         expected_dir: "tests/data/test_3diff/expected",
-        work_dir: "target/test_3diff_input_file_kgb6_rs",
+        work_dir: "target/test_3diff_input_file_rs",
         genomes: false,
         length_middle: 35,
-        recode: RecodeScheme::KGB6,
         nj: true,
     });
 }
@@ -133,7 +130,6 @@ fn golden_genomes() {
         work_dir: "target/test_genomes_rs",
         genomes: true,
         length_middle: 50,
-        recode: RecodeScheme::SR6,
         nj: false,
     });
 }
@@ -165,8 +161,8 @@ fn proteome_output_is_identical_across_thread_counts_and_repeated_runs() {
             length_middle: 35,
             mask: 5,
             threads,
-            recode: RecodeScheme::Dayhoff6,
             nj: false,
+            bootstrap: None,
         })
         .unwrap();
         outputs.push(

@@ -64,16 +64,14 @@ run_case \
   "tests/data/test_3diff/expected" \
   "target/test_3diff" \
   --length-middle 35 \
-  --recode dayhoff6 \
   --nj
 
 run_table_case \
-  "3diff-input-file-kgb6" \
+  "3diff-input-file" \
   "tests/data/test_3diff/input.tsv" \
   "tests/data/test_3diff/expected" \
-  "target/test_3diff_input_file_kgb6" \
+  "target/test_3diff_input_file" \
   --length-middle 35 \
-  --recode kgb6 \
   --nj
 
 run_case \
@@ -83,4 +81,3 @@ run_case \
   "target/test_genomes" \
   --genomes \
   --length-middle 50 \
-  --recode sr6
