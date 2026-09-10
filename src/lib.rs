@@ -28,17 +28,16 @@
 //!   -i, --input-directory <INPUT>        Directory containing proteome FASTA files
 //!   -I, --input-file <INPUT_FILE>        TSV table with `species_name<TAB>path_to_fasta` rows
 //!   -o, --output <OUTPUT>                Prefix for output files [default: kamino]
-//!   -k, --k <K>                          k-mer size used for anchor extraction [k=13]
-//!   -r, --recode <RECODE>                Six-state amino-acid k-mer recoding scheme [r=sr6] [possible values: dayhoff6, sr6, kgb6]
+//!   -k, --k <K>                          k-mer size used for anchor extraction [k=8]
 //!   -f, --min-freq <MIN_FREQ>            Minimum fraction of species present per alignment position [f=0.85]
 //!   -c, --constant <CONSTANT>            Number of 'constant' positions added to each partition [c=3]
 //!   -l, --length-middle <LENGTH_MIDDLE>  Maximum amino-acid length between two adjacent shared anchors [l=35]
 //!   -m, --mask <MASK>                    Consecutive amino-acid differences required for masking [m=5]; 0 disables
 //!   -t, --threads <THREADS>              Number of threads [t=1]
-//! 
+//!
 //! Optional input:
 //!       --genomes  Treat inputs as bacterial genomes and predict proteins first
-//! 
+//!
 //! Optional output:
 //!       --nj                     Build a neighbor-joining tree
 //!   -b, --bootstrap <BOOTSTRAP>  Number of bootstrap replicates; requires --nj
@@ -73,10 +72,8 @@
 //!
 //! The number of constant positions in the final alignment can be adjusted with the
 //! --constant parameter. These positions are taken from the left flank of the end
-//! k-mer in each variant group, next to the middle positions. Because these positions
-//! are recoded, some may become polymorphic once converted back to amino acids. With
-//! the default value of c = 3, constant positions represent about 50% of the
-//! alignment.
+//! amino-acid k-mer in each variant group, next to the middle positions. With the
+//! default value of c = 3, constant positions represent about 50% of the alignment.
 //!
 //! The --mask parameter controls the amino-acid masking performed by kamino to
 //! prevent long runs of polymorphism from being retained in the final alignment.
@@ -85,10 +82,6 @@
 //! paths caused by two consecutive indels. The minimum length of polymorphic runs to
 //! be masked can be decreased with this parameter to make the filtering more
 //! stringent.
-//!
-//! Finally, the six-letter recoding scheme can be modified with the --recode
-//! parameter, although the default sr6 recoding scheme performed best in most of my
-//! tests (sr6 >= dayhoff6 >> kgb6).
 //!
 //!
 //! ## Output files
@@ -109,12 +102,15 @@
 //!
 //! When `-b/--bootstrap` is supplied together with `--nj`, alignment columns are resampled
 //! with replacement and bootstrap percentages are written as internal-node labels in the NJ tree.
-//! Please note that bootstrap analyses on large datasets (e.g. >1,000 samples) can be 
+//! Please note that bootstrap analyses on large datasets (e.g. >1,000 samples) can be
 //! computationally intensive.
 //!
 use anyhow::Context;
 use clap::Parser;
 
+const DEFAULT_K: usize = 8;
+
+mod amino_acid;
 mod group_extraction;
 mod group_filtering;
 mod group_sorting;
@@ -123,9 +119,6 @@ mod output;
 mod phylo;
 mod proba_filter;
 mod protein_prediction;
-mod recode;
-
-pub use recode::RecodeScheme;
 
 #[derive(Parser, Debug)]
 #[command(name = "kamino", author, version, about)]
@@ -141,24 +134,18 @@ pub struct Args {
     pub input_file: Option<std::path::PathBuf>,
 
     /// Prefix for output files
-    #[arg(short, long, default_value = "kamino", help_heading = "Main parameters")]
+    #[arg(
+        short,
+        long,
+        default_value = "kamino",
+        help_heading = "Main parameters"
+    )]
     pub output: std::path::PathBuf,
 
-    /// k-mer size used for anchor extraction [k=13].
+    /// k-mer size used for anchor extraction [k=8].
     #[arg(short, long, help_heading = "Main parameters")]
     pub k: Option<usize>,
 
-    /// Six-state amino-acid k-mer recoding scheme [r=sr6].
-    #[arg(
-        short = 'r',
-        long = "recode",
-        value_enum,
-        default_value_t = RecodeScheme::SR6,
-        hide_default_value = true,
-        help_heading = "Main parameters"
-    )]
-    pub recode: RecodeScheme,
-    
     /// Minimum fraction of species present per alignment position [f=0.85].
     #[arg(
         short = 'f',
@@ -240,7 +227,6 @@ fn print_startup_banner(args: &Args, k: usize, constant: usize) {
     parameters.push(format!("length-middle={}", args.length_middle));
     parameters.push(format!("mask={}", args.mask));
     parameters.push(format!("threads={}", args.threads));
-    parameters.push(format!("recode={}", args.recode));
     if args.nj {
         parameters.push("nj=true".to_string());
     }
@@ -255,9 +241,7 @@ fn print_startup_banner(args: &Args, k: usize, constant: usize) {
 /// Validate arguments, collect inputs, run the analysis, and write output files.
 pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     // Defaults and bounds are kept here so tests and the CLI share identical behavior.
-    let default_k = 13usize;
-    let max_k = 21usize;
-    let k = args.k.unwrap_or(default_k);
+    let k = args.k.unwrap_or(DEFAULT_K);
     let constant = args.constant.unwrap_or(3usize.min(k));
     print_startup_banner(&args, k, constant);
     anyhow::ensure!(
@@ -269,7 +253,11 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         anyhow::ensure!(args.nj, "--bootstrap requires --nj");
         anyhow::ensure!(bootstrap > 0, "bootstrap replicates must be >=1");
     }
-    anyhow::ensure!((1..=max_k).contains(&k), "invalid k");
+    anyhow::ensure!(
+        (1..=amino_acid::MAX_PACKED_K).contains(&k),
+        "invalid k (expected 1..={})",
+        amino_acid::MAX_PACKED_K
+    );
     anyhow::ensure!(constant <= k, "constant <= k");
     // Merge the optional input sources into one sorted list of species inputs.
     let mut species_inputs = Vec::new();
@@ -312,25 +300,19 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         args.min_freq,
         args.length_middle,
         constant,
-        args.recode,
         args.threads,
     )?;
     eprintln!("# analyse variant groups");
     eprintln!(" . raw variant groups: {}", raw_groups.groups.len());
 
-    let sorted_groups = group_sorting::sort_and_deduplicate_groups(raw_groups, args.recode)?;
+    let sorted_groups = group_sorting::sort_and_deduplicate_groups(raw_groups)?;
     eprintln!(
         " . sorted variant groups: {}",
         sorted_groups.raw_candidates.len()
     );
 
-    let res = group_filtering::filter_groups(
-        sorted_groups,
-        args.min_freq,
-        constant,
-        args.mask,
-        args.threads,
-    )?;
+    let res =
+        group_filtering::filter_groups(sorted_groups, args.min_freq, args.mask, args.threads)?;
     eprintln!(" . filtered variant groups: {}", res.partitions.len());
 
     let (alen, amiss) = output::write_outputs(
@@ -355,4 +337,30 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     }
     drop(genomes_tmpdir);
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn default_k_is_selected_by_the_pipeline() {
+        let args = Args::try_parse_from(["kamino", "-i", "input"]).unwrap();
+        assert_eq!(args.k, None);
+        assert_eq!(DEFAULT_K, 8);
+    }
+
+    #[test]
+    fn k_twelve_parses_and_removed_alphabet_options_are_unknown() {
+        assert_eq!(
+            Args::try_parse_from(["kamino", "-i", "input", "-k", "12"])
+                .unwrap()
+                .k,
+            Some(12)
+        );
+        assert!((1..=amino_acid::MAX_PACKED_K).contains(&12));
+        assert!(!(1..=amino_acid::MAX_PACKED_K).contains(&13));
+        assert!(Args::try_parse_from(["kamino", "-i", "input", "-r", "sr6"]).is_err());
+        assert!(Args::try_parse_from(["kamino", "-i", "input", "--recode", "sr6"]).is_err());
+    }
 }

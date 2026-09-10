@@ -5,8 +5,6 @@ use rayon::{prelude::*, ThreadPoolBuilder};
 
 use crate::group_extraction::{BlockArena, RawGroup};
 use crate::group_sorting::{consensus_rows_by_isolate, RawDirectCandidate, SortedGroups};
-use crate::recode::recode_byte;
-use crate::RecodeScheme;
 
 /// Fully assembled result returned to the CLI layer before writing files.
 pub(crate) struct AlignmentResult {
@@ -34,98 +32,56 @@ fn is_missing_or_ambiguous(b: u8) -> bool {
     b == b'-' || b == b'X'
 }
 
-fn majority_recoded_consensus(
-    rows: &[Vec<u8>],
-    len: usize,
-    recode_scheme: RecodeScheme,
-) -> Vec<Option<u8>> {
+fn majority_consensus(rows: &[Vec<u8>], len: usize) -> Vec<Option<u8>> {
     let mut consensus = vec![None; len];
     for c in 0..len {
-        let mut counts = [0usize; 6];
+        let mut counts = [0u16; 26];
         for row in rows {
-            let b = row[c];
-            if is_missing_or_ambiguous(b) {
-                continue;
-            }
-            let recoded = recode_byte(b, recode_scheme);
-            if recoded != 255 {
-                counts[recoded as usize] += 1;
+            let aa = row[c];
+            if !is_missing_or_ambiguous(aa) {
+                debug_assert!(aa.is_ascii_uppercase());
+                counts[(aa - b'A') as usize] += 1;
             }
         }
-
-        let mut best_state = None;
-        let mut best_count = 0usize;
-        for (state, &count) in counts.iter().enumerate() {
-            if count > best_count {
-                best_state = Some(state as u8);
-                best_count = count;
-            }
-        }
-        consensus[c] = best_state;
+        consensus[c] = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(state, count)| (*count, std::cmp::Reverse(state)))
+            .and_then(|(state, &count)| (count > 0).then_some(b'A' + state as u8));
     }
     consensus
 }
 
-fn mask_rows_with_long_divergence(
-    rows: &mut [Vec<u8>],
-    consensus: &[Option<u8>],
-    mask: usize,
-    recode_scheme: RecodeScheme,
-) {
+fn mask_rows_with_long_divergence(rows: &mut [Vec<u8>], consensus: &[Option<u8>], mask: usize) {
     if mask == 0 {
         return;
     }
-
     for row in rows {
-        let mut consecutive_diffs = 0usize;
-        let mut should_mask = false;
-        for (&row_aa, &consensus_state) in row.iter().zip(consensus) {
-            let Some(consensus_state) = consensus_state else {
-                consecutive_diffs = 0;
-                continue;
-            };
-
-            if is_missing_or_ambiguous(row_aa) {
-                consecutive_diffs = 0;
-                continue;
-            }
-
-            let row_state = recode_byte(row_aa, recode_scheme);
-            if row_state == 255 {
-                consecutive_diffs = 0;
-                continue;
-            }
-
-            if row_state == consensus_state {
+        let mut consecutive_diffs = 0;
+        let should_mask = row.iter().zip(consensus).any(|(&aa, &majority)| {
+            if is_missing_or_ambiguous(aa) || majority.is_none() || majority == Some(aa) {
                 consecutive_diffs = 0;
             } else {
                 consecutive_diffs += 1;
-                if consecutive_diffs >= mask {
-                    should_mask = true;
-                    break;
-                }
             }
-        }
+            consecutive_diffs >= mask
+        });
         if should_mask {
             row.fill(b'X');
         }
     }
 }
 
-fn is_polymorphic_column(rows: &[Vec<u8>], col: usize, recode_scheme: RecodeScheme) -> bool {
-    let mut first_observed = None;
+fn is_polymorphic_column(rows: &[Vec<u8>], col: usize) -> bool {
+    let mut first = None;
     for row in rows {
-        let b = row[col];
-        if is_missing_or_ambiguous(b) {
+        let aa = row[col];
+        if is_missing_or_ambiguous(aa) {
             continue;
         }
-        let recoded = recode_byte(b, recode_scheme);
-        if recoded == 255 {
-            continue;
-        }
-        match first_observed {
-            None => first_observed = Some(recoded),
-            Some(first) if first != recoded => return true,
+        match first {
+            None => first = Some(aa),
+            Some(observed) if observed != aa => return true,
             Some(_) => {}
         }
     }
@@ -232,11 +188,9 @@ fn build_candidate_group(
     arena: &BlockArena,
     protein_names: &[Vec<String>],
     n: usize,
-    _k: usize,
     constant: usize,
     min_freq: f32,
     mask: usize,
-    recode_scheme: RecodeScheme,
 ) -> Option<CandidateGroup> {
     let name = consensus_protein_name(&raw.group, protein_names);
     let stored_len = raw.middle_len + constant;
@@ -247,13 +201,13 @@ fn build_candidate_group(
         return None;
     }
     if mask > 0 {
-        let consensus = majority_recoded_consensus(&rows, stored_len, recode_scheme);
-        mask_rows_with_long_divergence(&mut rows, &consensus, mask, recode_scheme);
+        let consensus = majority_consensus(&rows, stored_len);
+        mask_rows_with_long_divergence(&mut rows, &consensus, mask);
     }
 
     // Retain only original middle columns satisfying the missing-data
     // frequency threshold, then trim that retained middle to the first and
-    // last polymorphic columns in recoded amino-acid space. Constant
+    // last polymorphic columns using exact amino-acid bytes. Constant
     // right-anchor context is appended afterwards and cannot determine or
     // rescue middle polymorphism.
     let mut retained_middle = Vec::new();
@@ -267,10 +221,10 @@ fn build_candidate_group(
     }
     let first_poly_idx = retained_middle
         .iter()
-        .position(|&c| is_polymorphic_column(&rows, c, recode_scheme));
+        .position(|&c| is_polymorphic_column(&rows, c));
     let last_poly_idx = retained_middle
         .iter()
-        .rposition(|&c| is_polymorphic_column(&rows, c, recode_scheme));
+        .rposition(|&c| is_polymorphic_column(&rows, c));
     let (Some(first_poly_idx), Some(last_poly_idx)) = (first_poly_idx, last_poly_idx) else {
         return None;
     };
@@ -298,7 +252,6 @@ fn build_candidate_group(
 pub(crate) fn filter_groups(
     sorted: SortedGroups,
     min_freq: f32,
-    constant: usize,
     mask: usize,
     num_threads: usize,
 ) -> Result<AlignmentResult> {
@@ -307,13 +260,9 @@ pub(crate) fn filter_groups(
         arena,
         raw_candidates,
         protein_names,
-        k,
-        constant: stored_constant,
-        min_needed: _min_needed,
-        n_species: n,
-        recode_scheme,
+        constant,
     } = sorted;
-    debug_assert_eq!(constant, stored_constant);
+    let n = species_names.len();
     let mut partitions = Vec::new();
     let mut names = Vec::new();
     let mut pos = 0usize;
@@ -329,18 +278,8 @@ pub(crate) fn filter_groups(
             .into_par_iter()
             .enumerate()
             .filter_map(|(idx, raw)| {
-                build_candidate_group(
-                    raw,
-                    &arena,
-                    &protein_names,
-                    n,
-                    k,
-                    constant,
-                    min_freq,
-                    mask,
-                    recode_scheme,
-                )
-                .map(|candidate| (idx, candidate))
+                build_candidate_group(raw, &arena, &protein_names, n, constant, min_freq, mask)
+                    .map(|candidate| (idx, candidate))
             })
             .collect()
     });
@@ -409,7 +348,7 @@ mod tests {
         sorted_with_layout(rows, k, k)
     }
 
-    fn sorted_with_layout(rows: &[&[u8]], k: usize, constant: usize) -> SortedGroups {
+    fn sorted_with_layout(rows: &[&[u8]], _k: usize, constant: usize) -> SortedGroups {
         let mut arena = BlockArena::new();
         let raw_candidates = vec![candidate(rows, &mut arena, constant)];
         SortedGroups {
@@ -419,21 +358,17 @@ mod tests {
                 .collect(),
             raw_candidates,
             protein_names: vec![vec!["protein".to_string()]; rows.len()],
-            k,
             constant,
-            min_needed: 1,
-            n_species: rows.len(),
-            recode_scheme: RecodeScheme::SR6,
         }
     }
 
     #[test]
-    fn majority_recoded_consensus_ignores_missing_invalid_and_ties_by_state_value() {
-        let rows = vec![b"AAX".to_vec(), b"DDB".to_vec(), b"D--".to_vec()];
+    fn majority_consensus_ignores_missing_and_ties_by_amino_acid() {
+        let rows = vec![b"AAX".to_vec(), b"DDX".to_vec(), b"D--".to_vec()];
 
         assert_eq!(
-            majority_recoded_consensus(&rows, 3, RecodeScheme::SR6),
-            vec![Some(1), Some(0), None]
+            majority_consensus(&rows, 3),
+            vec![Some(b'D'), Some(b'A'), None]
         );
     }
 
@@ -481,61 +416,61 @@ mod tests {
     }
 
     #[test]
-    fn same_recoded_state_differences_are_not_masked() {
-        let consensus = vec![Some(0); 5];
+    fn exact_amino_acid_differences_are_masked() {
+        let consensus = vec![Some(b'A'); 5];
         let mut rows = vec![b"PPPPP".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(&mut rows, &consensus, 3);
 
-        assert_eq!(rows[0], b"PPPPP".to_vec());
+        assert_eq!(rows[0], b"XXXXX".to_vec());
     }
 
     #[test]
-    fn fewer_than_mask_consecutive_recoded_differences_are_not_masked() {
-        let consensus = vec![Some(0); 5];
+    fn fewer_than_mask_consecutive_amino_acid_differences_are_not_masked() {
+        let consensus = vec![Some(b'A'); 5];
         let mut rows = vec![b"ADDAA".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(&mut rows, &consensus, 3);
 
         assert_eq!(rows[0], b"ADDAA".to_vec());
     }
 
     #[test]
-    fn exactly_mask_consecutive_recoded_differences_mask_entire_row() {
-        let consensus = vec![Some(0); 5];
+    fn exactly_mask_consecutive_amino_acid_differences_mask_entire_row() {
+        let consensus = vec![Some(b'A'); 5];
         let mut rows = vec![b"ADDDA".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(&mut rows, &consensus, 3);
 
         assert_eq!(rows[0], b"XXXXX".to_vec());
     }
 
     #[test]
     fn missing_ambiguous_and_invalid_positions_break_difference_runs() {
-        let consensus = vec![Some(0); 9];
+        let consensus = vec![Some(b'A'); 9];
         let mut rows = vec![b"DDAD-DXBD".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(&mut rows, &consensus, 3);
 
         assert_eq!(rows[0], b"DDAD-DXBD".to_vec());
     }
 
     #[test]
-    fn consensus_positions_without_valid_recoded_state_break_difference_runs() {
-        let consensus = vec![Some(0), Some(0), None, Some(0), Some(0)];
+    fn missing_consensus_positions_break_difference_runs() {
+        let consensus = vec![Some(b'A'), Some(b'A'), None, Some(b'A'), Some(b'A')];
         let mut rows = vec![b"DDDDA".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(&mut rows, &consensus, 3);
 
         assert_eq!(rows[0], b"DDDDA".to_vec());
     }
 
     #[test]
     fn mask_zero_returns_without_changing_rows() {
-        let consensus = vec![Some(0); 5];
+        let consensus = vec![Some(b'A'); 5];
         let mut rows = vec![b"DDDDD".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 0, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(&mut rows, &consensus, 0);
 
         assert_eq!(rows[0], b"DDDDD".to_vec());
     }
@@ -543,7 +478,7 @@ mod tests {
     #[test]
     fn retained_middle_starts_at_first_retained_polymorphic_column() {
         let rows = &[b"ACCEF".as_slice(), b"ACCHF", b"ACCEF", b"ACCHF"];
-        let result = filter_groups(sorted(rows), 1.0, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 1.0, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 0, 1)]);
         assert_eq!(result.concat[0], b"E".to_vec());
@@ -555,19 +490,19 @@ mod tests {
     #[test]
     fn retained_middle_trims_past_raw_only_polymorphism() {
         let rows = &[b"AAPCF".as_slice(), b"APDCF", b"AAPCF", b"APDCF"];
-        let result = filter_groups(sorted(rows), 1.0, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 1.0, 0, 1).unwrap();
 
-        assert_eq!(result.partitions, vec![(0, 0, 1)]);
-        assert_eq!(result.concat[0], b"P".to_vec());
-        assert_eq!(result.concat[1], b"D".to_vec());
-        assert_eq!(result.concat[2], b"P".to_vec());
-        assert_eq!(result.concat[3], b"D".to_vec());
+        assert_eq!(result.partitions, vec![(0, 1, 2)]);
+        assert_eq!(result.concat[0], b"AP".to_vec());
+        assert_eq!(result.concat[1], b"PD".to_vec());
+        assert_eq!(result.concat[2], b"AP".to_vec());
+        assert_eq!(result.concat[3], b"PD".to_vec());
     }
 
     #[test]
     fn ambiguous_x_does_not_create_early_polymorphism() {
         let rows = &[b"ACCEF".as_slice(), b"ACCHF", b"AXCEF", b"ACXHF"];
-        let result = filter_groups(sorted(rows), 0.75, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 0.75, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 0, 1)]);
         assert_eq!(result.concat[0], b"E".to_vec());
@@ -579,7 +514,7 @@ mod tests {
     #[test]
     fn discards_when_only_retained_middle_columns_are_conserved() {
         let rows = &[b"ACCEF".as_slice(), b"ACCDF", b"ACC-F", b"ACC-F"];
-        let result = filter_groups(sorted(rows), 0.75, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 0.75, 0, 1).unwrap();
 
         assert!(result.partitions.is_empty());
         assert!(result.concat.iter().all(Vec::is_empty));
@@ -588,7 +523,7 @@ mod tests {
     #[test]
     fn right_anchor_tail_is_appended_after_polymorphic_middle() {
         let rows = &[b"ACEFT".as_slice(), b"ACHFT", b"ACEFT", b"ACHFT"];
-        let result = filter_groups(sorted_with_layout(rows, 1, 1), 1.0, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 1.0, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 1, 2)]);
         assert_eq!(result.concat[0], b"ET".to_vec());
@@ -600,7 +535,7 @@ mod tests {
     #[test]
     fn polymorphic_right_anchor_tail_cannot_rescue_conserved_middle() {
         let rows = &[b"ACCD".as_slice(), b"ACCE", b"ACCD", b"ACCE"];
-        let result = filter_groups(sorted_with_layout(rows, 1, 1), 1.0, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 1.0, 0, 1).unwrap();
 
         assert!(result.partitions.is_empty());
         assert!(result.concat.iter().all(Vec::is_empty));
@@ -609,7 +544,7 @@ mod tests {
     #[test]
     fn discards_when_only_raw_polymorphic_middle_column_fails_missingness() {
         let rows = &[b"ACGT".as_slice(), b"ADGT", b"A-GT", b"A-GT"];
-        let result = filter_groups(sorted(rows), 0.75, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 0.75, 0, 1).unwrap();
 
         assert!(result.partitions.is_empty());
         assert!(result.concat.iter().all(Vec::is_empty));
@@ -618,7 +553,7 @@ mod tests {
     #[test]
     fn retains_group_with_retained_polymorphic_middle_column() {
         let rows = &[b"ACGT".as_slice(), b"ADGT", b"ACGT", b"ADGT"];
-        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 1, 2)]);
         assert_eq!(result.concat[0], b"CT".to_vec());
@@ -630,7 +565,7 @@ mod tests {
     #[test]
     fn constant_tail_cannot_rescue_without_retained_polymorphic_middle() {
         let rows = &[b"AC-T".as_slice(), b"AD-T", b"A--T", b"A--T"];
-        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 0, 1).unwrap();
 
         assert!(result.partitions.is_empty());
         assert!(result.concat.iter().all(Vec::is_empty));
@@ -639,7 +574,7 @@ mod tests {
     #[test]
     fn middle_is_trimmed_on_both_sides_before_appending_constants() {
         let rows = &[b"QFCPQRRR".as_slice(), b"QDCDQRRR"];
-        let result = filter_groups(sorted_with_k(rows, 3), 1.0, 3, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_k(rows, 3), 1.0, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 5, 6)]);
         assert_eq!(result.concat[0], b"FCPRRR".to_vec());
@@ -649,7 +584,7 @@ mod tests {
     #[test]
     fn final_middle_column_before_constants_is_polymorphic() {
         let rows = &[b"QFCPQRRR".as_slice(), b"QDCDQRRR"];
-        let result = filter_groups(sorted_with_k(rows, 3), 1.0, 3, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_k(rows, 3), 1.0, 0, 1).unwrap();
         let tail_keep = 3;
         let middle_len = result.partitions[0].2 - tail_keep;
         let trimmed_rows: Vec<Vec<u8>> = result
@@ -658,11 +593,7 @@ mod tests {
             .map(|row| row[..middle_len].to_vec())
             .collect();
 
-        assert!(is_polymorphic_column(
-            &trimmed_rows,
-            middle_len - 1,
-            RecodeScheme::SR6
-        ));
+        assert!(is_polymorphic_column(&trimmed_rows, middle_len - 1,));
         assert_eq!(result.concat[0][middle_len - 1], b'P');
         assert_eq!(result.concat[1][middle_len - 1], b'D');
     }
@@ -670,7 +601,7 @@ mod tests {
     #[test]
     fn missingness_filtering_happens_before_polymorphic_trimming() {
         let rows = &[b"AFCPR".as_slice(), b"ADCDR", b"A-CPR", b"A-CDR"];
-        let result = filter_groups(sorted(rows), 0.75, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 0.75, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 0, 1)]);
         assert_eq!(result.concat[0], b"P".to_vec());
@@ -680,18 +611,19 @@ mod tests {
     }
 
     #[test]
-    fn raw_amino_acid_differences_in_same_recoded_state_do_not_count_as_polymorphism() {
+    fn amino_acid_a_and_p_count_as_polymorphism() {
         let rows = &[b"AACA".as_slice(), b"APCA"];
-        let result = filter_groups(sorted(rows), 1.0, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 1.0, 0, 1).unwrap();
 
-        assert!(result.partitions.is_empty());
-        assert!(result.concat.iter().all(Vec::is_empty));
+        assert_eq!(result.partitions, vec![(0, 0, 1)]);
+        assert_eq!(result.concat[0], b"A".to_vec());
+        assert_eq!(result.concat[1], b"P".to_vec());
     }
 
     #[test]
     fn gaps_and_x_are_ignored_when_detecting_polymorphism() {
         let rows = &[b"ACPR".as_slice(), b"AXPR", b"A-DR", b"ACDR"];
-        let result = filter_groups(sorted(rows), 0.5, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 0.5, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 0, 1)]);
         assert_eq!(result.concat[0], b"P".to_vec());
@@ -703,7 +635,7 @@ mod tests {
     #[test]
     fn constant_zero_emits_only_trimmed_polymorphic_middle_region() {
         let rows = &[b"QFCPQRRR".as_slice(), b"QDCDQRRR"];
-        let result = filter_groups(sorted_with_layout(rows, 3, 0), 1.0, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 3, 0), 1.0, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 2, 3)]);
         assert_eq!(result.concat[0], b"FCP".to_vec());
@@ -713,7 +645,7 @@ mod tests {
     #[test]
     fn one_polymorphic_middle_column_with_constant_three_has_length_four() {
         let rows = &[b"AAACRRR".as_slice(), b"AAADRRR"];
-        let result = filter_groups(sorted_with_k(rows, 3), 1.0, 3, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_k(rows, 3), 1.0, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 3, 4)]);
         assert_eq!(result.concat[0], b"CRRR".to_vec());
@@ -723,7 +655,7 @@ mod tests {
     #[test]
     fn divergent_row_masking_happens_before_polymorphic_middle_filtering() {
         let rows = &[b"ACDEFGK".as_slice(), b"ACDEFGK", b"APPPPPK"];
-        let result = filter_groups(sorted(rows), 1.0, 0, 5, 1).unwrap();
+        let result = filter_groups(sorted(rows), 1.0, 5, 1).unwrap();
 
         assert!(result.partitions.is_empty());
         assert!(result.concat.iter().all(Vec::is_empty));
@@ -732,7 +664,7 @@ mod tests {
     #[test]
     fn mask_zero_disables_divergent_row_masking() {
         let rows = &[b"ACDEFGK".as_slice(), b"ACDEFGK", b"APPPPPK"];
-        let result = filter_groups(sorted(rows), 1.0, 0, 0, 1).unwrap();
+        let result = filter_groups(sorted(rows), 1.0, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 4, 5)]);
         assert_eq!(result.concat[0], b"CDEFG".to_vec());
@@ -743,7 +675,7 @@ mod tests {
     #[test]
     fn constant_tail_columns_failing_missingness_are_not_appended() {
         let rows = &[b"ACT".as_slice(), b"AD-", b"AC-", b"AD-"];
-        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 1, 0, 1).unwrap();
+        let result = filter_groups(sorted_with_layout(rows, 1, 1), 0.75, 0, 1).unwrap();
 
         assert_eq!(result.partitions, vec![(0, 0, 1)]);
         assert_eq!(result.concat[0], b"C".to_vec());

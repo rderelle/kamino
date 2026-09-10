@@ -1,6 +1,6 @@
 //! Raw variant group extraction pipeline.
 //!
-//! The pipeline recodes amino-acid FASTA records into a compact six-state alphabet,
+//! The pipeline packs exact amino-acid FASTA records into compact keys,
 //! finds `k`-mer anchors shared by enough species, extracts short variable
 //! blocks between local bubble-boundary anchors, and merges raw observations across species.
 use anyhow::{anyhow, bail, Result};
@@ -10,12 +10,13 @@ use seq_io::fasta::{Reader as FastaReader, Record};
 use std::io::{self, Write};
 use std::sync::{mpsc, Mutex};
 
+use crate::amino_acid::{
+    encode, encode_valid_uppercase, kmer_mask, roll as packed_roll, INVALID_STATE,
+};
 use crate::io::{open_fasta, SpeciesInput};
 use crate::proba_filter::{
     AtomicCountMinSketch, BloomFilter, CountMinSketch, BLOOM_BITS, CMS_DEPTH, CMS_WIDTH,
 };
-use crate::recode::{recode_byte, RECODE_BITS_PER_SYMBOL};
-use crate::RecodeScheme;
 
 const START_CLUSTER_SPAN: usize = 10;
 
@@ -106,7 +107,7 @@ impl BlockArena {
     }
 }
 
-/// Pair of left/right recoded anchors that brackets one candidate variable block.
+/// Pair of left/right packed amino-acid anchors that brackets one candidate variable block.
 pub(crate) type AnchorPair = (u64, u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BlockOccurrence {
@@ -247,7 +248,6 @@ fn extract_bubble_pairs(
 #[allow(clippy::too_many_arguments)]
 fn extract_from_valid_segment(
     aa: &[u8],
-    recoded: &[u8],
     k: usize,
     k_mask: u64,
     cms: &CountMinSketch,
@@ -261,7 +261,7 @@ fn extract_from_valid_segment(
 ) -> Result<()> {
     // This function works only on already-valid amino-acid stretches. Unknown or
     // ambiguous residues split proteins into separate valid segments upstream.
-    if recoded.len() < k || k == 0 {
+    if aa.len() < k || k == 0 {
         return Ok(());
     }
 
@@ -275,9 +275,9 @@ fn extract_from_valid_segment(
     // storing every hit in the segment.
     let mut roll = 0u64;
     let mut have = 0usize;
-    for (pos, &a) in recoded.iter().enumerate() {
-        debug_assert_ne!(a, 255);
-        roll = ((roll << RECODE_BITS_PER_SYMBOL) | (a as u64)) & k_mask;
+    for (pos, &aa_byte) in aa.iter().enumerate() {
+        let code = encode_valid_uppercase(aa_byte);
+        roll = crate::amino_acid::roll(roll, code, k_mask);
         if have < k {
             have += 1;
         }
@@ -379,7 +379,6 @@ fn count_species_kmers(
     input: &SpeciesInput,
     k: usize,
     k_mask: u64,
-    recode_scheme: RecodeScheme,
     cmsa: &AtomicCountMinSketch,
 ) -> Result<()> {
     // Count each distinct `k`-mer at most once per species, which makes the
@@ -395,13 +394,13 @@ fn count_species_kmers(
             if b.is_ascii_whitespace() {
                 continue;
             }
-            let a = recode_byte(b.to_ascii_uppercase(), recode_scheme);
-            if a == 255 {
+            let a = encode(b);
+            if a == INVALID_STATE {
                 roll = 0;
                 have = 0;
                 continue;
             }
-            roll = ((roll << RECODE_BITS_PER_SYMBOL) | (a as u64)) & k_mask;
+            roll = packed_roll(roll, a, k_mask);
             if have < k {
                 have += 1;
             }
@@ -432,7 +431,6 @@ fn extract_species_blocks(
     min_needed: u32,
     length_middle: usize,
     constant: usize,
-    recode_scheme: RecodeScheme,
 ) -> Result<SpeciesExtraction> {
     // Split each protein at ambiguous residues. Valid stretches are independently
     // scanned for adjacent shared-anchor runs.
@@ -443,7 +441,6 @@ fn extract_species_blocks(
     let mut protein_names = Vec::new();
     let min_block_len = 2 * k + 1;
     let mut aa_segment = Vec::new();
-    let mut recoded_segment = Vec::new();
     while let Some(rec) = r.next() {
         let rec = rec?;
         let protein_record_id = rec.id()?.trim();
@@ -464,25 +461,20 @@ fn extract_species_blocks(
         protein_names.push(protein_name);
         let protein_id = protein_id as u32;
         aa_segment.clear();
-        recoded_segment.clear();
         let seq_len = rec.seq().len();
         if aa_segment.capacity() < seq_len {
             aa_segment.reserve(seq_len - aa_segment.capacity());
-        }
-        if recoded_segment.capacity() < seq_len {
-            recoded_segment.reserve(seq_len - recoded_segment.capacity());
         }
         for &b in rec.seq() {
             if b.is_ascii_whitespace() {
                 continue;
             }
             let up = b.to_ascii_uppercase();
-            let rv = recode_byte(up, recode_scheme);
-            if rv == 255 {
-                if recoded_segment.len() >= min_block_len {
+            let state = encode(up);
+            if state == INVALID_STATE {
+                if aa_segment.len() >= min_block_len {
                     extract_from_valid_segment(
                         &aa_segment,
-                        &recoded_segment,
                         k,
                         k_mask,
                         cms,
@@ -496,16 +488,13 @@ fn extract_species_blocks(
                     )?;
                 }
                 aa_segment.clear();
-                recoded_segment.clear();
             } else {
                 aa_segment.push(up);
-                recoded_segment.push(rv);
             }
         }
-        if recoded_segment.len() >= min_block_len {
+        if aa_segment.len() >= min_block_len {
             extract_from_valid_segment(
                 &aa_segment,
-                &recoded_segment,
                 k,
                 k_mask,
                 cms,
@@ -538,14 +527,12 @@ pub(crate) struct RawExtractedGroups {
     pub(crate) groups: RawDirectGroups,
     /// Per-species protein-name tables referenced by species-local protein IDs.
     pub(crate) protein_names: Vec<Vec<String>>,
-    /// Length of each complete recoded anchor in the logical full path.
+    /// Length of each complete amino-acid anchor in the logical full path.
     pub(crate) k: usize,
     /// Number of original right-anchor amino acids stored after each middle.
     pub(crate) constant: usize,
     /// Minimum species support threshold used during extraction.
     pub(crate) min_needed: usize,
-    /// Number of species represented by `species_names`.
-    pub(crate) n_species: usize,
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_groups(
@@ -554,7 +541,6 @@ pub(crate) fn extract_groups(
     min_freq: f32,
     length_middle: usize,
     constant: usize,
-    recode_scheme: RecodeScheme,
     num_threads: usize,
 ) -> Result<RawExtractedGroups> {
     // Stage 1: determine the occupancy threshold and build a deterministic local
@@ -567,11 +553,7 @@ pub(crate) fn extract_groups(
         );
     }
     let min_needed = (min_freq * n.max(1) as f32).ceil() as u32;
-    let k_mask = if k * RECODE_BITS_PER_SYMBOL as usize >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << (k * RECODE_BITS_PER_SYMBOL as usize)) - 1
-    };
+    let k_mask = kmer_mask(k);
     let n_threads = num_threads.max(1);
     let pool = ThreadPoolBuilder::new().num_threads(n_threads).build()?;
 
@@ -584,7 +566,7 @@ pub(crate) fn extract_groups(
         inputs
             .par_iter()
             .map(|input| {
-                let result = count_species_kmers(input, k, k_mask, recode_scheme, &cmsa);
+                let result = count_species_kmers(input, k, k_mask, &cmsa);
                 count_progress.increment();
                 result
             })
@@ -599,6 +581,10 @@ pub(crate) fn extract_groups(
     // Extraction intentionally uses this completed snapshot; counting and extraction
     // remain separate passes so anchors are evaluated against all species.
     let cms = cmsa.snapshot();
+    // The atomic table and its immutable snapshot are each roughly 512 MiB with
+    // the default dimensions. Release the write-only table before extraction so
+    // both representations are not retained for the rest of the pipeline.
+    drop(cmsa);
 
     // Stage 4: stream completed species extractions into the global structures,
     // merging each result immediately regardless of species completion order.
@@ -625,7 +611,6 @@ pub(crate) fn extract_groups(
                             min_needed,
                             length_middle,
                             constant,
-                            recode_scheme,
                         );
                         extraction_progress.increment();
                         let _ = tx.send(result);
@@ -670,7 +655,6 @@ pub(crate) fn extract_groups(
         k,
         constant,
         min_needed: min_needed as usize,
-        n_species: n,
     })
 }
 
