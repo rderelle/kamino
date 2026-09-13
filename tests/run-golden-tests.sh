@@ -23,7 +23,7 @@ run_case() {
   # Run from a clean working directory so outputs land there.
   (
     cd "$work_dir"
-    "../../${BIN}" "$@" -i "../../${input_dir}"
+    "../../${BIN}" "$@" -c 3 -i "../../${input_dir}"
   )
 
   # Compare the deterministic expected output files with the program output.
@@ -47,7 +47,7 @@ run_table_case() {
   # Run from a clean working directory so outputs land there.
   (
     cd "$work_dir"
-    "../../${BIN}" "$@" -I "../../${input_file}"
+    "../../${BIN}" "$@" -c 3 -I "../../${input_file}"
   )
 
   # Compare the deterministic expected output files with the program output.
