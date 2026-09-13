@@ -30,7 +30,7 @@
 //!   -o, --output <OUTPUT>                Prefix for output files [default: kamino]
 //!   -k, --k <K>                          k-mer size used for anchor extraction [k=8]
 //!   -f, --min-freq <MIN_FREQ>            Minimum fraction of species present per alignment position [f=0.85]
-//!   -c, --constant <CONSTANT>            Number of 'constant' positions added to each partition [c=3]
+//!   -c, --constant <CONSTANT>            Number of 'constant' positions added to each partition [c=1]
 //!   -l, --length-middle <LENGTH_MIDDLE>  Maximum amino-acid length between two adjacent shared anchors [l=35]
 //!   -m, --mask <MASK>                    Consecutive amino-acid differences required for masking [m=5]; 0 disables
 //!   -t, --threads <THREADS>              Number of threads [t=1]
@@ -72,8 +72,8 @@
 //!
 //! The number of constant positions in the final alignment can be adjusted with the
 //! --constant parameter. These positions are taken from the left flank of the end
-//! amino-acid k-mer in each variant group, next to the middle positions. With the
-//! default value of c = 3, constant positions represent about 50% of the alignment.
+//! amino-acid k-mer in each variant group, next to the middle positions. The
+//! default value is c = 1.
 //!
 //! The --mask parameter controls the amino-acid masking performed by kamino to
 //! prevent long runs of polymorphism from being retained in the final alignment.
@@ -156,7 +156,7 @@ pub struct Args {
     )]
     pub min_freq: f32,
 
-    /// Number of 'constant' positions added to each partition [c=3].
+    /// Number of 'constant' positions added to each partition [c=1].
     #[arg(short, long, help_heading = "Main parameters")]
     pub constant: Option<usize>,
 
@@ -242,7 +242,7 @@ fn print_startup_banner(args: &Args, k: usize, constant: usize) {
 pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     // Defaults and bounds are kept here so tests and the CLI share identical behavior.
     let k = args.k.unwrap_or(DEFAULT_K);
-    let constant = args.constant.unwrap_or(3usize.min(k));
+    let constant = args.constant.unwrap_or(1usize.min(k));
     print_startup_banner(&args, k, constant);
     anyhow::ensure!(
         (0.6..=1.0).contains(&args.min_freq),
@@ -315,7 +315,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         group_filtering::filter_groups(sorted_groups, args.min_freq, args.mask, args.threads)?;
     eprintln!(" . filtered variant groups: {}", res.partitions.len());
 
-    let (alen, amiss) = output::write_outputs(
+    let (alen, amiss, aconstant) = output::write_outputs(
         &args.output,
         &res.species_names,
         res.concat,
@@ -327,7 +327,10 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
     )?;
 
     eprintln!("# output files");
-    eprintln!(" . alignment: length={} missing={:.1}%", alen, amiss);
+    eprintln!(
+        " . alignment: length={} constant={:.1}% missing={:.1}%",
+        alen, aconstant, amiss
+    );
     if args.nj {
         if let Some(bootstrap) = args.bootstrap {
             eprintln!(" . NJ tree + {bootstrap} bootstrap replicates");

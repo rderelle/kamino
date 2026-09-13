@@ -38,7 +38,7 @@ pub fn write_outputs(
     generate_nj: bool,
     bootstrap: Option<usize>,
     threads: usize,
-) -> Result<(usize, f64)> {
+) -> Result<(usize, f64, f64)> {
     // Calculate overall missingness once before writing the FASTA rows.
     let (fas_path, tsv_path, partitions_path, tree_path) = output_paths(out_base);
     let mut w = BufWriter::new(File::create(&fas_path)?);
@@ -52,6 +52,25 @@ pub fn write_outputs(
         0.0
     } else {
         100.0 * total_missing as f64 / total_pos as f64
+    };
+    let constant_positions = (0..total_len)
+        .filter(|&column| {
+            let mut amino_acid = None;
+            concat.iter().all(|row| match row[column] {
+                b'-' | b'X' => true,
+                residue => {
+                    amino_acid.is_none_or(|previous| previous == residue) && {
+                        amino_acid = Some(residue);
+                        true
+                    }
+                }
+            })
+        })
+        .count();
+    let constant = if total_len == 0 {
+        0.0
+    } else {
+        100.0 * constant_positions as f64 / total_len as f64
     };
     // FASTA output is wrapped at 60 characters for broad tool compatibility.
     for (sid, name) in species.iter().enumerate() {
@@ -99,5 +118,5 @@ pub fn write_outputs(
         writeln!(tw, "{}", tree)?;
         tw.flush()?;
     }
-    Ok((total_len, miss))
+    Ok((total_len, miss, constant))
 }
