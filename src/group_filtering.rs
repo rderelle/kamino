@@ -5,8 +5,7 @@ use rayon::{prelude::*, ThreadPoolBuilder};
 
 use crate::group_extraction::{BlockArena, RawGroup};
 use crate::group_sorting::{consensus_rows_by_isolate, RawDirectCandidate, SortedGroups};
-use crate::recode::recode_byte;
-use crate::RecodeScheme;
+use crate::recode::Alphabet;
 
 /// Fully assembled result returned to the CLI layer before writing files.
 pub(crate) struct AlignmentResult {
@@ -34,22 +33,19 @@ fn is_missing_or_ambiguous(b: u8) -> bool {
     b == b'-' || b == b'X'
 }
 
-fn majority_recoded_consensus(
-    rows: &[Vec<u8>],
-    len: usize,
-    recode_scheme: RecodeScheme,
-) -> Vec<Option<u8>> {
+fn majority_state_consensus(rows: &[Vec<u8>], len: usize, alphabet: Alphabet) -> Vec<Option<u8>> {
     let mut consensus = vec![None; len];
+    debug_assert!(alphabet.n_states() <= 32);
     for c in 0..len {
-        let mut counts = [0usize; 6];
+        let mut counts = [0usize; 32];
         for row in rows {
             let b = row[c];
             if is_missing_or_ambiguous(b) {
                 continue;
             }
-            let recoded = recode_byte(b, recode_scheme);
-            if recoded != 255 {
-                counts[recoded as usize] += 1;
+            let state = alphabet.encode(b);
+            if state != 255 {
+                counts[state as usize] += 1;
             }
         }
 
@@ -70,7 +66,7 @@ fn mask_rows_with_long_divergence(
     rows: &mut [Vec<u8>],
     consensus: &[Option<u8>],
     mask: usize,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
 ) {
     if mask == 0 {
         return;
@@ -90,7 +86,7 @@ fn mask_rows_with_long_divergence(
                 continue;
             }
 
-            let row_state = recode_byte(row_aa, recode_scheme);
+            let row_state = alphabet.encode(row_aa);
             if row_state == 255 {
                 consecutive_diffs = 0;
                 continue;
@@ -112,32 +108,32 @@ fn mask_rows_with_long_divergence(
     }
 }
 
-fn is_polymorphic_column(rows: &[Vec<u8>], col: usize, recode_scheme: RecodeScheme) -> bool {
+fn is_polymorphic_column(rows: &[Vec<u8>], col: usize, alphabet: Alphabet) -> bool {
     let mut first_observed = None;
     for row in rows {
         let b = row[col];
         if is_missing_or_ambiguous(b) {
             continue;
         }
-        let recoded = recode_byte(b, recode_scheme);
-        if recoded == 255 {
+        let state = alphabet.encode(b);
+        if state == 255 {
             continue;
         }
         match first_observed {
-            None => first_observed = Some(recoded),
-            Some(first) if first != recoded => return true,
+            None => first_observed = Some(state),
+            Some(first) if first != state => return true,
             Some(_) => {}
         }
     }
     false
 }
 
-fn missing_fraction(rows: &[Vec<u8>], col: usize, n_species: usize) -> f32 {
-    let miss = rows
+fn has_minimum_presence(rows: &[Vec<u8>], col: usize, min_needed: usize) -> bool {
+    let present = rows
         .iter()
-        .filter(|r| is_missing_or_ambiguous(r[col]))
+        .filter(|r| !is_missing_or_ambiguous(r[col]))
         .count();
-    (miss as f32) / (n_species as f32)
+    present >= min_needed
 }
 
 fn consensus_protein_name(group: &RawGroup, protein_names: &[Vec<String>]) -> String {
@@ -155,11 +151,7 @@ fn consensus_protein_name(group: &RawGroup, protein_names: &[Vec<String>]) -> St
                 .get(occurrence.sid as usize)
                 .and_then(|names| names.get(occurrence.protein_id as usize))
         })
-        .filter_map(|name| {
-            name.trim()
-                .split_once(char::is_whitespace)
-                .map(|(_, desc)| desc.trim())
-        })
+        .map(|name| name.trim())
         .filter(|name| !name.is_empty())
         .collect();
 
@@ -234,9 +226,9 @@ fn build_candidate_group(
     n: usize,
     _k: usize,
     constant: usize,
-    min_freq: f32,
+    min_needed: usize,
     mask: usize,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
 ) -> Option<CandidateGroup> {
     let name = consensus_protein_name(&raw.group, protein_names);
     let stored_len = raw.middle_len + constant;
@@ -247,18 +239,18 @@ fn build_candidate_group(
         return None;
     }
     if mask > 0 {
-        let consensus = majority_recoded_consensus(&rows, stored_len, recode_scheme);
-        mask_rows_with_long_divergence(&mut rows, &consensus, mask, recode_scheme);
+        let consensus = majority_state_consensus(&rows, stored_len, alphabet);
+        mask_rows_with_long_divergence(&mut rows, &consensus, mask, alphabet);
     }
 
     // Retain only original middle columns satisfying the missing-data
     // frequency threshold, then trim that retained middle to the first and
-    // last polymorphic columns in recoded amino-acid space. Constant
+    // last polymorphic columns in state amino-acid space. Constant
     // right-anchor context is appended afterwards and cannot determine or
     // rescue middle polymorphism.
     let mut retained_middle = Vec::new();
     for c in mid_start..mid_end {
-        if missing_fraction(&rows, c, n) <= 1.0 - min_freq {
+        if has_minimum_presence(&rows, c, min_needed) {
             retained_middle.push(c);
         }
     }
@@ -267,17 +259,17 @@ fn build_candidate_group(
     }
     let first_poly_idx = retained_middle
         .iter()
-        .position(|&c| is_polymorphic_column(&rows, c, recode_scheme));
+        .position(|&c| is_polymorphic_column(&rows, c, alphabet));
     let last_poly_idx = retained_middle
         .iter()
-        .rposition(|&c| is_polymorphic_column(&rows, c, recode_scheme));
+        .rposition(|&c| is_polymorphic_column(&rows, c, alphabet));
     let (Some(first_poly_idx), Some(last_poly_idx)) = (first_poly_idx, last_poly_idx) else {
         return None;
     };
     let mut keep_cols: Vec<usize> = retained_middle[first_poly_idx..=last_poly_idx].to_vec();
 
     for c in mid_end..stored_len {
-        if missing_fraction(&rows, c, n) <= 1.0 - min_freq {
+        if has_minimum_presence(&rows, c, min_needed) {
             keep_cols.push(c);
         }
     }
@@ -309,11 +301,12 @@ pub(crate) fn filter_groups(
         protein_names,
         k,
         constant: stored_constant,
-        min_needed: _min_needed,
+        min_needed: _stored_min_needed,
         n_species: n,
-        recode_scheme,
+        alphabet,
     } = sorted;
     debug_assert_eq!(constant, stored_constant);
+    let min_needed = (min_freq * n as f32).ceil() as usize;
     let mut partitions = Vec::new();
     let mut names = Vec::new();
     let mut pos = 0usize;
@@ -336,9 +329,9 @@ pub(crate) fn filter_groups(
                     n,
                     k,
                     constant,
-                    min_freq,
+                    min_needed,
                     mask,
-                    recode_scheme,
+                    alphabet,
                 )
                 .map(|candidate| (idx, candidate))
             })
@@ -375,6 +368,15 @@ mod tests {
     use super::*;
     use crate::group_extraction::{BlockArena, BlockOccurrence};
     use crate::group_sorting::RawDirectCandidate;
+
+    #[test]
+    fn exact_minimum_presence_is_retained_without_float_rounding() {
+        let mut rows = vec![vec![b'A']; 17];
+        rows.extend(vec![vec![b'-']; 3]);
+
+        assert!(has_minimum_presence(&rows, 0, 17));
+        assert!(!has_minimum_presence(&rows, 0, 18));
+    }
 
     fn candidate(rows: &[&[u8]], arena: &mut BlockArena, constant: usize) -> RawDirectCandidate {
         let mut group = RawGroup::default();
@@ -423,18 +425,67 @@ mod tests {
             constant,
             min_needed: 1,
             n_species: rows.len(),
-            recode_scheme: RecodeScheme::SR6,
+            alphabet: Alphabet::new(Some(crate::RecodeScheme::SR6)),
         }
     }
 
     #[test]
-    fn majority_recoded_consensus_ignores_missing_invalid_and_ties_by_state_value() {
+    fn majority_state_consensus_ignores_missing_invalid_and_ties_by_state_value() {
         let rows = vec![b"AAX".to_vec(), b"DDB".to_vec(), b"D--".to_vec()];
 
         assert_eq!(
-            majority_recoded_consensus(&rows, 3, RecodeScheme::SR6),
+            majority_state_consensus(&rows, 3, Alphabet::new(Some(crate::RecodeScheme::SR6))),
             vec![Some(1), Some(0), None]
         );
+    }
+
+    #[test]
+    fn polymorphism_respects_selected_alphabet() {
+        let rows = vec![b"A".to_vec(), b"P".to_vec()];
+        assert!(is_polymorphic_column(&rows, 0, Alphabet::new(None)));
+        assert!(!is_polymorphic_column(
+            &rows,
+            0,
+            Alphabet::new(Some(crate::RecodeScheme::SR6))
+        ));
+    }
+
+    #[test]
+    fn aa20_consensus_and_polymorphism_handle_high_sparse_states() {
+        let alphabet = Alphabet::new(None);
+        let rows = vec![b"VWY".to_vec(), b"VWY".to_vec(), b"YWV".to_vec()];
+        assert_eq!(
+            majority_state_consensus(&rows, 3, alphabet),
+            vec![Some(21), Some(22), Some(24)]
+        );
+        assert!(is_polymorphic_column(&rows, 0, alphabet));
+        assert!(!is_polymorphic_column(&rows[..2], 2, alphabet));
+
+        let mut divergent = vec![b"YWV".to_vec()];
+        mask_rows_with_long_divergence(
+            &mut divergent,
+            &[Some(21), Some(22), Some(24)],
+            1,
+            alphabet,
+        );
+        assert_eq!(divergent[0], b"XXX");
+    }
+
+    #[test]
+    fn masking_respects_selected_alphabet() {
+        let consensus = vec![Some(0); 3];
+        let mut aa20_rows = vec![b"PPP".to_vec()];
+        mask_rows_with_long_divergence(&mut aa20_rows, &consensus, 3, Alphabet::new(None));
+        assert_eq!(aa20_rows[0], b"XXX");
+
+        let mut sr6_rows = vec![b"PPP".to_vec()];
+        mask_rows_with_long_divergence(
+            &mut sr6_rows,
+            &consensus,
+            3,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        );
+        assert_eq!(sr6_rows[0], b"PPP");
     }
 
     #[test]
@@ -481,31 +532,46 @@ mod tests {
     }
 
     #[test]
-    fn same_recoded_state_differences_are_not_masked() {
+    fn same_state_differences_are_not_masked() {
         let consensus = vec![Some(0); 5];
         let mut rows = vec![b"PPPPP".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(
+            &mut rows,
+            &consensus,
+            3,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        );
 
         assert_eq!(rows[0], b"PPPPP".to_vec());
     }
 
     #[test]
-    fn fewer_than_mask_consecutive_recoded_differences_are_not_masked() {
+    fn fewer_than_mask_consecutive_state_differences_are_not_masked() {
         let consensus = vec![Some(0); 5];
         let mut rows = vec![b"ADDAA".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(
+            &mut rows,
+            &consensus,
+            3,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        );
 
         assert_eq!(rows[0], b"ADDAA".to_vec());
     }
 
     #[test]
-    fn exactly_mask_consecutive_recoded_differences_mask_entire_row() {
+    fn exactly_mask_consecutive_state_differences_mask_entire_row() {
         let consensus = vec![Some(0); 5];
         let mut rows = vec![b"ADDDA".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(
+            &mut rows,
+            &consensus,
+            3,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        );
 
         assert_eq!(rows[0], b"XXXXX".to_vec());
     }
@@ -515,17 +581,27 @@ mod tests {
         let consensus = vec![Some(0); 9];
         let mut rows = vec![b"DDAD-DXBD".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(
+            &mut rows,
+            &consensus,
+            3,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        );
 
         assert_eq!(rows[0], b"DDAD-DXBD".to_vec());
     }
 
     #[test]
-    fn consensus_positions_without_valid_recoded_state_break_difference_runs() {
+    fn consensus_positions_without_valid_state_break_difference_runs() {
         let consensus = vec![Some(0), Some(0), None, Some(0), Some(0)];
         let mut rows = vec![b"DDDDA".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 3, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(
+            &mut rows,
+            &consensus,
+            3,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        );
 
         assert_eq!(rows[0], b"DDDDA".to_vec());
     }
@@ -535,7 +611,12 @@ mod tests {
         let consensus = vec![Some(0); 5];
         let mut rows = vec![b"DDDDD".to_vec()];
 
-        mask_rows_with_long_divergence(&mut rows, &consensus, 0, RecodeScheme::SR6);
+        mask_rows_with_long_divergence(
+            &mut rows,
+            &consensus,
+            0,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        );
 
         assert_eq!(rows[0], b"DDDDD".to_vec());
     }
@@ -661,7 +742,7 @@ mod tests {
         assert!(is_polymorphic_column(
             &trimmed_rows,
             middle_len - 1,
-            RecodeScheme::SR6
+            Alphabet::new(Some(crate::RecodeScheme::SR6))
         ));
         assert_eq!(result.concat[0][middle_len - 1], b'P');
         assert_eq!(result.concat[1][middle_len - 1], b'D');
@@ -680,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_amino_acid_differences_in_same_recoded_state_do_not_count_as_polymorphism() {
+    fn raw_amino_acid_differences_in_same_state_do_not_count_as_polymorphism() {
         let rows = &[b"AACA".as_slice(), b"APCA"];
         let result = filter_groups(sorted(rows), 1.0, 0, 0, 1).unwrap();
 
