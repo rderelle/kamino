@@ -1,6 +1,6 @@
 [package]
 name = "kamino-cli"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
 description = "Build phylogenomic datasets in seconds."
 license = "MIT"
@@ -15,7 +15,7 @@ clap = { version = "4", features = ["derive"] }
 seq_io = "0.3.4"
 flate2 = { version = "1.0", features = ["rust_backend"] }
 tempfile = "3"
-hashbrown = "0.14"
+hashbrown = "0.17"
 rayon = "1.11"
 
 [profile.release]
