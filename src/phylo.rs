@@ -1,11 +1,12 @@
 //! Minimal neighbor-joining implementation used for the optional `--nj` tree.
 //!
 //! Distances are computed from pairwise amino-acid differences while ignoring gaps
-//! and unknown residues; the resulting matrix is converted to Newick with the
-//! classic neighbor-joining reduction loop.
+//! and unknown residues. The alignment is bit-sliced so each pair comparison handles
+//! 64 columns at a time, and invariant gap-free/all-gap columns are folded away.
+//! The NJ reduction uses a compact matrix and incrementally maintained row sums.
 use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
-use std::collections::HashSet;
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::fmt::Write as _;
 
 #[derive(Debug, Clone)]
 pub struct Edge {
@@ -23,279 +24,468 @@ pub struct Node {
     pub children: Vec<Edge>,
 }
 
-// LG stationary frequencies from Le & Gascuel (2008).
 const LG_PI: [f64; 20] = [
     0.079_066, 0.055_941, 0.041_977, 0.053_052, 0.012_937, 0.040_767, 0.071_586, 0.057_337,
     0.022_355, 0.062_157, 0.099_081, 0.064_600, 0.022_951, 0.042_302, 0.044_040, 0.061_197,
     0.053_287, 0.012_777, 0.027_843, 0.070_200,
 ];
 
-// Pre-computed constant c = 1.0 - Σπᵢ² (hoisted out of the hot loop).
 const C: f64 = {
-    let mut s = 0.0f64;
-    let mut i = 0usize;
+    let mut sum = 0.0;
+    let mut i = 0;
     while i < LG_PI.len() {
-        let pi = LG_PI[i];
-        s += pi * pi;
+        sum += LG_PI[i] * LG_PI[i];
         i += 1;
     }
-    1.0 - s
+    1.0 - sum
 };
 
-/// Map an uppercase amino-acid byte to its LG index (A,R,N,...,V).
-/// Returns None for gaps/unknowns so they are ignored in distance estimates.
-fn aa_index(b: u8) -> Option<usize> {
-    match b {
-        b'A' => Some(0),
-        b'R' => Some(1),
-        b'N' => Some(2),
-        b'D' => Some(3),
-        b'C' => Some(4),
-        b'Q' => Some(5),
-        b'E' => Some(6),
-        b'G' => Some(7),
-        b'H' => Some(8),
-        b'I' => Some(9),
-        b'L' => Some(10),
-        b'K' => Some(11),
-        b'M' => Some(12),
-        b'F' => Some(13),
-        b'P' => Some(14),
-        b'S' => Some(15),
-        b'T' => Some(16),
-        b'W' => Some(17),
-        b'Y' => Some(18),
-        b'V' => Some(19),
-        _ => None,
+const GAP: u8 = 20;
+const PLANES: usize = 6;
+const VALID: usize = 5;
+
+const AA_CODE: [u8; 256] = {
+    let mut table = [GAP; 256];
+    let order = *b"ARNDCQEGHILKMFPSTWYV";
+    let mut i = 0;
+    while i < order.len() {
+        table[order[i] as usize] = i as u8;
+        i += 1;
     }
-}
+    table
+};
 
-/// Pre-map a sequence to integer indices (0-19 = AA, 20 = gap/unknown).
-/// Done once per sequence (O(n·L) cost, negligible).
-fn map_sequence(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .map(|&b| aa_index(b).map_or(20u8, |x| x as u8))
-        .collect()
-}
-
-/// Compute an LG+F81 corrected distance between two aligned sequences.
-/// Now operates on pre-mapped integer vectors → no branchy match lookups in the hot loop.
-fn lg_f81_distance(a: &[u8], b: &[u8]) -> f64 {
-    let mut valid_sites = 0usize;
-    let mut mismatches = 0usize;
-
-    for (&ia, &ib) in a.iter().zip(b.iter()) {
-        if ia < 20 && ib < 20 {
-            valid_sites += 1;
-            if ia != ib {
-                mismatches += 1;
-            }
-        }
-    }
-
+fn corrected_distance(valid_sites: u64, mismatches: u64) -> f64 {
     if valid_sites == 0 {
         return 0.0;
     }
-
-    let p = (mismatches as f64) / (valid_sites as f64);
-    let mut pc = p / C;
-    if pc >= 1.0 {
-        pc = 0.999_999_999;
-    }
+    let p = mismatches as f64 / valid_sites as f64;
+    let pc = (p / C).min(0.999_999_999);
     -(1.0 - pc).ln()
 }
 
-fn idx(i: usize, j: usize, dim: usize) -> usize {
-    // Flat row-major indexing avoids Vec<Vec<_>> allocation overhead.
-    i * dim + j
+struct BitAlignment {
+    n_taxa: usize,
+    words: usize,
+    planes: Vec<u64>,
+    const_cols: u64,
 }
 
-/// Build the full pairwise distance matrix (size (2n-1)²) for NJ.
-fn compute_distance_matrix(seqs: &[Vec<u8>], num_threads: usize) -> Vec<f64> {
-    let n = seqs.len();
-    let dim = 2 * n - 1;
-    let mut dist = vec![0.0; dim * dim];
-    let dist_ptr = dist.as_mut_ptr() as usize;
-    let n_threads = num_threads.max(1);
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(n_threads)
-        .build()
-        .expect("Failed to build Rayon thread pool in compute_distance_matrix");
+impl BitAlignment {
+    #[inline]
+    fn taxon(&self, i: usize) -> &[u64] {
+        let stride = self.words * PLANES;
+        &self.planes[i * stride..(i + 1) * stride]
+    }
+
+    #[inline]
+    fn counts(&self, i: usize, j: usize) -> (u64, u64) {
+        let (a, b) = (self.taxon(i), self.taxon(j));
+        let (mut valid_sites, mut mismatches) = (self.const_cols, 0u64);
+        let (a_blocks, a_remainder) = a.as_chunks::<PLANES>();
+        let (b_blocks, b_remainder) = b.as_chunks::<PLANES>();
+        debug_assert!(a_remainder.is_empty() && b_remainder.is_empty());
+        for (x, y) in a_blocks.iter().zip(b_blocks) {
+            let both = x[VALID] & y[VALID];
+            let diff =
+                (x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3]) | (x[4] ^ y[4]);
+            valid_sites += both.count_ones() as u64;
+            mismatches += (diff & both).count_ones() as u64;
+        }
+        (valid_sites, mismatches)
+    }
+}
+
+fn build_bit_alignment(seqs: &[Vec<u8>], len: usize, pool: &ThreadPool) -> BitAlignment {
+    // 0 = all gap, 1 = constant and gap-free, 2 = potentially pair-dependent.
+    const BLOCK: usize = 1 << 16;
+    let mut class = vec![0u8; len];
     pool.install(|| {
-        (0..n).into_par_iter().for_each(|i| {
-            for j in (i + 1)..n {
-                let d = lg_f81_distance(&seqs[i], &seqs[j]);
-                let ij = idx(i, j, dim);
-                let ji = idx(j, i, dim);
-                unsafe {
-                    // Safety: each (i, j) pair is unique per thread, so writes do not overlap.
-                    let dist_ptr = dist_ptr as *mut f64;
-                    *dist_ptr.add(ij) = d;
-                    *dist_ptr.add(ji) = d;
+        class
+            .par_chunks_mut(BLOCK)
+            .enumerate()
+            .for_each(|(block, out)| {
+                let range = block * BLOCK..block * BLOCK + out.len();
+                let first: Vec<u8> = seqs[0][range.clone()]
+                    .iter()
+                    .map(|&byte| AA_CODE[byte as usize])
+                    .collect();
+                // Flags: 1 = gap, 2 = difference, 4 = residue.
+                let mut flags: Vec<u8> = first
+                    .iter()
+                    .map(|&code| if code == GAP { 1 } else { 4 })
+                    .collect();
+                for seq in &seqs[1..] {
+                    for ((&byte, &reference), flag) in
+                        seq[range.clone()].iter().zip(&first).zip(&mut flags)
+                    {
+                        let code = AA_CODE[byte as usize];
+                        *flag |= if code == GAP {
+                            1
+                        } else {
+                            4 | (((code != reference) as u8) << 1)
+                        };
+                    }
                 }
-            }
-        });
+                for (kind, &flag) in out.iter_mut().zip(&flags) {
+                    *kind = if flag & 4 == 0 {
+                        0
+                    } else if flag & 3 == 0 {
+                        1
+                    } else {
+                        2
+                    };
+                }
+            });
     });
 
-    dist
+    let kept_cols: Vec<usize> = class
+        .iter()
+        .enumerate()
+        .filter_map(|(column, &kind)| (kind == 2).then_some(column))
+        .collect();
+    let const_cols = class.iter().filter(|&&kind| kind == 1).count() as u64;
+    let words = kept_cols.len().div_ceil(64);
+    let stride = words * PLANES;
+    let mut planes = vec![0u64; seqs.len() * stride];
+    if stride != 0 {
+        pool.install(|| {
+            planes
+                .par_chunks_mut(stride)
+                .zip(seqs)
+                .for_each(|(out, seq)| {
+                    for (block, columns) in kept_cols.chunks(64).enumerate() {
+                        let mut acc = [0u64; PLANES];
+                        for (bit, &column) in columns.iter().enumerate() {
+                            let code = AA_CODE[seq[column] as usize];
+                            let valid = (code != GAP) as u64;
+                            let value = code as u64 * valid;
+                            for (plane, slot) in acc[..VALID].iter_mut().enumerate() {
+                                *slot |= ((value >> plane) & 1) << bit;
+                            }
+                            acc[VALID] |= valid << bit;
+                        }
+                        out[block * PLANES..(block + 1) * PLANES].copy_from_slice(&acc);
+                    }
+                });
+        });
+    }
+    BitAlignment {
+        n_taxa: seqs.len(),
+        words,
+        planes,
+        const_cols,
+    }
 }
 
-/// Perform neighbor-joining using the precomputed distances.
-/// Returns the full node list and the root index.
-fn neighbor_joining(names: &[String], dist: &mut [f64]) -> (Vec<Node>, usize) {
-    // Nodes are stored in an arena: initial leaves first, then inferred internal
-    // nodes. `active` contains the current NJ frontier within that arena.
-    let n = names.len();
-    let dim = 2 * n - 1;
-    let mut nodes = Vec::with_capacity(dim);
-    for name in names {
-        nodes.push(Node {
+fn compute_distance_matrix(align: &BitAlignment, pool: &ThreadPool) -> Vec<Vec<f64>> {
+    pool.install(|| {
+        (0..align.n_taxa)
+            .into_par_iter()
+            .map(|i| {
+                ((i + 1)..align.n_taxa)
+                    .map(|j| {
+                        let (valid, mismatches) = align.counts(i, j);
+                        corrected_distance(valid, mismatches)
+                    })
+                    .collect()
+            })
+            .collect()
+    })
+}
+
+const Q_BLOCK: usize = 8;
+const ROW_SUM_REFRESH: usize = 128;
+
+#[inline]
+fn row_sum(row: &[f64]) -> f64 {
+    let mut acc = [0.0; 4];
+    let (blocks, remainder) = row.as_chunks::<4>();
+    for block in blocks {
+        for (sum, &value) in acc.iter_mut().zip(block) {
+            *sum += value;
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3]) + remainder.iter().sum::<f64>()
+}
+
+struct Nj {
+    dist: Vec<f64>,
+    row_sums: Vec<f64>,
+    new_row: Vec<f64>,
+    slot: Vec<u32>,
+    children: Vec<[u32; 2]>,
+    lengths: Vec<[f64; 2]>,
+}
+
+impl Nj {
+    fn new(n: usize) -> Self {
+        Self {
+            dist: vec![0.0; n * n],
+            row_sums: vec![0.0; n],
+            new_row: vec![0.0; n],
+            slot: Vec::with_capacity(n),
+            children: Vec::with_capacity(n),
+            lengths: Vec::with_capacity(n),
+        }
+    }
+
+    fn load(&mut self, n: usize, rows: &[Vec<f64>]) {
+        for (i, row) in rows.iter().enumerate().take(n) {
+            for (offset, j) in ((i + 1)..n).enumerate() {
+                let distance = row[offset];
+                self.dist[i * n + j] = distance;
+                self.dist[j * n + i] = distance;
+            }
+        }
+    }
+
+    fn reduce(&mut self, n: usize) {
+        let (dist, sums, new_row, slot) = (
+            &mut self.dist[..],
+            &mut self.row_sums[..],
+            &mut self.new_row[..],
+            &mut self.slot,
+        );
+        slot.extend(0..n as u32);
+        let mut m = n;
+        for i in 0..m {
+            sums[i] = row_sum(&dist[i * n..i * n + m]);
+        }
+        let mut since_refresh = 0;
+
+        while m > 2 {
+            let factor = (m - 2) as f64;
+            let mut best_q = f64::INFINITY;
+            let mut best = (0, 1);
+            let mut best_key = (u32::MAX, u32::MAX);
+            for a in 0..m - 1 {
+                let row = &dist[a * n..a * n + m];
+                let mut b = a + 1;
+                while b + Q_BLOCK <= m {
+                    let mut q = [0.0; Q_BLOCK];
+                    let mut low = f64::INFINITY;
+                    for (offset, value) in q.iter_mut().enumerate() {
+                        *value = factor * row[b + offset] - sums[a] - sums[b + offset];
+                        low = low.min(*value);
+                    }
+                    if low <= best_q {
+                        for (offset, &value) in q.iter().enumerate() {
+                            let key = pair_key(slot[a], slot[b + offset]);
+                            if value < best_q || (value == best_q && key < best_key) {
+                                (best_q, best, best_key) = (value, (a, b + offset), key);
+                            }
+                        }
+                    }
+                    b += Q_BLOCK;
+                }
+                for b in b..m {
+                    let value = factor * row[b] - sums[a] - sums[b];
+                    let key = pair_key(slot[a], slot[b]);
+                    if value < best_q || (value == best_q && key < best_key) {
+                        (best_q, best, best_key) = (value, (a, b), key);
+                    }
+                }
+            }
+
+            let (a, b) = best;
+            let dab = dist[a * n + b];
+            let la = (0.5 * dab + (sums[a] - sums[b]) / (2.0 * factor)).max(0.0);
+            let lb = (dab - la).max(0.0);
+            self.children.push([slot[a], slot[b]]);
+            self.lengths.push([la, lb]);
+            slot[a] = (n + self.children.len() - 1) as u32;
+
+            let mut new_sum = 0.0;
+            for t in 0..m {
+                if t != a && t != b {
+                    let (dat, dbt) = (dist[a * n + t], dist[b * n + t]);
+                    let dut = 0.5 * (dat + dbt - dab);
+                    new_row[t] = dut;
+                    sums[t] = sums[t] - dat - dbt + dut;
+                    new_sum += dut;
+                }
+            }
+            for t in 0..m {
+                if t != a && t != b {
+                    dist[a * n + t] = new_row[t];
+                    dist[t * n + a] = new_row[t];
+                }
+            }
+            dist[a * n + a] = 0.0;
+            sums[a] = new_sum;
+
+            let last = m - 1;
+            if b != last {
+                dist.copy_within(last * n..last * n + m, b * n);
+                dist[b * n + b] = 0.0;
+                for t in 0..m {
+                    dist[t * n + b] = dist[b * n + t];
+                }
+                sums[b] = sums[last];
+                slot[b] = slot[last];
+            }
+            m -= 1;
+            since_refresh += 1;
+            if since_refresh == ROW_SUM_REFRESH {
+                since_refresh = 0;
+                for i in 0..m {
+                    sums[i] = row_sum(&dist[i * n..i * n + m]);
+                }
+            }
+        }
+
+        let len = (dist[1] * 0.5).max(0.0);
+        self.children.push([slot[0], slot[1]]);
+        self.lengths.push([len, len]);
+    }
+}
+
+#[inline]
+fn pair_key(a: u32, b: u32) -> (u32, u32) {
+    (a.min(b), a.max(b))
+}
+
+fn build_nodes(names: &[String], nj: &Nj) -> (Vec<Node>, usize) {
+    let mut nodes: Vec<Node> = names
+        .iter()
+        .map(|name| Node {
             name: Some(name.clone()),
             children: Vec::new(),
-        });
-    }
-
-    let mut active: Vec<usize> = (0..n).collect();
-    while active.len() > 2 {
-        let m = active.len();
-        let mut r = vec![0.0; dim];
-        for &i in &active {
-            let mut sum = 0.0;
-            for &j in &active {
-                if i != j {
-                    sum += dist[idx(i, j, dim)];
-                }
-            }
-            r[i] = sum;
-        }
-
-        // Select the pair minimizing the NJ Q criterion.
-        let mut best_pair = (active[0], active[1]);
-        let mut best_q = f64::INFINITY;
-        for (pos_i, &i) in active.iter().enumerate() {
-            for &j in active.iter().skip(pos_i + 1) {
-                let q = ((m - 2) as f64) * dist[idx(i, j, dim)] - r[i] - r[j];
-                if q < best_q {
-                    best_q = q;
-                    best_pair = (i, j);
-                }
-            }
-        }
-
-        let (i, j) = best_pair;
-        let dij = dist[idx(i, j, dim)];
-        let denom = 2.0 * ((m - 2) as f64);
-        let mut li = 0.5 * dij + (r[i] - r[j]) / denom;
-        let mut lj = dij - li;
-        if li < 0.0 {
-            li = 0.0;
-        }
-        if lj < 0.0 {
-            lj = 0.0;
-        }
-
-        // Create a new internal node joining the chosen pair and update distances
-        // from that node to every remaining active node.
-        let u = nodes.len();
+        })
+        .collect();
+    for (children, lengths) in nj.children.iter().zip(&nj.lengths) {
         nodes.push(Node {
             name: None,
-            children: vec![Edge { child: i, len: li }, Edge { child: j, len: lj }],
+            children: vec![
+                Edge {
+                    child: children[0] as usize,
+                    len: lengths[0],
+                },
+                Edge {
+                    child: children[1] as usize,
+                    len: lengths[1],
+                },
+            ],
         });
-
-        for &k in &active {
-            if k == i || k == j {
-                continue;
-            }
-            let duk = 0.5 * (dist[idx(i, k, dim)] + dist[idx(j, k, dim)] - dij);
-            dist[idx(u, k, dim)] = duk;
-            dist[idx(k, u, dim)] = duk;
-        }
-
-        active.retain(|&x| x != i && x != j);
-        active.push(u);
     }
-
-    // The final two active nodes are connected under a synthetic root.
-    let a = active[0];
-    let b = active[1];
-    let mut len = dist[idx(a, b, dim)] * 0.5;
-    if len < 0.0 {
-        len = 0.0;
-    }
-    let root = nodes.len();
-    nodes.push(Node {
-        name: None,
-        children: vec![Edge { child: a, len }, Edge { child: b, len }],
-    });
-
+    let root = nodes.len() - 1;
     (nodes, root)
 }
 
-/// Quote/escape names containing Newick-special characters.
 fn escape_name(name: &str) -> String {
-    let needs_quotes = name
+    if name
         .chars()
-        .any(|c| matches!(c, ' ' | ':' | '(' | ')' | ',' | ';'));
-    if needs_quotes {
-        let escaped = name.replace('\'', "''");
-        format!("'{}'", escaped)
+        .any(|character| matches!(character, ' ' | ':' | '(' | ')' | ',' | ';'))
+    {
+        format!("'{}'", name.replace('\'', "''"))
     } else {
         name.to_string()
     }
 }
 
-/// Format branch lengths with fixed precision for stable output.
-fn format_len(len: f64) -> String {
-    format!("{:.6}", len)
-}
-
-/// Recursively format a subtree in Newick (without trailing semicolon).
-fn format_subtree(nodes: &[Node], node_id: usize) -> String {
+fn write_subtree(nodes: &[Node], node_id: usize, out: &mut String) {
     let node = &nodes[node_id];
     if node.children.is_empty() {
-        return escape_name(node.name.as_deref().unwrap_or(""));
+        out.push_str(&escape_name(node.name.as_deref().unwrap_or("")));
+        return;
     }
-
-    let mut parts = Vec::with_capacity(node.children.len());
-    for edge in &node.children {
-        let child_str = format_subtree(nodes, edge.child);
-        parts.push(format!("{}:{}", child_str, format_len(edge.len)));
+    out.push('(');
+    for (position, edge) in node.children.iter().enumerate() {
+        if position != 0 {
+            out.push(',');
+        }
+        write_subtree(nodes, edge.child, out);
+        let _ = write!(out, ":{:.6}", edge.len);
     }
-    format!("({})", parts.join(","))
+    out.push(')');
 }
 
-/// Emit a full Newick string from the rooted node list.
 fn to_newick(nodes: &[Node], root: usize) -> String {
-    format!("{};", format_subtree(nodes, root))
+    let mut out = String::new();
+    write_subtree(nodes, root, &mut out);
+    out.push(';');
+    out
 }
 
-/// Build a neighbor-joining tree and return it as Newick.
-/// Requires at least two sequences of identical length.
-pub fn nj_tree_newick(
-    names: &[String],
-    seqs: &[Vec<u8>],
-    num_threads: usize,
-) -> Result<String, String> {
-    // Validate the rectangular alignment contract before doing any expensive work.
+fn validate_alignment(names: &[String], seqs: &[Vec<u8>]) -> Result<usize, String> {
     if names.len() != seqs.len() {
         return Err("names and sequences length mismatch".to_string());
     }
     if names.len() < 2 {
         return Err("need at least 2 sequences".to_string());
     }
-    let mut lengths = HashSet::new();
-    for seq in seqs {
-        lengths.insert(seq.len());
-    }
-    if lengths.len() != 1 {
+    let len = seqs[0].len();
+    if seqs.iter().any(|seq| seq.len() != len) {
         return Err("all sequences must have identical lengths".to_string());
     }
+    Ok(len)
+}
 
-    // One-time mapping of all sequences to integer indices (0-19 = AA, 20 = gap).
-    // This removes the expensive aa_index match from the O(n²·L) hot loop.
-    let mapped_seqs: Vec<Vec<u8>> = seqs.iter().map(|s| map_sequence(s)).collect();
-
-    let mut dist = compute_distance_matrix(&mapped_seqs, num_threads);
-    let (nodes, root) = neighbor_joining(names, &mut dist);
+pub fn nj_tree_newick(
+    names: &[String],
+    seqs: &[Vec<u8>],
+    num_threads: usize,
+) -> Result<String, String> {
+    let len = validate_alignment(names, seqs)?;
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(num_threads.max(1))
+        .build()
+        .expect("Failed to build Rayon thread pool for the neighbor-joining stage");
+    let alignment = build_bit_alignment(seqs, len, &pool);
+    let mut nj = Nj::new(names.len());
+    nj.load(names.len(), &compute_distance_matrix(&alignment, &pool));
+    nj.reduce(names.len());
+    let (nodes, root) = build_nodes(names, &nj);
     Ok(to_newick(&nodes, root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn naive_distance(a: &[u8], b: &[u8]) -> f64 {
+        let (mut valid, mut mismatches) = (0, 0);
+        for (&a, &b) in a.iter().zip(b) {
+            let (a, b) = (AA_CODE[a as usize], AA_CODE[b as usize]);
+            if a < GAP && b < GAP {
+                valid += 1;
+                mismatches += (a != b) as u64;
+            }
+        }
+        corrected_distance(valid, mismatches)
+    }
+
+    #[test]
+    fn bit_slicing_preserves_pairwise_distances() {
+        let seqs = vec![
+            b"AARN-XVA-KKMAAV".to_vec(),
+            b"ARRNAXVA-KKLAAV".to_vec(),
+            b"NNRNA-VR-KKMAAV".to_vec(),
+            b"NNRDA-VR-KKMAAC".to_vec(),
+        ];
+        let pool = ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let alignment = build_bit_alignment(&seqs, seqs[0].len(), &pool);
+        let rows = compute_distance_matrix(&alignment, &pool);
+        for i in 0..seqs.len() {
+            for j in i + 1..seqs.len() {
+                assert!((rows[i][j - i - 1] - naive_distance(&seqs[i], &seqs[j])).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn output_is_independent_of_thread_count() {
+        let names = ["A", "B", "C", "D"].map(str::to_string);
+        let seqs = vec![
+            b"AAAA----ARND".to_vec(),
+            b"AAAR----ARND".to_vec(),
+            b"RRRR----ARNE".to_vec(),
+            b"RRRN----ARNE".to_vec(),
+        ];
+        assert_eq!(
+            nj_tree_newick(&names, &seqs, 1).unwrap(),
+            nj_tree_newick(&names, &seqs, 4).unwrap()
+        );
+    }
 }

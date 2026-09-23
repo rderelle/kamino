@@ -1,6 +1,6 @@
 //! Raw variant group extraction pipeline.
 //!
-//! The pipeline recodes amino-acid FASTA records into a compact six-state alphabet,
+//! The pipeline encodes amino-acid FASTA records into a compact selected alphabet,
 //! finds `k`-mer anchors shared by enough species, extracts short variable
 //! blocks between local bubble-boundary anchors, and merges raw observations across species.
 use anyhow::{anyhow, bail, Result};
@@ -14,8 +14,7 @@ use crate::io::{open_fasta, SpeciesInput};
 use crate::proba_filter::{
     AtomicCountMinSketch, BloomFilter, CountMinSketch, BLOOM_BITS, CMS_DEPTH, CMS_WIDTH,
 };
-use crate::recode::{recode_byte, RECODE_BITS_PER_SYMBOL};
-use crate::RecodeScheme;
+use crate::recode::Alphabet;
 
 const START_CLUSTER_SPAN: usize = 10;
 
@@ -106,7 +105,7 @@ impl BlockArena {
     }
 }
 
-/// Pair of left/right recoded anchors that brackets one candidate variable block.
+/// Pair of left/right encoded anchors that brackets one candidate variable block.
 pub(crate) type AnchorPair = (u64, u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BlockOccurrence {
@@ -247,9 +246,10 @@ fn extract_bubble_pairs(
 #[allow(clippy::too_many_arguments)]
 fn extract_from_valid_segment(
     aa: &[u8],
-    recoded: &[u8],
+    encoded: &[u8],
     k: usize,
     k_mask: u64,
+    bits_per_state: u32,
     cms: &CountMinSketch,
     min_needed: u32,
     length_middle: usize,
@@ -261,7 +261,7 @@ fn extract_from_valid_segment(
 ) -> Result<()> {
     // This function works only on already-valid amino-acid stretches. Unknown or
     // ambiguous residues split proteins into separate valid segments upstream.
-    if recoded.len() < k || k == 0 {
+    if encoded.len() < k || k == 0 {
         return Ok(());
     }
 
@@ -275,9 +275,9 @@ fn extract_from_valid_segment(
     // storing every hit in the segment.
     let mut roll = 0u64;
     let mut have = 0usize;
-    for (pos, &a) in recoded.iter().enumerate() {
+    for (pos, &a) in encoded.iter().enumerate() {
         debug_assert_ne!(a, 255);
-        roll = ((roll << RECODE_BITS_PER_SYMBOL) | (a as u64)) & k_mask;
+        roll = ((roll << bits_per_state) | (a as u64)) & k_mask;
         if have < k {
             have += 1;
         }
@@ -379,7 +379,7 @@ fn count_species_kmers(
     input: &SpeciesInput,
     k: usize,
     k_mask: u64,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
     cmsa: &AtomicCountMinSketch,
 ) -> Result<()> {
     // Count each distinct `k`-mer at most once per species, which makes the
@@ -387,6 +387,7 @@ fn count_species_kmers(
     let rdr = open_fasta(&input.path)?;
     let mut r = FastaReader::new(rdr);
     let mut bloom = BloomFilter::new(BLOOM_BITS);
+    let bits_per_state = alphabet.bits_per_state();
     while let Some(rec) = r.next() {
         let rec = rec?;
         let mut roll = 0u64;
@@ -395,13 +396,13 @@ fn count_species_kmers(
             if b.is_ascii_whitespace() {
                 continue;
             }
-            let a = recode_byte(b.to_ascii_uppercase(), recode_scheme);
+            let a = alphabet.encode(b);
             if a == 255 {
                 roll = 0;
                 have = 0;
                 continue;
             }
-            roll = ((roll << RECODE_BITS_PER_SYMBOL) | (a as u64)) & k_mask;
+            roll = ((roll << bits_per_state) | (a as u64)) & k_mask;
             if have < k {
                 have += 1;
             }
@@ -413,8 +414,8 @@ fn count_species_kmers(
     Ok(())
 }
 
-fn truncate_protein_name(raw: &str) -> String {
-    let trimmed = raw.trim();
+fn normalize_protein_description(desc: &str) -> String {
+    let trimmed = desc.trim();
     trimmed
         .split_once(" [")
         .map(|(name, _)| name.trim_end())
@@ -432,7 +433,7 @@ fn extract_species_blocks(
     min_needed: u32,
     length_middle: usize,
     constant: usize,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
 ) -> Result<SpeciesExtraction> {
     // Split each protein at ambiguous residues. Valid stretches are independently
     // scanned for adjacent shared-anchor runs.
@@ -442,18 +443,13 @@ fn extract_species_blocks(
     let mut arena = BlockArena::new();
     let mut protein_names = Vec::new();
     let min_block_len = 2 * k + 1;
+    let bits_per_state = alphabet.bits_per_state();
     let mut aa_segment = Vec::new();
-    let mut recoded_segment = Vec::new();
+    let mut encoded_segment = Vec::new();
     while let Some(rec) = r.next() {
         let rec = rec?;
-        let protein_record_id = rec.id()?.trim();
         let protein_desc = rec.desc().transpose()?.map(str::trim).unwrap_or_default();
-        let raw_protein_name = if protein_desc.is_empty() {
-            protein_record_id.to_string()
-        } else {
-            format!("{protein_record_id} {protein_desc}")
-        };
-        let protein_name = truncate_protein_name(&raw_protein_name);
+        let protein_name = normalize_protein_description(protein_desc);
         let protein_id = protein_names.len();
         if protein_id > u32::MAX as usize {
             bail!(
@@ -464,27 +460,28 @@ fn extract_species_blocks(
         protein_names.push(protein_name);
         let protein_id = protein_id as u32;
         aa_segment.clear();
-        recoded_segment.clear();
+        encoded_segment.clear();
         let seq_len = rec.seq().len();
         if aa_segment.capacity() < seq_len {
             aa_segment.reserve(seq_len - aa_segment.capacity());
         }
-        if recoded_segment.capacity() < seq_len {
-            recoded_segment.reserve(seq_len - recoded_segment.capacity());
+        if encoded_segment.capacity() < seq_len {
+            encoded_segment.reserve(seq_len - encoded_segment.capacity());
         }
         for &b in rec.seq() {
             if b.is_ascii_whitespace() {
                 continue;
             }
             let up = b.to_ascii_uppercase();
-            let rv = recode_byte(up, recode_scheme);
+            let rv = alphabet.encode(up);
             if rv == 255 {
-                if recoded_segment.len() >= min_block_len {
+                if encoded_segment.len() >= min_block_len {
                     extract_from_valid_segment(
                         &aa_segment,
-                        &recoded_segment,
+                        &encoded_segment,
                         k,
                         k_mask,
+                        bits_per_state,
                         cms,
                         min_needed,
                         length_middle,
@@ -496,18 +493,19 @@ fn extract_species_blocks(
                     )?;
                 }
                 aa_segment.clear();
-                recoded_segment.clear();
+                encoded_segment.clear();
             } else {
                 aa_segment.push(up);
-                recoded_segment.push(rv);
+                encoded_segment.push(rv);
             }
         }
-        if recoded_segment.len() >= min_block_len {
+        if encoded_segment.len() >= min_block_len {
             extract_from_valid_segment(
                 &aa_segment,
-                &recoded_segment,
+                &encoded_segment,
                 k,
                 k_mask,
+                bits_per_state,
                 cms,
                 min_needed,
                 length_middle,
@@ -538,7 +536,7 @@ pub(crate) struct RawExtractedGroups {
     pub(crate) groups: RawDirectGroups,
     /// Per-species protein-name tables referenced by species-local protein IDs.
     pub(crate) protein_names: Vec<Vec<String>>,
-    /// Length of each complete recoded anchor in the logical full path.
+    /// Length of each complete encoded anchor in the logical full path.
     pub(crate) k: usize,
     /// Number of original right-anchor amino acids stored after each middle.
     pub(crate) constant: usize,
@@ -554,7 +552,7 @@ pub(crate) fn extract_groups(
     min_freq: f32,
     length_middle: usize,
     constant: usize,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
     num_threads: usize,
 ) -> Result<RawExtractedGroups> {
     // Stage 1: determine the occupancy threshold and build a deterministic local
@@ -567,11 +565,7 @@ pub(crate) fn extract_groups(
         );
     }
     let min_needed = (min_freq * n.max(1) as f32).ceil() as u32;
-    let k_mask = if k * RECODE_BITS_PER_SYMBOL as usize >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << (k * RECODE_BITS_PER_SYMBOL as usize)) - 1
-    };
+    let k_mask = alphabet.packed_mask(k);
     let n_threads = num_threads.max(1);
     let pool = ThreadPoolBuilder::new().num_threads(n_threads).build()?;
 
@@ -584,7 +578,7 @@ pub(crate) fn extract_groups(
         inputs
             .par_iter()
             .map(|input| {
-                let result = count_species_kmers(input, k, k_mask, recode_scheme, &cmsa);
+                let result = count_species_kmers(input, k, k_mask, alphabet, &cmsa);
                 count_progress.increment();
                 result
             })
@@ -599,6 +593,7 @@ pub(crate) fn extract_groups(
     // Extraction intentionally uses this completed snapshot; counting and extraction
     // remain separate passes so anchors are evaluated against all species.
     let cms = cmsa.snapshot();
+    drop(cmsa);
 
     // Stage 4: stream completed species extractions into the global structures,
     // merging each result immediately regardless of species completion order.
@@ -625,7 +620,7 @@ pub(crate) fn extract_groups(
                             min_needed,
                             length_middle,
                             constant,
-                            recode_scheme,
+                            alphabet,
                         );
                         extraction_progress.increment();
                         let _ = tx.send(result);
@@ -679,15 +674,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncate_protein_name_keeps_record_id_and_removes_organism_suffix() {
+    fn normalize_protein_description_removes_organism_suffix() {
         assert_eq!(
-            truncate_protein_name("WP_012345.1 hypothetical protein [Escherichia coli]"),
-            "WP_012345.1 hypothetical protein"
+            normalize_protein_description("hypothetical protein [Escherichia coli]"),
+            "hypothetical protein"
         );
         assert_eq!(
-            truncate_protein_name("WP_012345.1 hypothetical protein"),
-            "WP_012345.1 hypothetical protein"
+            normalize_protein_description("hypothetical protein"),
+            "hypothetical protein"
         );
+        assert_eq!(normalize_protein_description(""), "");
     }
 
     #[test]

@@ -4,21 +4,10 @@ use hashbrown::HashSet;
 use anyhow::Result;
 
 use crate::group_extraction::{AnchorPair, BlockArena, RawExtractedGroups, RawGroup};
-use crate::recode::{recode_byte, RECODE_BITS_PER_SYMBOL};
-use crate::RecodeScheme;
+use crate::recode::Alphabet;
 
-const DEFAULT_DIRECT_OVERLAP_K: usize = 21;
-
-fn direct_overlap_k(k: usize) -> usize {
-    // The shortest raw group spans two k-mer anchors plus one middle
-    // residue. Fixed recoded 21-mers work for k >= 11; for smaller k values the
-    // overlap detector must use the whole minimum-length block so shortest valid
-    // groups still contribute comparable k-mers.
-    if k < 10 {
-        2 * k + 1
-    } else {
-        DEFAULT_DIRECT_OVERLAP_K
-    }
+fn direct_overlap_k(k: usize, alphabet: Alphabet) -> usize {
+    (2 * k + 1).min(alphabet.max_packed_k())
 }
 
 #[derive(Clone, Debug)]
@@ -161,15 +150,6 @@ fn select_unique_best_supported_length(
 }
 
 #[inline]
-fn kmer_mask(k: usize) -> u64 {
-    let bit_len = k * RECODE_BITS_PER_SYMBOL as usize;
-    if bit_len >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bit_len) - 1
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn path_has_used_kmer(
     sequences: &[crate::group_extraction::BlockAa],
@@ -178,14 +158,16 @@ fn path_has_used_kmer(
     k: usize,
     anchor_k: usize,
     middle_len: usize,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
     used_global: &HashSet<u64>,
 ) -> bool {
-    // Stream every valid recoded k-mer represented by the raw selected block
+    // Stream every valid encoded k-mer represented by the raw selected block
     // observations and stop as soon as any k-mer has already been retained by a
     // stronger raw group. This preserves full-path overlap semantics without
     // allocating, sorting, or deduplicating a per-candidate k-mer vector.
-    let mask = kmer_mask(k);
+    let mask = alphabet.packed_mask(k);
+    let bits = alphabet.bits_per_state() as usize;
+    let symbol_mask = alphabet.symbol_mask();
 
     for &block in sequences {
         let mut val = 0u64;
@@ -196,24 +178,24 @@ fn path_has_used_kmer(
                 have = 0;
                 return false;
             }
-            val = ((val << RECODE_BITS_PER_SYMBOL) | c as u64) & mask;
+            val = ((val << bits) | c as u64) & mask;
             if have < k {
                 have += 1;
             }
             have == k && used_global.contains(&val)
         };
         for i in 0..anchor_k {
-            if feed(((key.0 >> ((anchor_k - 1 - i) * RECODE_BITS_PER_SYMBOL as usize)) & 7) as u8) {
+            if feed(((key.0 >> ((anchor_k - 1 - i) * bits)) & symbol_mask) as u8) {
                 return true;
             }
         }
         for &b in &arena.get(block)[..middle_len] {
-            if feed(recode_byte(b, recode_scheme)) {
+            if feed(alphabet.encode_valid_uppercase(b)) {
                 return true;
             }
         }
         for i in 0..anchor_k {
-            if feed(((key.1 >> ((anchor_k - 1 - i) * RECODE_BITS_PER_SYMBOL as usize)) & 7) as u8) {
+            if feed(((key.1 >> ((anchor_k - 1 - i) * bits)) & symbol_mask) as u8) {
                 return true;
             }
         }
@@ -230,13 +212,15 @@ fn insert_path_kmers(
     k: usize,
     anchor_k: usize,
     middle_len: usize,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
     used_global: &mut HashSet<u64>,
 ) {
-    // Insert valid rolling recoded k-mers directly into the global overlap set.
+    // Insert valid rolling encoded k-mers directly into the global overlap set.
     // Duplicate k-mers are intentionally left to HashSet::insert so retained
     // candidates avoid the old temporary Vec sort/dedup hot path.
-    let mask = kmer_mask(k);
+    let mask = alphabet.packed_mask(k);
+    let bits = alphabet.bits_per_state() as usize;
+    let symbol_mask = alphabet.symbol_mask();
 
     for &block in sequences {
         let mut val = 0u64;
@@ -247,7 +231,7 @@ fn insert_path_kmers(
                 have = 0;
                 return;
             }
-            val = ((val << RECODE_BITS_PER_SYMBOL) | c as u64) & mask;
+            val = ((val << bits) | c as u64) & mask;
             if have < k {
                 have += 1;
             }
@@ -256,13 +240,13 @@ fn insert_path_kmers(
             }
         };
         for i in 0..anchor_k {
-            feed(((key.0 >> ((anchor_k - 1 - i) * RECODE_BITS_PER_SYMBOL as usize)) & 7) as u8);
+            feed(((key.0 >> ((anchor_k - 1 - i) * bits)) & symbol_mask) as u8);
         }
         for &b in &arena.get(block)[..middle_len] {
-            feed(recode_byte(b, recode_scheme));
+            feed(alphabet.encode_valid_uppercase(b));
         }
         for i in 0..anchor_k {
-            feed(((key.1 >> ((anchor_k - 1 - i) * RECODE_BITS_PER_SYMBOL as usize)) & 7) as u8);
+            feed(((key.1 >> ((anchor_k - 1 - i) * bits)) & symbol_mask) as u8);
         }
     }
 }
@@ -272,7 +256,7 @@ fn retain_nonoverlapping_raw_candidates(
     arena: &BlockArena,
     overlap_k: usize,
     anchor_k: usize,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
 ) -> Vec<RawDirectCandidate> {
     raw_candidates.sort_unstable_by(|a, b| {
         b.coverage
@@ -293,7 +277,7 @@ fn retain_nonoverlapping_raw_candidates(
             overlap_k,
             anchor_k,
             cand.middle_len,
-            recode_scheme,
+            alphabet,
             &used_global,
         ) {
             continue;
@@ -306,7 +290,7 @@ fn retain_nonoverlapping_raw_candidates(
             overlap_k,
             anchor_k,
             cand.middle_len,
-            recode_scheme,
+            alphabet,
             &mut used_global,
         );
 
@@ -344,11 +328,11 @@ pub(crate) struct SortedGroups {
     pub(crate) species_names: Vec<String>,
     /// Global amino-acid bytes referenced by raw observations.
     pub(crate) arena: BlockArena,
-    /// Deduplicated raw candidates retained after recoded k-mer non-overlap filtering.
+    /// Deduplicated raw candidates retained after encoded k-mer non-overlap filtering.
     pub(crate) raw_candidates: Vec<RawDirectCandidate>,
     /// Per-species protein-name tables referenced by species-local protein IDs.
     pub(crate) protein_names: Vec<Vec<String>>,
-    /// Length of each complete recoded anchor in the logical full path.
+    /// Length of each complete encoded anchor in the logical full path.
     pub(crate) k: usize,
     /// Stored right-anchor prefix length.
     pub(crate) constant: usize,
@@ -356,13 +340,13 @@ pub(crate) struct SortedGroups {
     pub(crate) min_needed: usize,
     /// Number of species represented by `species_names`.
     pub(crate) n_species: usize,
-    /// Recoding scheme used for anchor encoding and recoded-space polymorphism checks.
-    pub(crate) recode_scheme: RecodeScheme,
+    /// Recoding scheme used for anchor encoding and encoded-state polymorphism checks.
+    pub(crate) alphabet: Alphabet,
 }
 
 pub(crate) fn sort_and_deduplicate_groups(
     raw: RawExtractedGroups,
-    recode_scheme: RecodeScheme,
+    alphabet: Alphabet,
 ) -> Result<SortedGroups> {
     let RawExtractedGroups {
         species_names,
@@ -378,7 +362,7 @@ pub(crate) fn sort_and_deduplicate_groups(
     let mut raw_candidates = Vec::with_capacity(groups.len());
     // Stage 5: for each original anchor pair, keep one unambiguous raw block
     // length present in enough species. These raw candidates are sorted by
-    // strength inside recoded k-mer non-overlap filtering.
+    // strength inside encoded k-mer non-overlap filtering.
     for (key, group) in groups {
         if let Ok(group) = select_unique_best_supported_length(key, group, n, min_needed, constant)
         {
@@ -392,17 +376,17 @@ pub(crate) fn sort_and_deduplicate_groups(
     }
 
     // Stage 6: greedily keep the strongest non-overlapping raw groups so one
-    // biological signal cannot contribute the same transient recoded k-mer
-    // twice. The detector uses recoded 21-mers except when k < 11, where the
-    // minimum valid raw block is shorter than 21 residues and therefore defines
-    // the comparison k-mer length. Raw groups without valid overlap k-mers pass
-    // because they cannot be compared by the overlap set.
+    // biological signal cannot contribute the same transient encoded k-mer
+    // twice. The detector uses the shorter of the minimum logical path length
+    // (`2 * k + 1`) and the largest k-mer the selected alphabet can pack. Raw
+    // groups without valid overlap k-mers pass because the overlap set cannot
+    // compare them.
     let nonoverlap_raw_candidates = retain_nonoverlapping_raw_candidates(
         raw_candidates,
         &arena,
-        direct_overlap_k(k),
+        direct_overlap_k(k, alphabet),
         k,
-        recode_scheme,
+        alphabet,
     );
     Ok(SortedGroups {
         species_names,
@@ -413,7 +397,7 @@ pub(crate) fn sort_and_deduplicate_groups(
         constant,
         min_needed,
         n_species: n,
-        recode_scheme,
+        alphabet,
     })
 }
 
@@ -494,11 +478,14 @@ mod tests {
     }
 
     #[test]
-    fn direct_overlap_k_uses_minimum_block_length_below_k_11() {
-        assert_eq!(direct_overlap_k(1), 3);
-        assert_eq!(direct_overlap_k(9), 19);
-        assert_eq!(direct_overlap_k(10), DEFAULT_DIRECT_OVERLAP_K);
-        assert_eq!(direct_overlap_k(20), DEFAULT_DIRECT_OVERLAP_K);
+    fn direct_overlap_k_uses_alphabet_packing_limit() {
+        let aa20 = Alphabet::new(None);
+        let sr6 = Alphabet::new(Some(crate::RecodeScheme::SR6));
+        assert_eq!(direct_overlap_k(1, aa20), 3);
+        assert_eq!(direct_overlap_k(8, aa20), 12);
+        assert_eq!(direct_overlap_k(9, sr6), 19);
+        assert_eq!(direct_overlap_k(10, sr6), 21);
+        assert_eq!(direct_overlap_k(20, sr6), 21);
     }
 
     #[test]
@@ -567,7 +554,7 @@ mod tests {
                 min_needed: 2,
                 n_species: 2,
             },
-            RecodeScheme::SR6,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
         )
         .unwrap();
 
@@ -617,9 +604,9 @@ mod tests {
         let retained = retain_nonoverlapping_raw_candidates(
             raw_candidates,
             &arena,
-            DEFAULT_DIRECT_OVERLAP_K,
+            21,
             0,
-            RecodeScheme::SR6,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
         );
         let retained_keys: Vec<_> = retained.into_iter().map(|cand| cand.key).collect();
 
@@ -639,10 +626,10 @@ mod tests {
             &candidate.group.sequences,
             candidate.key,
             &arena,
-            DEFAULT_DIRECT_OVERLAP_K,
+            21,
             0,
             candidate.middle_len,
-            RecodeScheme::SR6,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
             &mut used,
         );
         assert_eq!(used.len(), 1);
@@ -650,10 +637,10 @@ mod tests {
             &candidate.group.sequences,
             candidate.key,
             &arena,
-            DEFAULT_DIRECT_OVERLAP_K,
+            21,
             0,
             candidate.middle_len,
-            RecodeScheme::SR6,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
             &used,
         ));
     }
@@ -669,8 +656,13 @@ mod tests {
             raw_candidate(&mut arena, (10, 11), 4, shared.len(), &[shared]),
         ];
 
-        let retained =
-            retain_nonoverlapping_raw_candidates(raw_candidates, &arena, 5, 0, RecodeScheme::SR6);
+        let retained = retain_nonoverlapping_raw_candidates(
+            raw_candidates,
+            &arena,
+            5,
+            0,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        );
         let retained_keys: Vec<_> = retained.into_iter().map(|cand| cand.key).collect();
 
         assert_eq!(retained_keys, vec![(10, 11), (30, 31), (40, 41)]);
@@ -680,7 +672,7 @@ mod tests {
     fn compact_path_reconstruction_matches_historical_full_path_kmers() {
         fn encode(aa: &[u8]) -> u64 {
             aa.iter().fold(0, |v, &b| {
-                (v << RECODE_BITS_PER_SYMBOL) | recode_byte(b, RecodeScheme::SR6) as u64
+                (v << 3) | Alphabet::new(Some(crate::RecodeScheme::SR6)).encode(b) as u64
             })
         }
         let left = b"ACD";
@@ -698,7 +690,7 @@ mod tests {
             3,
             3,
             middle.len(),
-            RecodeScheme::SR6,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
             &mut reconstructed,
         );
 
@@ -710,6 +702,38 @@ mod tests {
         assert!(reconstructed.contains(&encode(b"DEF")));
         assert!(reconstructed.contains(&encode(b"FGH")));
         assert!(reconstructed.contains(&encode(right)));
+    }
+
+    #[test]
+    fn packed_anchor_decoding_supports_three_and_five_bit_states() {
+        for alphabet in [
+            Alphabet::new(None),
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        ] {
+            let encode = |aa: &[u8]| {
+                aa.iter().fold(0, |value, &b| {
+                    (value << alphabet.bits_per_state()) | alphabet.encode(b) as u64
+                })
+            };
+            let left = b"ACD";
+            let middle = b"EF";
+            let right = b"GHI";
+            let mut arena = BlockArena::new();
+            let observations = group(&mut arena, &[(0, b"EFI")]);
+            let mut reconstructed = HashSet::new();
+            insert_path_kmers(
+                &observations.sequences,
+                (encode(left), encode(right)),
+                &arena,
+                3,
+                3,
+                middle.len(),
+                alphabet,
+                &mut reconstructed,
+            );
+            let full = [left.as_slice(), middle.as_slice(), right.as_slice()].concat();
+            assert_eq!(reconstructed, full.windows(3).map(encode).collect());
+        }
     }
 
     #[test]
@@ -760,9 +784,11 @@ mod tests {
     #[test]
     fn sort_retains_original_raw_anchor_key_without_refinement() {
         let rows = &[b"*AC**FGHIKL*".as_slice(), b"*AC**DGHIKL*"];
-        let sorted =
-            sort_and_deduplicate_groups(raw_extracted(rows, 2, (31, 37)), RecodeScheme::SR6)
-                .unwrap();
+        let sorted = sort_and_deduplicate_groups(
+            raw_extracted(rows, 2, (31, 37)),
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
+        )
+        .unwrap();
 
         assert_eq!(sorted.raw_candidates.len(), 1);
         assert_eq!(sorted.raw_candidates[0].key, (31, 37));
@@ -783,9 +809,9 @@ mod tests {
         let retained = retain_nonoverlapping_raw_candidates(
             raw_candidates,
             &arena,
-            DEFAULT_DIRECT_OVERLAP_K,
+            21,
             0,
-            RecodeScheme::SR6,
+            Alphabet::new(Some(crate::RecodeScheme::SR6)),
         );
         let retained_keys: Vec<_> = retained.into_iter().map(|cand| cand.key).collect();
 

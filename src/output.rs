@@ -10,15 +10,13 @@ pub fn output_paths(out_base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     // Derive all output filenames from one prefix so `-o results/foo` writes
     // `results/foo_alignment.fas`, `results/foo_missing.tsv`, and so on.
     fn build_path(base: &Path, suffix: &str, ext: &str) -> PathBuf {
-        let stem = base
-            .file_stem()
-            .or_else(|| base.file_name())
-            .unwrap_or_else(|| OsStr::new("output"));
-        let mut name = stem.to_os_string();
+        let base_name = base.file_name().unwrap_or_else(|| OsStr::new("output"));
+        let mut name = base_name.to_os_string();
         name.push(suffix);
+        name.push(".");
+        name.push(ext);
         let mut path = base.parent().map(Path::to_path_buf).unwrap_or_default();
         path.push(name);
-        path.set_extension(ext);
         path
     }
     (
@@ -37,7 +35,7 @@ pub fn write_outputs(
     partition_names: Vec<String>,
     generate_nj: bool,
     threads: usize,
-) -> Result<(usize, f64)> {
+) -> Result<(usize, f64, f64)> {
     // Calculate overall missingness once before writing the FASTA rows.
     let (fas_path, tsv_path, partitions_path, tree_path) = output_paths(out_base);
     let mut w = BufWriter::new(File::create(&fas_path)?);
@@ -51,6 +49,25 @@ pub fn write_outputs(
         0.0
     } else {
         100.0 * total_missing as f64 / total_pos as f64
+    };
+    let constant_positions = (0..total_len)
+        .filter(|&column| {
+            let mut amino_acid = None;
+            concat.iter().all(|row| match row[column] {
+                b'-' | b'X' => true,
+                residue => {
+                    amino_acid.is_none_or(|previous| previous == residue) && {
+                        amino_acid = Some(residue);
+                        true
+                    }
+                }
+            })
+        })
+        .count();
+    let constant = if total_len == 0 {
+        0.0
+    } else {
+        100.0 * constant_positions as f64 / total_len as f64
     };
     // FASTA output is wrapped at 60 characters for broad tool compatibility.
     for (sid, name) in species.iter().enumerate() {
@@ -84,12 +101,13 @@ pub fn write_outputs(
     }
     pw.flush()?;
     if generate_nj {
-        // Tree generation is optional because it adds an O(n²·L) distance pass.
+        eprintln!("# build NJ tree");
+        // Tree generation is optional because it adds an O(n²·L) distance pass;
         let tree = crate::phylo::nj_tree_newick(species, &concat, threads)
             .map_err(|e| anyhow::anyhow!(e))?;
         let mut tw = BufWriter::new(File::create(&tree_path)?);
         writeln!(tw, "{}", tree)?;
         tw.flush()?;
     }
-    Ok((total_len, miss))
+    Ok((total_len, miss, constant))
 }

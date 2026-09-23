@@ -82,7 +82,7 @@ fn run_golden_case(case: GoldenCase) {
         length_middle: case.length_middle,
         mask: 5,
         threads: 1,
-        recode: case.recode,
+        recode: Some(case.recode),
         nj: case.nj,
     };
 
@@ -165,7 +165,7 @@ fn proteome_output_is_identical_across_thread_counts_and_repeated_runs() {
             length_middle: 35,
             mask: 5,
             threads,
-            recode: RecodeScheme::Dayhoff6,
+            recode: Some(RecodeScheme::Dayhoff6),
             nj: false,
         })
         .unwrap();
