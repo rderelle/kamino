@@ -82,7 +82,10 @@ impl BitAlignment {
     fn counts(&self, i: usize, j: usize) -> (u64, u64) {
         let (a, b) = (self.taxon(i), self.taxon(j));
         let (mut valid_sites, mut mismatches) = (self.const_cols, 0u64);
-        for (x, y) in a.chunks_exact(PLANES).zip(b.chunks_exact(PLANES)) {
+        let (a_blocks, a_remainder) = a.as_chunks::<PLANES>();
+        let (b_blocks, b_remainder) = b.as_chunks::<PLANES>();
+        debug_assert!(a_remainder.is_empty() && b_remainder.is_empty());
+        for (x, y) in a_blocks.iter().zip(b_blocks) {
             let both = x[VALID] & y[VALID];
             let diff =
                 (x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3]) | (x[4] ^ y[4]);
@@ -197,13 +200,13 @@ const ROW_SUM_REFRESH: usize = 128;
 #[inline]
 fn row_sum(row: &[f64]) -> f64 {
     let mut acc = [0.0; 4];
-    let mut blocks = row.chunks_exact(4);
-    for block in blocks.by_ref() {
+    let (blocks, remainder) = row.as_chunks::<4>();
+    for block in blocks {
         for (sum, &value) in acc.iter_mut().zip(block) {
             *sum += value;
         }
     }
-    (acc[0] + acc[1]) + (acc[2] + acc[3]) + blocks.remainder().iter().sum::<f64>()
+    (acc[0] + acc[1]) + (acc[2] + acc[3]) + remainder.iter().sum::<f64>()
 }
 
 struct Nj {
