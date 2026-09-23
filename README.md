@@ -12,6 +12,9 @@
 
 Builds an amino acid alignment in a reference-free, alignment-free manner from a set of proteomes. Not ‘better’ than traditional marker-based pipelines, but simpler and much faster to run. Typical usages range from between-strains to within-family (prokaryotes) or within-phylum (eukaryotes) phylogenetic analyses.
 
+This repo is no longer under development but bug reports, PRs and suggestions are very welcome.
+
+
 ## Installation
 You can either compile the code locally using rustc, or install a precompiled binary from Bioconda:
 
@@ -55,7 +58,7 @@ More information are available at https://docs.rs/kamino-cli/latest/kamino_cli/
 Please let me know if anything is unclear or missing, and I'll update the doc accordingly.
 
 ## Citation
-If you use kamino, please cite:
+More information is also available in the manuscript. Please note that, as of v2.3.0, kamino uses plain amino acids by default rather than recoding them into a 6-letter scheme.
 
 > Romain Derelle, John A. Lees and Leonid Chindelevitch. 2026.
 > kamino: fast proteome-wide variant calling for amino acid phylogenomics.
