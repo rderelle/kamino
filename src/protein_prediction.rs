@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use seq_io::fasta::{Reader, Record};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -452,6 +453,7 @@ fn estimate_input_genome_gc(path: &Path) -> Result<(f32, f32)> {
 
 #[inline]
 /// Return the overlap length between two half-open nucleotide intervals.
+#[cfg(test)]
 fn overlap_len(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> usize {
     let s = a_start.max(b_start);
     let e = a_end.min(b_end);
@@ -470,19 +472,25 @@ fn greedy_non_overlapping(orfs: &mut [Orf]) -> Vec<Orf> {
             .then_with(|| a.start.cmp(&b.start))
     });
 
+    // Accepted ORFs longer than the allowed overlap cannot contain one another, so
+    // their ends increase with their starts. A candidate then overlaps some accepted
+    // ORF by more than the limit iff it does so with the accepted ORF having the
+    // largest start below `cand.end - MAX_ALLOWED_OVERLAP_NT`. Shorter ORFs can never
+    // exceed the limit and are accepted without being indexed.
+    let mut ends_by_start: BTreeMap<usize, usize> = BTreeMap::new();
     let mut accepted: Vec<Orf> = Vec::with_capacity(orfs.len());
     for &cand in orfs.iter() {
-        let mut ok = true;
-        for a in &accepted {
-            let ov = overlap_len(cand.start, cand.end, a.start, a.end);
-            if ov > MAX_ALLOWED_OVERLAP_NT {
-                ok = false;
-                break;
+        if cand.len_nt() > MAX_ALLOWED_OVERLAP_NT {
+            let blocked = ends_by_start
+                .range(..cand.end - MAX_ALLOWED_OVERLAP_NT)
+                .next_back()
+                .is_some_and(|(_, &end)| end > cand.start + MAX_ALLOWED_OVERLAP_NT);
+            if blocked {
+                continue;
             }
+            ends_by_start.insert(cand.start, cand.end);
         }
-        if ok {
-            accepted.push(cand);
-        }
+        accepted.push(cand);
     }
     accepted
 }
@@ -657,9 +665,18 @@ fn emit_complete_orfs(
     }
 
     let mut ranked: Vec<RankedStart> = Vec::with_capacity(valid_starts.len());
-    for &vs in valid_starts.iter() {
-        let nt_slice = &seq[vs.cand.pos..segment_end];
-        let gc_score = gcpos_score_pm(nt_slice, gc_model);
+    // Starts remain in coordinate order after suppression/filtering. Walk their
+    // shared suffix once, preserving the original integer scoring arithmetic.
+    let mut suffix_start = segment_end;
+    let mut gc = [0usize; 3];
+    for &vs in valid_starts.iter().rev() {
+        for codon in seq[vs.cand.pos..suffix_start].chunks_exact(3) {
+            gc[0] += is_gc(codon[0]) as usize;
+            gc[1] += is_gc(codon[1]) as usize;
+            gc[2] += is_gc(codon[2]) as usize;
+        }
+        suffix_start = vs.cand.pos;
+        let gc_score = gcpos_score_from_counts(vs.len_nt / 3, gc, gc_model);
         let total = total_orf_score(
             vs.len_nt,
             true,
@@ -891,6 +908,7 @@ fn length_score(nt_len: usize) -> i32 {
 
 #[inline]
 /// Score how well codon-position GC content matches the genome-level model.
+#[cfg(test)]
 fn gcpos_score_pm(seq: &[u8], gc_model: &GcModel) -> i32 {
     let codons = seq.len() / 3;
     if codons < 20 {
@@ -918,6 +936,15 @@ fn gcpos_score_pm(seq: &[u8], gc_model: &GcModel) -> i32 {
         i += 3;
     }
 
+    gcpos_score_from_counts(codons, [gc1, gc2, gc3], gc_model)
+}
+
+#[inline]
+fn gcpos_score_from_counts(codons: usize, gc: [usize; 3], gc_model: &GcModel) -> i32 {
+    if codons < 20 {
+        return 0;
+    }
+    let [gc1, gc2, gc3] = gc;
     let obs1_pm = ((gc1 * 1000) / codons) as i32;
     let obs2_pm = ((gc2 * 1000) / codons) as i32;
     let obs3_pm = ((gc3 * 1000) / codons) as i32;
@@ -1283,5 +1310,85 @@ mod tests {
         assert_eq!(counts[codon_index_fast(b'A', b'T', b'G').unwrap()], 1);
         assert_eq!(counts[codon_index_fast(b'G', b'C', b'T').unwrap()], 1);
         assert_eq!(counts.iter().sum::<usize>(), 2);
+    }
+
+    fn reference_greedy_non_overlapping(orfs: &mut [Orf]) -> Vec<Orf> {
+        orfs.sort_unstable_by(|a, b| {
+            a.partial_class()
+                .cmp(&b.partial_class())
+                .then_with(|| b.total_score.cmp(&a.total_score))
+                .then_with(|| b.len_nt().cmp(&a.len_nt()))
+                .then_with(|| a.start.cmp(&b.start))
+        });
+
+        let mut accepted: Vec<Orf> = Vec::with_capacity(orfs.len());
+        for &cand in orfs.iter() {
+            let mut ok = true;
+            for a in &accepted {
+                let ov = overlap_len(cand.start, cand.end, a.start, a.end);
+                if ov > MAX_ALLOWED_OVERLAP_NT {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                accepted.push(cand);
+            }
+        }
+        accepted
+    }
+    fn next_random(state: &mut u64) -> usize {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state as usize
+    }
+    #[test]
+    fn indexed_overlap_matches_original_with_ties_and_short_intervals() {
+        let mut rng = 1937u64;
+        for _ in 0..300 {
+            let mut input = Vec::new();
+            for _ in 0..400 {
+                let start = next_random(&mut rng) % 20000;
+                let end = start + next_random(&mut rng) % 1000;
+                let mut o = complete_orf(start, end, 1, (next_random(&mut rng) % 15) as i32);
+                o.partial_5p = next_random(&mut rng).is_multiple_of(3);
+                o.partial_3p = next_random(&mut rng).is_multiple_of(3);
+                input.push(o);
+            }
+            let expected = reference_greedy_non_overlapping(&mut input.clone());
+            let got = greedy_non_overlapping(&mut input);
+            assert_eq!(format!("{:?}", got), format!("{:?}", expected));
+        }
+        for overlap in [29, 30, 31] {
+            let mut input = vec![
+                complete_orf(0, 300, 1, 10),
+                complete_orf(300 - overlap, 600, 1, 9),
+            ];
+            assert_eq!(
+                greedy_non_overlapping(&mut input).len(),
+                if overlap > 30 { 1 } else { 2 }
+            );
+        }
+    }
+    #[test]
+    fn suffix_gc_matches_independent_scans() {
+        let mut rng = 971u64;
+        for _ in 0..100 {
+            let seq: Vec<u8> = (0..6000)
+                .map(|_| b"ACGTNRYSW"[next_random(&mut rng) % 9])
+                .collect();
+            let model = GcModel::from_genome_gc((next_random(&mut rng) % 1001) as f32 / 1000.0);
+            let mut gc = [0usize; 3];
+            for start in (0..seq.len()).step_by(3).rev() {
+                for i in 0..3 {
+                    gc[i] += is_gc(seq[start + i]) as usize;
+                }
+                assert_eq!(
+                    gcpos_score_from_counts((seq.len() - start) / 3, gc, &model),
+                    gcpos_score_pm(&seq[start..], &model)
+                );
+            }
+        }
     }
 }

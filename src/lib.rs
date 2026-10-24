@@ -135,11 +135,11 @@ pub struct Args {
     #[arg(short, long, help_heading = "Main parameters")]
     pub constant: Option<usize>,
 
-    /// Maximum amino-acid length between two adjacent shared anchors [l=35].
+    /// Maximum amino-acid length between two adjacent shared anchors [l=70].
     #[arg(
         short = 'l',
         long = "length-middle",
-        default_value_t = 35,
+        default_value_t = 70,
         hide_default_value = true,
         help_heading = "Main parameters"
     )]
@@ -259,6 +259,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         constant,
         alphabet,
         args.threads,
+        !args.genomes,
     )?;
     eprintln!("# analyse variant groups");
     eprintln!(" . raw variant groups: {}", raw_groups.groups.len());

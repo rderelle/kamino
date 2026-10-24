@@ -136,6 +136,7 @@ struct KmerHit {
     kmer: u64,
     start: usize,
     end: usize,
+    /// Exact for shared hits; a below-threshold bound is sufficient otherwise.
     occupancy: u32,
     shared: bool,
 }
@@ -282,7 +283,7 @@ fn extract_from_valid_segment(
             have += 1;
         }
         if have == k {
-            let occupancy = cms.estimate(roll);
+            let occupancy = cms.estimate_for_anchors(roll, min_needed);
             let shared = occupancy >= min_needed;
             let start = pos + 1 - k;
             let current_hit = KmerHit {
@@ -375,12 +376,53 @@ fn find_sequence_id(group: &RawGroup, sequence: &[u8], arena: &BlockArena) -> Op
         .and_then(|id| u32::try_from(id).ok())
 }
 
-fn count_species_kmers(
+// Bound validation work per input file, independent of proteome/genome size.
+const PROTEOME_CHECK_MAX_BYTES: usize = 8192;
+const PROTEOME_CHECK_MIN_LETTERS: usize = 100;
+const PROTEOME_CHECK_NUCLEOTIDE_PERCENT: usize = 90;
+
+#[derive(Default)]
+struct ProteomeInputCheck {
+    scanned: usize,
+    informative: usize,
+    nucleotides: usize,
+}
+
+impl ProteomeInputCheck {
+    fn observe(&mut self, seq: &[u8]) {
+        for &b in seq.iter().take(PROTEOME_CHECK_MAX_BYTES - self.scanned) {
+            self.scanned += 1;
+            let b = b.to_ascii_uppercase();
+            // N/X cannot reliably distinguish unknown DNA from protein residues.
+            // Ignore formatting, gaps, and stop symbols as well.
+            if !b.is_ascii_alphabetic() || matches!(b, b'N' | b'X') {
+                continue;
+            }
+            self.informative += 1;
+            self.nucleotides += matches!(b, b'A' | b'C' | b'G' | b'T' | b'U') as usize;
+        }
+    }
+
+    fn validate(&self, path: &std::path::Path) -> Result<()> {
+        if self.informative >= PROTEOME_CHECK_MIN_LETTERS
+            && self.nucleotides * 100 >= self.informative * PROTEOME_CHECK_NUCLEOTIDE_PERCENT
+        {
+            bail!(
+                "the file {} appears to contain nucleotide sequences rather than amino-acid sequences. Use --genomes for bacterial genome input.",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn count_species_kmers<F: FnMut(u64)>(
     input: &SpeciesInput,
     k: usize,
     k_mask: u64,
     alphabet: Alphabet,
-    cmsa: &AtomicCountMinSketch,
+    validate_proteome: bool,
+    mut increment: F,
 ) -> Result<()> {
     // Count each distinct `k`-mer at most once per species, which makes the
     // sketch estimate species occupancy rather than raw copy number.
@@ -388,8 +430,17 @@ fn count_species_kmers(
     let mut r = FastaReader::new(rdr);
     let mut bloom = BloomFilter::new(BLOOM_BITS);
     let bits_per_state = alphabet.bits_per_state();
+    let mut input_check = validate_proteome.then(ProteomeInputCheck::default);
     while let Some(rec) = r.next() {
         let rec = rec?;
+        // One branch per FASTA record; no checks in the residue/k-mer loop.
+        if let Some(check) = input_check.as_mut() {
+            check.observe(rec.seq());
+            if check.scanned == PROTEOME_CHECK_MAX_BYTES {
+                check.validate(&input.path)?;
+                input_check = None;
+            }
+        }
         let mut roll = 0u64;
         let mut have = 0usize;
         for &b in rec.seq() {
@@ -407,9 +458,12 @@ fn count_species_kmers(
                 have += 1;
             }
             if have == k && !bloom.test_and_set(roll) {
-                cmsa.increment(roll);
+                increment(roll);
             }
         }
+    }
+    if let Some(check) = input_check {
+        check.validate(&input.path)?;
     }
     Ok(())
 }
@@ -554,6 +608,7 @@ pub(crate) fn extract_groups(
     constant: usize,
     alphabet: Alphabet,
     num_threads: usize,
+    validate_proteomes: bool,
 ) -> Result<RawExtractedGroups> {
     // Stage 1: determine the occupancy threshold and build a deterministic local
     // Rayon pool instead of changing the process-global pool.
@@ -569,33 +624,44 @@ pub(crate) fn extract_groups(
     let n_threads = num_threads.max(1);
     let pool = ThreadPoolBuilder::new().num_threads(n_threads).build()?;
 
-    // Stage 2: parallel species-level counting into an atomic count-min sketch.
+    // Stage 2: count species occupancies. A single worker uses plain counters;
+    // concurrent workers share atomic counters until counting is complete.
     eprintln!(" . pass 1: estimate k-mer occupancies");
     let count_progress = ProteomeProgress::new(n);
     count_progress.draw(0);
-    let cmsa = AtomicCountMinSketch::new(CMS_WIDTH, CMS_DEPTH);
-    let count_results = pool.install(|| {
-        inputs
-            .par_iter()
-            .map(|input| {
-                let result = count_species_kmers(input, k, k_mask, alphabet, &cmsa);
+    let cms = if n_threads == 1 {
+        let mut cms = CountMinSketch::new(CMS_WIDTH, CMS_DEPTH);
+        for input in inputs {
+            if let Err(error) =
+                count_species_kmers(input, k, k_mask, alphabet, validate_proteomes, |key| {
+                    cms.increment(key)
+                })
+            {
+                count_progress.finish();
+                return Err(error);
+            }
+            count_progress.increment();
+        }
+        count_progress.finish();
+        cms
+    } else {
+        let cmsa = AtomicCountMinSketch::new(CMS_WIDTH, CMS_DEPTH);
+        let count_result = pool.install(|| {
+            inputs.par_iter().try_for_each(|input| {
+                let result =
+                    count_species_kmers(input, k, k_mask, alphabet, validate_proteomes, |key| {
+                        cmsa.increment(key)
+                    });
                 count_progress.increment();
                 result
             })
-            .collect::<Vec<_>>()
-    });
-    count_progress.finish();
-    for result in count_results {
-        result?;
-    }
+        });
+        count_progress.finish();
+        count_result?;
+        cmsa.into_snapshot()
+    };
 
-    // Stage 3: snapshot immutable counts and extract candidate blocks per species.
-    // Extraction intentionally uses this completed snapshot; counting and extraction
-    // remain separate passes so anchors are evaluated against all species.
-    let cms = cmsa.snapshot();
-    drop(cmsa);
-
-    // Stage 4: stream completed species extractions into the global structures,
+    // Stage 3: stream completed species extractions into the global structures,
     // merging each result immediately regardless of species completion order.
     eprintln!(" . pass 2: extract sequences");
     let extraction_progress = ProteomeProgress::new(n);
@@ -672,6 +738,107 @@ pub(crate) fn extract_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proteome_check_detects_dna_and_rna_with_case_whitespace_and_unknowns() {
+        for seq in [b"acgt nNX \n".repeat(100), b"acgu".repeat(100)] {
+            let mut check = ProteomeInputCheck::default();
+            check.observe(&seq);
+            let error = check
+                .validate(std::path::Path::new("example.fna"))
+                .unwrap_err();
+            assert!(error.to_string().contains("example.fna"));
+            assert!(error.to_string().contains("--genomes"));
+        }
+    }
+
+    #[test]
+    fn proteome_check_threshold_and_minimum_are_exact() {
+        for (dna, other, rejected) in [
+            (90, 10, true),
+            (89, 11, false),
+            (99, 0, false),
+            (100, 0, true),
+        ] {
+            let mut check = ProteomeInputCheck::default();
+            check.observe(&vec![b'A'; dna]);
+            check.observe(&vec![b'E'; other]);
+            assert_eq!(
+                check.validate(std::path::Path::new("input")).is_err(),
+                rejected
+            );
+        }
+        let mut check = ProteomeInputCheck::default();
+        check.observe(&b"NX- *\n".repeat(2000));
+        assert!(check.validate(std::path::Path::new("input")).is_ok());
+    }
+
+    #[test]
+    fn proteome_check_is_bounded_and_samples_across_records() {
+        let mut check = ProteomeInputCheck::default();
+        check.observe(&b"ACGT".repeat(30));
+        // A first low-complexity protein is not classified on its own.
+        check.observe(&b"ACDEFGHIKLMNPQRSTVWY".repeat(1000));
+        assert_eq!(check.scanned, PROTEOME_CHECK_MAX_BYTES);
+        assert!(check.validate(std::path::Path::new("proteins")).is_ok());
+        let before = (check.scanned, check.informative, check.nucleotides);
+        check.observe(&b"ACGT".repeat(1000));
+        assert_eq!(
+            before,
+            (check.scanned, check.informative, check.nucleotides)
+        );
+    }
+
+    #[test]
+    fn input_validation_preserves_counting_and_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proteins.faa");
+        let data = format!(
+            ">short\n{}\n>long\n{}\n>last\n{}\n",
+            "ACDEFGHIKLMNPQRSTVWY".repeat(5),
+            "ACDEFGHIKLMNPQRSTVWY".repeat(700),
+            "WYVTSRQPNMLKIHGFEDCA".repeat(7)
+        );
+        std::fs::write(&path, data).unwrap();
+        let input = SpeciesInput {
+            name: "example".into(),
+            path,
+        };
+        for scheme in [
+            None,
+            Some(crate::RecodeScheme::SR6),
+            Some(crate::RecodeScheme::Dayhoff6),
+            Some(crate::RecodeScheme::KGB6),
+        ] {
+            let alphabet = Alphabet::new(scheme);
+            let mut checked = Vec::new();
+            let mut unchecked = Vec::new();
+            count_species_kmers(&input, 8, alphabet.packed_mask(8), alphabet, true, |k| {
+                checked.push(k)
+            })
+            .unwrap();
+            count_species_kmers(&input, 8, alphabet.packed_mask(8), alphabet, false, |k| {
+                unchecked.push(k)
+            })
+            .unwrap();
+            assert_eq!(checked, unchecked);
+            assert!(!checked.is_empty());
+        }
+        std::fs::write(&input.path, format!(">dna\n{}\n", "ACGT".repeat(3000))).unwrap();
+        let alphabet = Alphabet::new(None);
+        let mut count = 0;
+        assert!(
+            count_species_kmers(&input, 8, alphabet.packed_mask(8), alphabet, true, |_| {
+                count += 1
+            })
+            .is_err()
+        );
+        assert_eq!(count, 0);
+        assert!(
+            count_species_kmers(&input, 8, alphabet.packed_mask(8), alphabet, false, |_| {})
+                .is_ok()
+        );
+    }
 
     #[test]
     fn normalize_protein_description_removes_organism_suffix() {
