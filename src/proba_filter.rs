@@ -36,6 +36,17 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+#[inline]
+fn four_offsets(key: u64, width: usize) -> [usize; 4] {
+    let mask = width as u64 - 1;
+    [
+        (mix64(key ^ SEEDS[2]) & mask) as usize,
+        width + (mix64(key ^ SEEDS[3]) & mask) as usize,
+        2 * width + (mix64(key ^ SEEDS[4]) & mask) as usize,
+        3 * width + (mix64(key ^ SEEDS[5]) & mask) as usize,
+    ]
+}
+
 #[derive(Clone)]
 pub struct BloomFilter {
     /// Packed bitset for the filter.
@@ -100,6 +111,45 @@ impl CountMinSketch {
         }
     }
 
+    /// Single-writer counting avoids atomic read-modify-write operations.
+    pub fn increment(&mut self, key: u64) {
+        for (row, seed) in self.seeds.iter().enumerate() {
+            let idx = (mix64(key ^ seed) & (self.width as u64 - 1)) as usize;
+            let cell = &mut self.table[row * self.width + idx];
+            *cell = cell.saturating_add(1);
+        }
+    }
+
+    /// Return the exact occupancy for shared anchors. For an unshared k-mer,
+    /// any value below `min_needed` preserves all neighbour-boundary comparisons,
+    /// so the lookup stops at the first row below the threshold.
+    pub fn estimate_for_anchors(&self, key: u64, min_needed: u32) -> u32 {
+        // The production sketch has four rows: computing the four probes up front
+        // lets their loads proceed independently instead of looping over `seeds`.
+        if self.seeds.len() == 4 {
+            let [a, b, c, d] = four_offsets(key, self.width);
+            let first = self.table[a];
+            if (first as u32) < min_needed {
+                return first as u32;
+            }
+            return first
+                .min(self.table[b])
+                .min(self.table[c])
+                .min(self.table[d]) as u32;
+        }
+        let mut min = u16::MAX;
+        for (row, seed) in self.seeds.iter().enumerate() {
+            let idx = (mix64(key ^ seed) & (self.width as u64 - 1)) as usize;
+            let value = self.table[row * self.width + idx];
+            if (value as u32) < min_needed {
+                return value as u32;
+            }
+            min = min.min(value);
+        }
+        min as u32
+    }
+
+    #[cfg(test)]
     pub fn estimate(&self, key: u64) -> u32 {
         // CMS query returns the minimum row counter, which bounds overestimation.
         let mut min = u16::MAX;
@@ -167,12 +217,98 @@ impl AtomicCountMinSketch {
         }
     }
 
-    /// Create a read-only snapshot for the filtering pass.
-    pub fn snapshot(&self) -> CountMinSketch {
-        let mut cms = CountMinSketch::new(self.width, self.seeds.len());
-        for (slot, cell) in cms.table.iter_mut().zip(self.table.iter()) {
-            *slot = cell.load(Ordering::Relaxed);
+    /// Consume the finished sketch without retaining a second 512 MiB table.
+    /// Owned iteration allows Vec to reuse the allocation when converting counters.
+    pub fn into_snapshot(self) -> CountMinSketch {
+        CountMinSketch {
+            width: self.width,
+            table: self.table.into_iter().map(AtomicU16::into_inner).collect(),
+            seeds: self.seeds,
         }
-        cms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_and_atomic_counts_match_including_collisions_and_saturation() {
+        for width in [1, 16, 1024] {
+            for depth in [1, 2, 4, 7] {
+                let mut plain = CountMinSketch::new(width, depth);
+                let atomic = AtomicCountMinSketch::new(width, depth);
+                for key in (0..1000).map(|i| mix64(i % 311)) {
+                    plain.increment(key);
+                    atomic.increment(key);
+                }
+                // Exercise the saturation boundary without a large input file.
+                for _ in 0..65536 {
+                    plain.increment(42);
+                    atomic.increment(42);
+                }
+                let frozen = atomic.into_snapshot();
+                assert_eq!(plain.table, frozen.table);
+                for key in (0..1200).map(mix64) {
+                    let reference = plain
+                        .seeds
+                        .iter()
+                        .enumerate()
+                        .map(|(row, seed)| {
+                            plain.table[row * plain.width
+                                + (mix64(key ^ seed) & (plain.width as u64 - 1)) as usize]
+                        })
+                        .min()
+                        .unwrap() as u32;
+                    assert_eq!(plain.estimate(key), reference);
+                    assert_eq!(frozen.estimate(key), reference);
+                    for threshold in [1, 2, 3, 10, 65535] {
+                        let observed = frozen.estimate_for_anchors(key, threshold);
+                        assert_eq!(observed >= threshold, reference >= threshold);
+                        if reference >= threshold {
+                            assert_eq!(observed, reference);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn below_threshold_counts_do_not_change_anchor_boundaries() {
+        for threshold in 1..=32 {
+            for left in 0..=32 {
+                for right in 0..=32 {
+                    let boundaries = |a, b| (a >= threshold && a > b, b >= threshold && a < b);
+                    let clamp = |value| {
+                        if value < threshold {
+                            threshold - 1
+                        } else {
+                            value
+                        }
+                    };
+                    assert_eq!(
+                        boundaries(left, right),
+                        boundaries(clamp(left), clamp(right))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_updates_keep_saturating_counts() {
+        let atomic = AtomicCountMinSketch::new(1, 4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let atomic = &atomic;
+                scope.spawn(move || {
+                    for _ in 0..20000 {
+                        atomic.increment(42);
+                    }
+                });
+            }
+        });
+        assert_eq!(atomic.into_snapshot().estimate(42), u16::MAX as u32);
     }
 }

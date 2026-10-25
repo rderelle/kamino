@@ -12,27 +12,41 @@
 
 Builds an amino acid alignment in a reference-free, alignment-free manner from a set of proteomes. Not ‘better’ than traditional marker-based pipelines, but simpler and much faster to run. Typical usages range from between-strains to within-family (prokaryotes) or within-phylum (eukaryotes) phylogenetic analyses.
 
-This repo is no longer under development but bug reports, PRs and suggestions are very welcome.
+<del>This repo is no longer under development but</del> bug reports, PRs and suggestions are very welcome.
 
 
 ## Installation
-You can either compile the code locally using rustc, or install a precompiled binary from Bioconda:
-
 ```bash
 conda install bioconda::kamino
 ```
 
+or from source:
+
+```bash
+git clone https://github.com/rderelle/kamino.git
+cd kamino
+cargo build --release           # binary: target/release/kamino
+```
+
 ## Usage
-### input
-Input consists of proteome files in FASTA format (gzipped or not), with one file per sample. Files can be placed in a single directory, specified with the `-i` argument. Files are then recognised by their extension (.fa, .fas, .fasta, .faa, .fna; gzipped ot not) and filenames minus extensions become isolate names in the final alignment. 
 ```bash
+# standard analysis of proteomes using 4 CPUs
 kamino -i <input_dir> -t 4
+
+# also get a NJ tree
+kamino -i <input_dir> -t 4 --nj
+
+# use bacterial genome assemblies as input instead
+kamino -i <input_dir> -t 4 --genomes
+
+# get a longer alignment by lowering the minimum sample occupancy per position
+kamino -i <input_dir> -t 4 -f 0.75
 ```
-Alternatively , the path of input files can be provided in a headless tab-delimited file using the `-I` argument. This is useful when file names do not encode the sample name or when proteomes are located in multiple directories. 
-```bash
-kamino -I <tabular_file> -t 4
-```
-The first column of the tab-delimited file should contain the isolate names in the final alignment and the second column the path of proteome files.
+
+### input
+Input consists of proteome files in FASTA format (gzipped or not), with one file per sample. Files can be placed in a single directory, specified with the `-i` argument. Files are then recognised by their extension (.fa, .fas, .fasta, .faa, .fna; gzipped or not) and filenames minus extensions become isolate names in the final alignment. 
+
+Alternatively, the path of input files can be provided in a headerless tab-delimited file using the `-I` argument. This is useful when file names do not encode the sample name or when proteomes are located in multiple directories. The first column of the tab-delimited file should contain the isolate names in the final alignment and the second column the path of proteome files.
 ```bash
 species_soil    new_assemblies/proteins.fas.gz
 ncbi_species_1    ncbi/GCA_00076868/proteome.fa.gz
@@ -40,29 +54,18 @@ ncbi_species_2    ncbi/GCA_01092864/proteome.fa.gz
 ```
 For **bacterial** isolates, the phylogenomic alignment can also be generated directly from genome assemblies by selecting the `--genomes` argument, using either `-i` or `-I`. In this case, an ultra-fast but approximate protein prediction is performed, with predicted proteomes stored in a temporary directory.
 
-```bash
-kamino -i <input_dir> -t 4 --genomes
-```
 ### output
 kamino outputs a FASTA amino acid alignment, a file containing the percentage of missing data per isolate, and a file containing variant group coordinates in the FASTA alignment. By default, these output files use the prefix 'kamino_', but this can be changed with the `-o` argument.
 
-Additionally, a Neighbour-joinging tree can be generated together with other output files by selecting the `--nj` optional argument.
-
-```bash
-kamino -i <input_dir> -t 4 --nj
-```
+Additionally, a Neighbour-joining tree can be generated together with other output files by selecting the `--nj` optional argument.
 
 ## Documentation
-More information are available at https://docs.rs/kamino-cli/latest/kamino_cli/
-
-Please let me know if anything is unclear or missing, and I'll update the doc accordingly.
+More information is available at https://docs.rs/kamino-cli/latest/kamino_cli/. The algorithm is also described in the manuscript mentioned below. Please note that, as of v2.3.0, kamino uses plain amino acids by default rather than recoding them into a 6-letter scheme.
 
 ## Citation
-More information is also available in the manuscript. Please note that, as of v2.3.0, kamino uses plain amino acids by default rather than recoding them into a 6-letter scheme.
-
 > Romain Derelle, John A. Lees and Leonid Chindelevitch. 2026.
 > kamino: fast proteome-wide variant calling for amino acid phylogenomics.
-> https://www.biorxiv.org/content/10.64898/2026.05.21.726148v2
+> [Molecular Biology and Evolution](https://academic.oup.com/mbe/article/43/10/msag250/8840831)
 
 ---
 This codebase is provided under the MIT License. Some parts of the code were drafted using AI assistance.

@@ -168,12 +168,14 @@ fn consensus_protein_name(group: &RawGroup, protein_names: &[Vec<String>]) -> St
 
     let mut word_stats: HashMap<&str, WordStats> = HashMap::new();
     let mut next_seen_order = 0usize;
+    let mut seen_in_name: HashSet<&str> = HashSet::new();
 
     for name in &names {
         // Count each word at most once per protein name, matching the majority-rule
         // definition across names rather than across repeated words within one name.
         // If a word appears more than once in the same name, keep its first position.
-        let mut seen_in_name: HashSet<&str> = HashSet::new();
+        // The set is reused across names to avoid one allocation per name.
+        seen_in_name.clear();
         for (position, word) in name.split_whitespace().enumerate() {
             if !seen_in_name.insert(word) {
                 continue;

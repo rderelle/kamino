@@ -61,11 +61,13 @@
 //! The other parameters refine how anchors and retained regions are handled:
 //!
 //! - `-k`/`--k` sets the anchor k-mer size. It can be adjusted for the evolutionary scale of
-//!   the dataset; for example, `-k 9` can be useful for comparisons within a species.
+//!   the dataset; for example, `-k 9` generates longer alignments for within-species analyses
+//!   while `-k 7` gives longer alignments at high divergences.
 //! - `-c`/`--constant` controls how many constant anchor sites are added to each retained
 //!   variant group in the final alignment. It does not affect which variants are identified.
 //! - `-l`/`--length-middle` sets the maximum amino-acid length allowed between adjacent shared
-//!   anchors.
+//!   anchors. At high divergences, longer alignments can be obtained with values up to around 
+//!   100 amino acids.
 //! - `-m`/`--mask` sets the minimum run of consecutive amino-acid differences to mask; use `0`
 //!   to disable this filtering.
 //! - `-r`/`--recode` enables the Dayhoff6, SR6, or KGB6 six-state recoding scheme for anchor
@@ -135,11 +137,11 @@ pub struct Args {
     #[arg(short, long, help_heading = "Main parameters")]
     pub constant: Option<usize>,
 
-    /// Maximum amino-acid length between two adjacent shared anchors [l=35].
+    /// Maximum amino-acid length between two adjacent shared anchors [l=70].
     #[arg(
         short = 'l',
         long = "length-middle",
-        default_value_t = 35,
+        default_value_t = 70,
         hide_default_value = true,
         help_heading = "Main parameters"
     )]
@@ -259,6 +261,7 @@ pub fn run_with_args(args: Args) -> anyhow::Result<()> {
         constant,
         alphabet,
         args.threads,
+        !args.genomes,
     )?;
     eprintln!("# analyse variant groups");
     eprintln!(" . raw variant groups: {}", raw_groups.groups.len());
