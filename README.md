@@ -25,7 +25,7 @@ or from source:
 ```bash
 git clone https://github.com/rderelle/kamino.git
 cd kamino
-cargo build --release           # binary: target/release/broccoli
+cargo build --release           # binary: target/release/kamino
 ```
 
 ## Usage
