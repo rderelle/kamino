@@ -16,7 +16,7 @@ Builds an amino acid alignment in a reference-free, alignment-free manner from a
 
 
 ## Installation
-You can either compile the code locally using rustc, or install a precompiled binary from Bioconda:
+You can either compile the code locally using cargo, or install a precompiled binary from Bioconda:
 
 ```bash
 conda install bioconda::kamino
