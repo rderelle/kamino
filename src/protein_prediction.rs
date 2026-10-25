@@ -670,7 +670,7 @@ fn emit_complete_orfs(
     let mut suffix_start = segment_end;
     let mut gc = [0usize; 3];
     for &vs in valid_starts.iter().rev() {
-        for codon in seq[vs.cand.pos..suffix_start].chunks_exact(3) {
+        for codon in seq[vs.cand.pos..suffix_start].as_chunks::<3>().0 {
             gc[0] += is_gc(codon[0]) as usize;
             gc[1] += is_gc(codon[1]) as usize;
             gc[2] += is_gc(codon[2]) as usize;
