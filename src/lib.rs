@@ -66,7 +66,8 @@
 //! - `-c`/`--constant` controls how many constant anchor sites are added to each retained
 //!   variant group in the final alignment. It does not affect which variants are identified.
 //! - `-l`/`--length-middle` sets the maximum amino-acid length allowed between adjacent shared
-//!   anchors. Longer alignments can be obtained with values up to around 100 amino acids.
+//!   anchors. At high divergences, longer alignments can be obtained with values up to around 
+//!   100 amino acids.
 //! - `-m`/`--mask` sets the minimum run of consecutive amino-acid differences to mask; use `0`
 //!   to disable this filtering.
 //! - `-r`/`--recode` enables the Dayhoff6, SR6, or KGB6 six-state recoding scheme for anchor
