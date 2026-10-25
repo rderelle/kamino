@@ -16,10 +16,16 @@ Builds an amino acid alignment in a reference-free, alignment-free manner from a
 
 
 ## Installation
-You can either compile the code locally using cargo, or install a precompiled binary from Bioconda:
-
 ```bash
 conda install bioconda::kamino
+```
+
+or from source:
+
+```bash
+git clone https://github.com/rderelle/kamino.git
+cd kamino
+cargo build --release           # binary: target/release/broccoli
 ```
 
 ## Usage
