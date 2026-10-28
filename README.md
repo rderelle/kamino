@@ -12,8 +12,6 @@
 
 Builds an amino acid alignment in a reference-free, alignment-free manner from a set of proteomes. Not ‘better’ than traditional marker-based pipelines, but simpler and much faster to run. Typical usages range from between-strains to within-family (prokaryotes) or within-phylum (eukaryotes) phylogenetic analyses.
 
-<del>This repo is no longer under development but</del> bug reports, PRs and suggestions are very welcome.
-
 
 ## Installation
 ```bash
