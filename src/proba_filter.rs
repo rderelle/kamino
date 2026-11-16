@@ -7,6 +7,11 @@
 //!   which can drop some proteins that should pass (conservative).
 //! - CMS overestimates counts, which can let extra proteins through (permissive).
 //!   The combination keeps sensitivity while bounding memory and runtime.
+//!
+//! Both tables are far larger than the CPU caches, and each k-mer reads them at
+//! unrelated places. K-mers are therefore handled in batches, and the memory needed
+//! by a k-mer is prefetched [`AHEAD`] k-mers before it is used: otherwise most of
+//! the time is spent waiting for memory, one k-mer at a time.
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
@@ -17,6 +22,11 @@ pub const BLOOM_HASHES: usize = 2;
 pub const CMS_WIDTH: usize = 1 << 26;
 /// Number of hash rows in the count-min sketch.
 pub const CMS_DEPTH: usize = 4;
+
+/// K-mers handed to the Bloom filter and to the sketch in one call.
+pub const BATCH: usize = 1 << 12;
+/// Number of k-mers between prefetching the memory of a k-mer and using it.
+const AHEAD: usize = 32;
 
 const SEEDS: [u64; 6] = [
     0x9e3779b97f4a7c15,
@@ -34,6 +44,40 @@ fn mix64(mut x: u64) -> u64 {
     x ^= x >> 27;
     x = x.wrapping_mul(0x94d049bb133111eb);
     x ^ (x >> 31)
+}
+
+/// Ask the CPU to start loading the cache line of `target`. This is only a hint: it
+/// never changes results, and does nothing on other architectures.
+#[inline(always)]
+fn prefetch<T>(target: &T) {
+    let p: *const u8 = (target as *const T).cast();
+    // SAFETY (both blocks): a prefetch is not a memory access for the program (it
+    // cannot fault), and `p` comes from a valid reference anyway.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(p.cast(), _MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) p,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
+/// Table offset of the counter of `key` in each row of a sketch.
+#[inline]
+fn row_offsets(seeds: &[u64], width: usize, key: u64) -> impl Iterator<Item = usize> + '_ {
+    let mask = width as u64 - 1;
+    seeds
+        .iter()
+        .enumerate()
+        .map(move |(row, seed)| row * width + (mix64(key ^ seed) & mask) as usize)
 }
 
 #[inline]
@@ -66,13 +110,18 @@ impl BloomFilter {
         }
     }
 
-    /// Returns true when the item is likely already present.
-    pub fn test_and_set(&mut self, key: u64) -> bool {
+    /// Bit indexes probed for a key.
+    #[inline]
+    fn probes(&self, key: u64) -> [usize; BLOOM_HASHES] {
         let h1 = mix64(key ^ SEEDS[0]);
         let h2 = mix64(key ^ SEEDS[1]) | 1;
+        std::array::from_fn(|i| (h1.wrapping_add((i as u64).wrapping_mul(h2)) & self.mask) as usize)
+    }
+
+    /// Returns true when the item is likely already present.
+    pub fn test_and_set(&mut self, key: u64) -> bool {
         let mut seen = true;
-        for i in 0..BLOOM_HASHES {
-            let idx = (h1.wrapping_add((i as u64).wrapping_mul(h2)) & self.mask) as usize;
+        for idx in self.probes(key) {
             let word = idx >> 6;
             let bit = 1u64 << (idx & 63);
             let had = (self.bits[word] & bit) != 0;
@@ -82,6 +131,25 @@ impl BloomFilter {
             }
         }
         seen
+    }
+
+    /// Keep, in order, the keys that were not present yet: the same decisions as
+    /// [`Self::test_and_set`] on each key in turn.
+    pub fn retain_unseen(&mut self, keys: &mut Vec<u64>) {
+        let mut kept = 0;
+        for i in 0..keys.len() {
+            if let Some(&later) = keys.get(i + AHEAD) {
+                for idx in self.probes(later) {
+                    prefetch(&self.bits[idx >> 6]);
+                }
+            }
+            let key = keys[i];
+            if !self.test_and_set(key) {
+                keys[kept] = key;
+                kept += 1;
+            }
+        }
+        keys.truncate(kept);
     }
 }
 
@@ -118,6 +186,40 @@ impl CountMinSketch {
             let cell = &mut self.table[row * self.width + idx];
             *cell = cell.saturating_add(1);
         }
+    }
+
+    /// [`Self::increment`] for each key, its counters being prefetched beforehand.
+    pub fn increment_batch(&mut self, keys: &[u64]) {
+        for (i, &key) in keys.iter().enumerate() {
+            if let Some(&later) = keys.get(i + AHEAD) {
+                row_offsets(&self.seeds, self.width, later).for_each(|o| prefetch(&self.table[o]));
+            }
+            self.increment(key);
+        }
+    }
+
+    /// [`Self::estimate_for_anchors`] for each key, in order.
+    ///
+    /// The first-row counter of a key is prefetched [`AHEAD`] keys in advance. Halfway
+    /// there, it has arrived and is read: the other counters of the key are needed,
+    /// and thus prefetched in turn, only if this first one reaches `min_needed`.
+    pub fn estimate_batch_for_anchors(&self, keys: &[u64], min_needed: u32) -> Vec<u32> {
+        let first_row = |key| (mix64(key ^ self.seeds[0]) & (self.width as u64 - 1)) as usize;
+        let mut estimates = Vec::with_capacity(keys.len());
+        for (i, &key) in keys.iter().enumerate() {
+            if let Some(&later) = keys.get(i + AHEAD) {
+                prefetch(&self.table[first_row(later)]);
+            }
+            if let Some(&soon) = keys.get(i + AHEAD / 2) {
+                if self.table[first_row(soon)] as u32 >= min_needed {
+                    row_offsets(&self.seeds, self.width, soon)
+                        .skip(1)
+                        .for_each(|o| prefetch(&self.table[o]));
+                }
+            }
+            estimates.push(self.estimate_for_anchors(key, min_needed));
+        }
+        estimates
     }
 
     /// Return the exact occupancy for shared anchors. For an unshared k-mer,
@@ -217,6 +319,16 @@ impl AtomicCountMinSketch {
         }
     }
 
+    /// [`Self::increment`] for each key, its counters being prefetched beforehand.
+    pub fn increment_batch(&self, keys: &[u64]) {
+        for (i, &key) in keys.iter().enumerate() {
+            if let Some(&later) = keys.get(i + AHEAD) {
+                row_offsets(&self.seeds, self.width, later).for_each(|o| prefetch(&self.table[o]));
+            }
+            self.increment(key);
+        }
+    }
+
     /// Consume the finished sketch without retaining a second 512 MiB table.
     /// Owned iteration allows Vec to reuse the allocation when converting counters.
     pub fn into_snapshot(self) -> CountMinSketch {
@@ -270,6 +382,60 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_bloom_makes_the_same_decisions_as_single_keys() {
+        // Small filter and repeated keys: many keys are (or look) already present.
+        let keys: Vec<u64> = (0..5000u64).map(|i| mix64(i % 1777)).collect();
+        let mut single = BloomFilter::new(1 << 12);
+        let expected: Vec<u64> = keys
+            .iter()
+            .copied()
+            .filter(|&key| !single.test_and_set(key))
+            .collect();
+        assert!(expected.len() < 1777);
+        let mut batched = BloomFilter::new(1 << 12);
+        let mut kept = Vec::new();
+        for chunk in keys.chunks(700) {
+            let mut chunk = chunk.to_vec();
+            batched.retain_unseen(&mut chunk);
+            kept.extend(chunk);
+        }
+        assert_eq!(kept, expected);
+        assert_eq!(batched.bits, single.bits);
+    }
+
+    #[test]
+    fn batched_sketch_calls_match_single_key_calls() {
+        let keys: Vec<u64> = (0..3000u64).map(|i| mix64(i % 701)).collect();
+        for width in [1, 16, 1024] {
+            for depth in [1, 2, 4, 7] {
+                let mut single = CountMinSketch::new(width, depth);
+                keys.iter().for_each(|&key| single.increment(key));
+                let mut plain = CountMinSketch::new(width, depth);
+                let atomic = AtomicCountMinSketch::new(width, depth);
+                for chunk in keys.chunks(1000) {
+                    plain.increment_batch(chunk);
+                    atomic.increment_batch(chunk);
+                }
+                assert_eq!(plain.table, single.table);
+                assert_eq!(atomic.into_snapshot().table, single.table);
+                // Counts are 4 or 5 per key, plus collisions.
+                let queries: Vec<u64> = (0..1500).map(mix64).collect();
+                for threshold in [1, 4, 5, 6, 9, 10, 65535] {
+                    let expected: Vec<u32> = queries
+                        .iter()
+                        .map(|&key| single.estimate_for_anchors(key, threshold))
+                        .collect();
+                    assert_eq!(
+                        single.estimate_batch_for_anchors(&queries, threshold),
+                        expected
+                    );
+                }
+                assert!(single.estimate_batch_for_anchors(&[], 1).is_empty());
             }
         }
     }

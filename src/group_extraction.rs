@@ -8,11 +8,11 @@ use hashbrown::HashMap;
 use rayon::{prelude::*, ThreadPoolBuilder};
 use seq_io::fasta::{Reader as FastaReader, Record};
 use std::io::{self, Write};
-use std::sync::{mpsc, Mutex};
+use std::sync::Mutex;
 
 use crate::io::{open_fasta, SpeciesInput};
 use crate::proba_filter::{
-    AtomicCountMinSketch, BloomFilter, CountMinSketch, BLOOM_BITS, CMS_DEPTH, CMS_WIDTH,
+    AtomicCountMinSketch, BloomFilter, CountMinSketch, BATCH, BLOOM_BITS, CMS_DEPTH, CMS_WIDTH,
 };
 use crate::recode::Alphabet;
 
@@ -270,41 +270,40 @@ fn extract_from_valid_segment(
     let mut end_anchors = Vec::new();
     let mut previous_hit: Option<KmerHit> = None;
 
-    // Roll a compact `k`-mer code over the segment and query the completed,
-    // immutable CMS snapshot from the first pass. Streaming neighbour comparisons
-    // are equivalent to the previous full-hit-vector boundary detection, but avoid
-    // storing every hit in the segment.
+    // Roll a compact `k`-mer code over the segment, then query the completed,
+    // immutable CMS snapshot from the first pass for all `k`-mers of the segment
+    // (in one call, so that the sketch can prefetch its counters).
     let mut roll = 0u64;
-    let mut have = 0usize;
+    let mut kmers = Vec::with_capacity(encoded.len() + 1 - k);
     for (pos, &a) in encoded.iter().enumerate() {
         debug_assert_ne!(a, 255);
         roll = ((roll << bits_per_state) | (a as u64)) & k_mask;
-        if have < k {
-            have += 1;
+        if pos + 1 >= k {
+            kmers.push(roll);
         }
-        if have == k {
-            let occupancy = cms.estimate_for_anchors(roll, min_needed);
-            let shared = occupancy >= min_needed;
-            let start = pos + 1 - k;
-            let current_hit = KmerHit {
-                kmer: roll,
-                start,
-                end: start + k,
-                occupancy,
-                shared,
-            };
+    }
+    let occupancies = cms.estimate_batch_for_anchors(&kmers, min_needed);
 
-            if let Some(previous) = previous_hit {
-                if previous.shared && previous.occupancy > current_hit.occupancy {
-                    start_candidates.push(StartCandidate { hit: previous });
-                }
-                if current_hit.shared && previous.occupancy < current_hit.occupancy {
-                    end_anchors.push(current_hit);
-                }
+    // Comparisons between neighbouring `k`-mers find the bubble boundaries.
+    for (start, (&kmer, &occupancy)) in kmers.iter().zip(&occupancies).enumerate() {
+        let current_hit = KmerHit {
+            kmer,
+            start,
+            end: start + k,
+            occupancy,
+            shared: occupancy >= min_needed,
+        };
+
+        if let Some(previous) = previous_hit {
+            if previous.shared && previous.occupancy > current_hit.occupancy {
+                start_candidates.push(StartCandidate { hit: previous });
             }
-
-            previous_hit = Some(current_hit);
+            if current_hit.shared && previous.occupancy < current_hit.occupancy {
+                end_anchors.push(current_hit);
+            }
         }
+
+        previous_hit = Some(current_hit);
     }
 
     // Start candidates are shared k-mers preceding a lower-occupancy k-mer, ranked
@@ -338,34 +337,79 @@ struct SpeciesExtraction {
     protein_names: Vec<String>,
 }
 
-fn merge_species_extraction(
-    extraction: SpeciesExtraction,
-    groups: &mut RawDirectGroups,
-    arena: &mut BlockArena,
-    protein_names: &mut [Vec<String>],
-) -> Result<()> {
-    let sid = extraction.sid;
-    protein_names[sid] = extraction.protein_names;
-    for (key, observations) in extraction.groups {
-        let group = groups.entry(key).or_default();
-        for obs in observations {
-            let sequence = extraction.arena.get(obs.aa);
-            let sequence_id = if let Some(id) = find_sequence_id(group, sequence, arena) {
-                id
-            } else {
-                let id = u32::try_from(group.sequences.len())
-                    .map_err(|_| anyhow!("too many unique sequences for one anchor pair"))?;
-                group.sequences.push(arena.push(sequence)?);
-                id
-            };
-            group.occurrences.push(BlockOccurrence {
-                sid: sid as u16,
-                protein_id: obs.protein_id,
-                sequence_id,
-            });
+/// Merges species extractions one at a time into the global structures.
+///
+/// Once `merged` species are in, a group seen in `s` of them can reach at most
+/// `s + (n - merged)` species. Groups that can no longer reach `min_needed` are
+/// dropped, and new groups are no longer created when too few species remain. These
+/// groups would be rejected by the support filter anyway, so dropping them early
+/// changes nothing but memory and time.
+struct Merger {
+    groups: RawDirectGroups,
+    arena: BlockArena,
+    protein_names: Vec<Vec<String>>,
+    n: usize,
+    min_needed: usize,
+    merged: usize,
+}
+
+impl Merger {
+    fn new(n: usize, min_needed: usize) -> Self {
+        Self {
+            groups: HashMap::new(),
+            arena: BlockArena::new(),
+            protein_names: vec![Vec::new(); n],
+            n,
+            min_needed,
+            merged: 0,
         }
     }
-    Ok(())
+
+    fn merge(&mut self, extraction: SpeciesExtraction) -> Result<()> {
+        let sid = extraction.sid;
+        self.protein_names[sid] = extraction.protein_names;
+        // A group first seen now can reach at most `n - merged` species.
+        let can_create = self.n - self.merged >= self.min_needed;
+        for (key, observations) in extraction.groups {
+            let group = if can_create {
+                self.groups.entry(key).or_default()
+            } else if let Some(group) = self.groups.get_mut(&key) {
+                group
+            } else {
+                continue;
+            };
+            for obs in observations {
+                let sequence = extraction.arena.get(obs.aa);
+                let sequence_id = if let Some(id) = find_sequence_id(group, sequence, &self.arena) {
+                    id
+                } else {
+                    let id = u32::try_from(group.sequences.len())
+                        .map_err(|_| anyhow!("too many unique sequences for one anchor pair"))?;
+                    group.sequences.push(self.arena.push(sequence)?);
+                    id
+                };
+                group.occurrences.push(BlockOccurrence {
+                    sid: sid as u16,
+                    protein_id: obs.protein_id,
+                    sequence_id,
+                });
+            }
+        }
+        self.merged += 1;
+
+        // Drop groups about 16 times over the run, and always after the last species.
+        let remaining = self.n - self.merged;
+        let step = (self.n / 16).max(1);
+        if remaining < self.min_needed && (self.merged.is_multiple_of(step) || remaining == 0) {
+            let min_seen = self.min_needed - remaining;
+            // The occurrences of a species are contiguous: each run is one species.
+            self.groups.retain(|_, group| {
+                let species = group.occurrences.chunk_by(|a, b| a.sid == b.sid).count();
+                species >= min_seen
+            });
+        }
+        Ok(())
+    }
 }
 
 fn find_sequence_id(group: &RawGroup, sequence: &[u8], arena: &BlockArena) -> Option<u32> {
@@ -416,7 +460,7 @@ impl ProteomeInputCheck {
     }
 }
 
-fn count_species_kmers<F: FnMut(u64)>(
+fn count_species_kmers<F: FnMut(&[u64])>(
     input: &SpeciesInput,
     k: usize,
     k_mask: u64,
@@ -425,10 +469,13 @@ fn count_species_kmers<F: FnMut(u64)>(
     mut increment: F,
 ) -> Result<()> {
     // Count each distinct `k`-mer at most once per species, which makes the
-    // sketch estimate species occupancy rather than raw copy number.
+    // sketch estimate species occupancy rather than raw copy number. `k`-mers are
+    // gathered in batches: the Bloom filter keeps those seen for the first time in
+    // the species (in order), which are then passed to `increment`.
     let rdr = open_fasta(&input.path)?;
     let mut r = FastaReader::new(rdr);
     let mut bloom = BloomFilter::new(BLOOM_BITS);
+    let mut kmers = Vec::with_capacity(BATCH);
     let bits_per_state = alphabet.bits_per_state();
     let mut input_check = validate_proteome.then(ProteomeInputCheck::default);
     while let Some(rec) = r.next() {
@@ -457,11 +504,18 @@ fn count_species_kmers<F: FnMut(u64)>(
             if have < k {
                 have += 1;
             }
-            if have == k && !bloom.test_and_set(roll) {
-                increment(roll);
+            if have == k {
+                kmers.push(roll);
+                if kmers.len() == BATCH {
+                    bloom.retain_unseen(&mut kmers);
+                    increment(&kmers);
+                    kmers.clear();
+                }
             }
         }
     }
+    bloom.retain_unseen(&mut kmers);
+    increment(&kmers);
     if let Some(check) = input_check {
         check.validate(&input.path)?;
     }
@@ -633,8 +687,8 @@ pub(crate) fn extract_groups(
         let mut cms = CountMinSketch::new(CMS_WIDTH, CMS_DEPTH);
         for input in inputs {
             if let Err(error) =
-                count_species_kmers(input, k, k_mask, alphabet, validate_proteomes, |key| {
-                    cms.increment(key)
+                count_species_kmers(input, k, k_mask, alphabet, validate_proteomes, |keys| {
+                    cms.increment_batch(keys)
                 })
             {
                 count_progress.finish();
@@ -649,8 +703,8 @@ pub(crate) fn extract_groups(
         let count_result = pool.install(|| {
             inputs.par_iter().try_for_each(|input| {
                 let result =
-                    count_species_kmers(input, k, k_mask, alphabet, validate_proteomes, |key| {
-                        cmsa.increment(key)
+                    count_species_kmers(input, k, k_mask, alphabet, validate_proteomes, |keys| {
+                        cmsa.increment_batch(keys)
                     });
                 count_progress.increment();
                 result
@@ -661,73 +715,44 @@ pub(crate) fn extract_groups(
         cmsa.into_snapshot()
     };
 
-    // Stage 3: stream completed species extractions into the global structures,
-    // merging each result immediately regardless of species completion order.
+    // Stage 3: each worker extracts one species, then merges it into the global
+    // structures under a lock, whatever the species completion order. Merging on
+    // the workers keeps the number of busy threads to the number requested.
     eprintln!(" . pass 2: extract sequences");
     let extraction_progress = ProteomeProgress::new(n);
     extraction_progress.draw(0);
-    let mut groups: RawDirectGroups = HashMap::new();
-    let mut arena = BlockArena::new();
-    let mut protein_names = vec![Vec::new(); n];
-    std::thread::scope(|thread_scope| {
-        let (tx, rx) = mpsc::sync_channel(n_threads);
-        let extraction_thread = thread_scope.spawn(|| {
-            pool.install(|| {
-                inputs
-                    .par_iter()
-                    .enumerate()
-                    .for_each_with(tx, |tx, (sid, input)| {
-                        let result = extract_species_blocks(
-                            sid,
-                            input,
-                            k,
-                            k_mask,
-                            &cms,
-                            min_needed,
-                            length_middle,
-                            constant,
-                            alphabet,
-                        );
-                        extraction_progress.increment();
-                        let _ = tx.send(result);
-                    });
+    let merger = Mutex::new(Merger::new(n, min_needed as usize));
+    let extraction_result = pool.install(|| {
+        inputs.par_iter().enumerate().try_for_each(|(sid, input)| {
+            let result = extract_species_blocks(
+                sid,
+                input,
+                k,
+                k_mask,
+                &cms,
+                min_needed,
+                length_middle,
+                constant,
+                alphabet,
+            )
+            .and_then(|extraction| {
+                merger
+                    .lock()
+                    .expect("merger mutex poisoned")
+                    .merge(extraction)
             });
-        });
-
-        let mut first_error = None;
-        for result in rx {
-            match result {
-                Ok(extraction) if first_error.is_none() => {
-                    if let Err(err) = merge_species_extraction(
-                        extraction,
-                        &mut groups,
-                        &mut arena,
-                        &mut protein_names,
-                    ) {
-                        first_error.get_or_insert(err);
-                    }
-                }
-                Ok(_extraction) => {}
-                Err(err) => {
-                    first_error.get_or_insert(err);
-                }
-            }
-        }
-        extraction_thread
-            .join()
-            .expect("species extraction worker thread panicked");
-        extraction_progress.finish();
-        if let Some(err) = first_error {
-            Err(err)
-        } else {
-            Ok(())
-        }
-    })?;
+            extraction_progress.increment();
+            result
+        })
+    });
+    extraction_progress.finish();
+    extraction_result?;
+    let merger = merger.into_inner().expect("merger mutex poisoned");
     Ok(RawExtractedGroups {
         species_names: inputs.iter().map(|x| x.name.clone()).collect(),
-        arena,
-        groups,
-        protein_names,
+        arena: merger.arena,
+        groups: merger.groups,
+        protein_names: merger.protein_names,
         k,
         constant,
         min_needed: min_needed as usize,
@@ -814,11 +839,11 @@ mod tests {
             let mut checked = Vec::new();
             let mut unchecked = Vec::new();
             count_species_kmers(&input, 8, alphabet.packed_mask(8), alphabet, true, |k| {
-                checked.push(k)
+                checked.extend_from_slice(k)
             })
             .unwrap();
             count_species_kmers(&input, 8, alphabet.packed_mask(8), alphabet, false, |k| {
-                unchecked.push(k)
+                unchecked.extend_from_slice(k)
             })
             .unwrap();
             assert_eq!(checked, unchecked);
@@ -828,8 +853,8 @@ mod tests {
         let alphabet = Alphabet::new(None);
         let mut count = 0;
         assert!(
-            count_species_kmers(&input, 8, alphabet.packed_mask(8), alphabet, true, |_| {
-                count += 1
+            count_species_kmers(&input, 8, alphabet.packed_mask(8), alphabet, true, |k| {
+                count += k.len()
             })
             .is_err()
         );
@@ -941,16 +966,15 @@ mod tests {
     #[test]
     fn merge_interns_exact_sequences_and_keeps_species_local_protein_ids() {
         let key = (3, 5);
-        let mut groups = RawDirectGroups::new();
-        let mut arena = BlockArena::new();
-        let mut names = vec![Vec::new(); 3];
+        let mut merger = Merger::new(3, 1);
         for extraction in [
             extraction_many(0, key, &[("p0", b"ABC"), ("p1", b"ABC")]),
             extraction_many(1, key, &[("p2", b"ABD")]),
             extraction_many(2, key, &[("p3", b"ABC")]),
         ] {
-            merge_species_extraction(extraction, &mut groups, &mut arena, &mut names).unwrap();
+            merger.merge(extraction).unwrap();
         }
+        let (groups, arena, names) = (merger.groups, merger.arena, merger.protein_names);
         let group = &groups[&key];
         assert_eq!(group.sequences.len(), 2);
         assert_eq!(group.occurrences.len(), 4);
@@ -979,6 +1003,36 @@ mod tests {
     }
 
     #[test]
+    fn merge_drops_groups_that_cannot_reach_the_threshold() {
+        // 4 species, groups need 3 of them.
+        let (core, early, late) = ((1, 1), (2, 2), (3, 3));
+        // One species with the given number of occurrences of each group.
+        let species = |sid: usize, copies: &[(AnchorPair, usize)]| {
+            let mut extraction = extraction(sid, "protein", core, b"ACDE");
+            let observation = extraction.groups[&core][0];
+            extraction.groups = copies
+                .iter()
+                .map(|&(key, n)| (key, vec![observation; n]))
+                .collect();
+            extraction
+        };
+        let mut merger = Merger::new(4, 3);
+        merger.merge(species(0, &[(core, 1), (early, 2)])).unwrap();
+        merger.merge(species(1, &[(core, 1)])).unwrap();
+        // 2 species left: `early` (1 species) can still reach 3.
+        assert!(merger.groups.contains_key(&early));
+        merger.merge(species(2, &[(core, 1), (late, 1)])).unwrap();
+        // 1 species left: `early` (two occurrences, but in one species) can reach 2 at
+        // most, and it was too late to create `late`.
+        assert!(merger.groups.contains_key(&core));
+        assert!(!merger.groups.contains_key(&early));
+        assert!(!merger.groups.contains_key(&late));
+        merger.merge(species(3, &[(core, 1), (late, 1)])).unwrap();
+        assert_eq!(merger.groups.len(), 1);
+        assert_eq!(merger.groups[&core].occurrences.len(), 4);
+    }
+
+    #[test]
     fn repeated_occurrences_store_one_block_per_distinct_sequence() {
         let key = (7, 9);
         let variants: [&[u8]; 4] = [
@@ -991,9 +1045,9 @@ mod tests {
             .map(|i| ("protein", variants[i % variants.len()]))
             .collect();
         let extraction = extraction_many(0, key, &rows);
-        let mut groups = RawDirectGroups::new();
-        let mut arena = BlockArena::new();
-        merge_species_extraction(extraction, &mut groups, &mut arena, &mut [Vec::new()]).unwrap();
+        let mut merger = Merger::new(1, 1);
+        merger.merge(extraction).unwrap();
+        let (groups, arena) = (merger.groups, merger.arena);
         assert_eq!(groups[&key].sequences.len(), 4);
         assert_eq!(groups[&key].occurrences.len(), 100);
         assert_eq!(arena.data.len(), 80);
@@ -1004,9 +1058,9 @@ mod tests {
         let key = (11, 13);
         let rows = vec![("protein", b"ABCDEFGHIJKLMNOPQRST".as_slice()); 100];
         let extraction = extraction_many(0, key, &rows);
-        let mut groups = RawDirectGroups::new();
-        let mut arena = BlockArena::new();
-        merge_species_extraction(extraction, &mut groups, &mut arena, &mut [Vec::new()]).unwrap();
+        let mut merger = Merger::new(1, 1);
+        merger.merge(extraction).unwrap();
+        let (groups, arena) = (merger.groups, merger.arena);
         assert_eq!(groups[&key].sequences.len(), 1);
         assert_eq!(groups[&key].occurrences.len(), 100);
         assert_eq!(arena.data.len(), 20);
@@ -1016,9 +1070,7 @@ mod tests {
     fn species_merge_order_preserves_effective_raw_data() {
         let key = (7, 11);
         let merge = |order: &[usize]| {
-            let mut groups = RawDirectGroups::new();
-            let mut arena = BlockArena::new();
-            let mut protein_names = vec![Vec::new(); 3];
+            let mut merger = Merger::new(3, 1);
             for &sid in order {
                 let (name, aa): (&str, &[u8]) = match sid {
                     0 => ("protein_0", b"AAAA"),
@@ -1026,14 +1078,10 @@ mod tests {
                     2 => ("protein_2", b"CCCC"),
                     _ => unreachable!(),
                 };
-                merge_species_extraction(
-                    extraction(sid, name, key, aa),
-                    &mut groups,
-                    &mut arena,
-                    &mut protein_names,
-                )
-                .unwrap();
+                merger.merge(extraction(sid, name, key, aa)).unwrap();
             }
+            let (groups, arena, protein_names) =
+                (merger.groups, merger.arena, merger.protein_names);
             let group = groups.get(&key).unwrap();
             let mut effective: Vec<_> = group
                 .occurrences
