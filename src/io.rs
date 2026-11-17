@@ -38,11 +38,13 @@ pub fn collect_fasta_files(input_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(input_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        // `fs::metadata` follows symlinks (unlike `DirEntry::file_type`), so linked
+        // FASTA files are included; broken links are skipped.
+        .filter(|e| std::fs::metadata(e.path()).map(|m| m.is_file()).unwrap_or(false))
         .map(|e| e.path())
         .filter(|p| is_supported_ext(p))
         .collect();
-
+    
     files.sort_unstable_by(|a, b| a.file_name().unwrap().cmp(b.file_name().unwrap()));
 
     Ok(files)
